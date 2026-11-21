@@ -1,0 +1,18 @@
+{
+  "name": "@seedingsys/db",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "@seedingsys/contracts": "workspace:*",
+    "@seedingsys/domain": "workspace:*"
+  },
+  "devDependencies": {
+    "prisma": "6.19.3"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma"
+  }
+}

@@ -1,0 +1,32 @@
+# Worker host (~8 vCPU / 32 GB / SSD 200 GB). Talks to the core over WireGuard only.
+#   docker compose -f infra/compose/worker.yml --env-file .env.worker up -d
+# .env.worker holds DATABASE_URL (restricted DB role), WORKER_NAME, R2 read/write keys for media.
+# It must NOT contain ANTHROPIC_API_KEY.
+name: seedingsys-worker
+
+x-app: &app
+  build: { context: ../.., dockerfile: infra/Dockerfile }
+  image: seedingsys:${SEEDINGSYS_VERSION:-dev}
+  restart: unless-stopped
+  env_file: ../../.env.worker
+
+services:
+  worker-browser:
+    <<: *app
+    build: { context: ../.., dockerfile: infra/Dockerfile.worker }
+    image: seedingsys-worker:${SEEDINGSYS_VERSION:-dev}
+    command: ["node", "--import", "tsx", "apps/worker-browser/src/main.ts"]
+    # Browser profiles stay on this host's encrypted disk; never synced to cloud backups.
+    volumes: ["${PROFILES_DIR:-/srv/seedingsys/profiles}:/profiles"]
+    shm_size: 2gb
+    deploy:
+      resources:
+        limits: { cpus: "6", memory: 24g }
+
+  worker-media:
+    <<: *app
+    command: ["node", "--import", "tsx", "apps/worker-media/src/main.ts"]
+    # Own CPU cap so transcoding never starves the browsers.
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4g }

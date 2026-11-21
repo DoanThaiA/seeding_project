@@ -1,0 +1,25 @@
+{
+  "name": "@seedingsys/worker-browser",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@seedingsys/config": "workspace:*",
+    "@seedingsys/contracts": "workspace:*",
+    "@seedingsys/db": "workspace:*",
+    "@seedingsys/domain": "workspace:*",
+    "@seedingsys/observability": "workspace:*",
+    "@seedingsys/queue": "workspace:*",
+    "@seedingsys/connectors-core": "workspace:*",
+    "@seedingsys/connectors-fake": "workspace:*",
+    "@seedingsys/connectors-fb-web": "workspace:*",
+    "@seedingsys/storage": "workspace:*",
+    "@seedingsys/connectors-manual": "workspace:*",
+    "@seedingsys/connectors-fb-graph": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts"
+  }
+}

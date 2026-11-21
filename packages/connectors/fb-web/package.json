@@ -1,0 +1,13 @@
+{
+  "name": "@seedingsys/connectors-fb-web",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@seedingsys/connectors-core": "workspace:*",
+    "@seedingsys/contracts": "workspace:*",
+    "playwright-core": "1.65.1",
+    "@seedingsys/domain": "workspace:*"
+  }
+}

@@ -1,0 +1,10 @@
+# Automatic HTTPS (Let's Encrypt) for the operations web. The API itself is NOT exposed:
+# the web server talks to it on the internal Docker network.
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy web:3000
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}

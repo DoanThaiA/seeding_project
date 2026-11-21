@@ -1,0 +1,729 @@
+// SeedingSys — business data model. PostgreSQL is the source of truth.
+// All timestamps are stored in UTC (timestamptz). Operating timezone: Asia/Ho_Chi_Minh.
+// Constraints Prisma cannot express are appended to the migration SQL ("extra constraints").
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum ContentType {
+  TEXT
+  QUOTE_IMAGE
+  SINGLE_PHOTO
+  MULTI_PHOTO
+  NAMED_ALBUM
+  VIDEO
+  REEL
+  UNSUPPORTED
+}
+
+enum Workflow {
+  STANDARD
+  ALBUM
+  VIDEO
+}
+
+enum IdentityConfidence {
+  HIGH // stable external post id from the source
+  LOW // fallback: URL/content hash
+}
+
+enum ReviewMode {
+  AUTO
+  MANUAL
+}
+
+enum MediaStatus {
+  NOT_REQUIRED
+  PENDING
+  READY
+  FAILED
+}
+
+enum AssetStatus {
+  PENDING
+  STORED
+  FAILED
+}
+
+enum VariantStatus {
+  BASELINE // seen on first sync — never auto-eligible
+  FETCHING_MEDIA
+  REWRITING
+  VALIDATING
+  READY // snapshot frozen
+  NEEDS_REVIEW
+  REJECTED
+  UNSUPPORTED
+  EXPIRED
+  SUPERSEDED // a newer source revision replaced this draft before publication
+  DUPLICATE // another source post already holds the same content for this target
+}
+
+enum SlotStatus {
+  PLANNED
+  RESERVED
+  DISPATCHED
+  STARTED
+  DONE
+  SKIPPED_NO_CONTENT
+  DEFERRED
+  MISSED
+}
+
+enum PublicationStatus {
+  QUEUED
+  PREPARING
+  UPLOADING_DRAFT
+  READY_TO_SUBMIT
+  COMMITTING
+  PLATFORM_PROCESSING
+  VERIFYING
+  PUBLISHED_VERIFIED
+  FAILED_CONFIRMED
+  UNKNOWN
+  RECONCILING
+  NEEDS_OPERATOR
+  OPERATOR_CONFIRMED
+  CANCELLED // cancelled before any possible side effect; content returns to backlog
+}
+
+enum AttemptOutcome {
+  RUNNING
+  SUCCEEDED
+  FAILED_PRE_COMMIT
+  FAILED_CONFIRMED
+  UNKNOWN
+  ABANDONED
+  NEEDS_OPERATOR
+}
+
+enum OperatorTaskKind {
+  REVIEW_CONTENT
+  TAKEOVER_ACCOUNT
+  CONFIRM_RESULT
+}
+
+enum OperatorTaskStatus {
+  OPEN
+  CLAIMED
+  DONE
+  CANCELLED
+}
+
+enum ControlScope {
+  GLOBAL
+  SOURCE
+  TARGET
+  FORMAT
+  CONNECTOR
+}
+
+enum WorkerKind {
+  CORE
+  BROWSER
+  MEDIA
+}
+
+enum CommentScanStatus {
+  QUEUED
+  RUNNING
+  COMPLETE
+  PARTIAL
+  FAILED
+}
+
+enum CommentReplayStatus {
+  DRAFT
+  APPROVED
+  QUEUED
+  SENDING
+  FAILED
+  UNKNOWN
+  POSTED
+  OMITTED
+}
+
+enum ProfileSyncPhase {
+  DISCOVERING
+  PREPARING
+  PREPARED
+  FAILED
+}
+
+// ─────────────────────────── Configuration ───────────────────────────
+
+model Source {
+  id              String    @id @default(uuid()) @db.Uuid
+  code            String    @unique // "A1".."A50"
+  name            String
+  externalRef     String    @map("external_ref") // URL or ID of the source
+  connector       String // read connector key: "fake" | "manual" | "fb-graph" | "fb-web" | "fb-public"
+  enabled         Boolean   @default(true)
+  pollIntervalSec Int       @default(300) @map("poll_interval_sec")
+  overlapCount    Int       @default(5) @map("overlap_count")
+  collectComments Boolean   @default(false) @map("collect_comments")
+  watermark       Json? // connector-defined cursor, only advanced after results are stored
+  baselineDone    Boolean   @default(false) @map("baseline_done")
+  lastPollAt      DateTime? @map("last_poll_at") @db.Timestamptz(3)
+  lastSuccessAt   DateTime? @map("last_success_at") @db.Timestamptz(3)
+  lastErrorAt     DateTime? @map("last_error_at") @db.Timestamptz(3)
+  lastError       String?   @map("last_error")
+  lastIncomplete  Json?     @map("last_incomplete") // completeness flags of the last read
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  posts    SourcePost[]
+  mappings SourceTargetMapping[]
+  postAliases SourcePostAlias[]
+
+  @@map("sources")
+}
+
+model TargetAccount {
+  id           String   @id @default(uuid()) @db.Uuid
+  code         String   @unique // "B1".."B50"
+  name         String
+  externalId   String   @map("external_id") // profile id, used by the identity check
+  connector    String // publish connector key: "fake" | "fb-web"
+  audience     String   @default("ONLY_ME") // ONLY_ME (pilot-test) | FRIENDS | PUBLIC
+  uiLocale     String   @default("vi-VN") @map("ui_locale")
+  enabled      Boolean  @default(true)
+  styleProfile Json     @default("{}") @map("style_profile") // caption style config for the LLM
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  mappings     SourceTargetMapping[]
+  profile      BrowserProfile?
+  variants     ContentVariant[]
+  slots        PublicationSlot[]
+  publications Publication[]
+  capabilities CapabilityCheck[]
+  commentAuthors      PublicationComment[] @relation("CommentAuthor")
+  commentDestinations PublicationComment[] @relation("CommentDestination")
+
+  @@map("target_accounts")
+}
+
+model SourceTargetMapping {
+  id              String     @id @default(uuid()) @db.Uuid
+  sourceId        String     @map("source_id") @db.Uuid
+  targetId        String     @map("target_id") @db.Uuid
+  enabled         Boolean    @default(true)
+  contentTtlHours Int        @default(72) @map("content_ttl_hours")
+  lateWindowMin   Int        @default(15) @map("late_window_min")
+  strictOrder     Boolean    @default(false) @map("strict_order")
+  reviewMode      ReviewMode @default(AUTO) @map("review_mode")
+  maxPublishTries Int        @default(2) @map("max_publish_tries")
+  createdAt       DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  source Source        @relation(fields: [sourceId], references: [id])
+  target TargetAccount @relation(fields: [targetId], references: [id])
+  profileSyncs ProfileSync[]
+
+  @@unique([sourceId, targetId])
+  @@map("source_target_mappings")
+}
+
+// ─────────────────────────── Infrastructure ───────────────────────────
+
+model WorkerNode {
+  id              String     @id @default(uuid()) @db.Uuid
+  name            String     @unique
+  kind            WorkerKind
+  capabilities    Json       @default("{}")
+  lastHeartbeatAt DateTime?  @map("last_heartbeat_at") @db.Timestamptz(3)
+  createdAt       DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  profiles BrowserProfile[]
+
+  @@map("worker_nodes")
+}
+
+model BrowserProfile {
+  id           String   @id @default(uuid()) @db.Uuid
+  targetId     String   @unique @map("target_id") @db.Uuid
+  workerNodeId String?  @map("worker_node_id") @db.Uuid // profile is pinned to one host
+  profileDir   String   @map("profile_dir")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  target     TargetAccount @relation(fields: [targetId], references: [id])
+  workerNode WorkerNode?   @relation(fields: [workerNodeId], references: [id])
+
+  @@map("browser_profiles")
+}
+
+model ConnectorRelease {
+  id         String   @id @default(uuid()) @db.Uuid
+  connector  String
+  version    String
+  active     Boolean  @default(false)
+  notes      String?
+  releasedAt DateTime @default(now()) @map("released_at") @db.Timestamptz(3)
+
+  @@unique([connector, version])
+  @@map("connector_releases")
+}
+
+model CapabilityCheck {
+  id               String      @id @default(uuid()) @db.Uuid
+  targetId         String      @map("target_id") @db.Uuid
+  contentType      ContentType @map("content_type")
+  connector        String
+  connectorVersion String      @map("connector_version")
+  passed           Boolean
+  cases            Int         @default(0)
+  failures         Int         @default(0)
+  notes            String?
+  checkedAt        DateTime    @default(now()) @map("checked_at") @db.Timestamptz(3)
+
+  target TargetAccount @relation(fields: [targetId], references: [id])
+
+  @@unique([targetId, contentType, connector, connectorVersion])
+  @@map("capability_checks")
+}
+
+// ─────────────────────────── Source content ───────────────────────────
+
+model SourcePost {
+  id                 String             @id @default(uuid()) @db.Uuid
+  sourceId           String             @map("source_id") @db.Uuid
+  externalId         String             @map("external_id")
+  identityConfidence IdentityConfidence @map("identity_confidence")
+  permalink          String?
+  contentType        ContentType        @map("content_type")
+  isPinned           Boolean            @default(false) @map("is_pinned")
+  isShared           Boolean            @default(false) @map("is_shared")
+  isBaseline         Boolean            @default(false) @map("is_baseline")
+  postedAt           DateTime?          @map("posted_at") @db.Timestamptz(3)
+  firstSeenAt        DateTime           @map("first_seen_at") @db.Timestamptz(3)
+  archivedAt         DateTime?          @map("archived_at") @db.Timestamptz(3)
+  archivedBy         String?            @map("archived_by")
+  latestRevisionId   String?            @map("latest_revision_id") @db.Uuid
+  createdAt          DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  source       Source               @relation(fields: [sourceId], references: [id])
+  revisions    SourcePostRevision[]
+  publications Publication[]
+  comments     SourceComment[]
+  commentScans CommentScan[]
+  syncItems ProfileSyncItem[]
+  aliases   SourcePostAlias[]
+
+  @@unique([sourceId, externalId])
+  @@index([sourceId, firstSeenAt, id])
+  @@index([sourceId, id])
+  @@index([sourceId, postedAt])
+  @@map("source_posts")
+}
+
+// Another platform id under which a stored post was read again (Facebook rotates a post's
+// pfbid between sessions). (source, id) is never used twice: by a post or by an alias.
+model SourcePostAlias {
+  sourceId     String   @map("source_id") @db.Uuid
+  externalId   String   @map("external_id")
+  sourcePostId String   @map("source_post_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  source Source     @relation(fields: [sourceId], references: [id])
+  post   SourcePost @relation(fields: [sourcePostId], references: [id])
+
+  @@id([sourceId, externalId])
+  @@index([sourcePostId])
+  @@map("source_post_aliases")
+}
+
+model ProfileSync {
+  id           String           @id @default(uuid()) @db.Uuid
+  mappingId    String           @map("mapping_id") @db.Uuid
+  phase        ProfileSyncPhase
+  step         Int              @default(0)
+  history      Boolean
+  historyDone  Boolean          @default(false) @map("history_done")
+  historyCursor String?         @map("history_cursor")
+  archiveCursor String?         @map("archive_cursor") @db.Uuid
+  capturedUntil DateTime        @map("captured_until") @db.Timestamptz(3)
+  detail       String?
+  requestedBy  String           @map("requested_by")
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  mapping SourceTargetMapping @relation(fields: [mappingId], references: [id])
+  items ProfileSyncItem[]
+  @@index([mappingId, createdAt])
+  @@map("profile_syncs")
+}
+
+model ProfileSyncItem {
+  syncId          String  @map("sync_id") @db.Uuid
+  sourcePostId    String  @map("source_post_id") @db.Uuid
+  preparedVariantId String? @map("prepared_variant_id") @db.Uuid
+  commentScanId   String? @map("comment_scan_id") @db.Uuid
+
+  sync ProfileSync @relation(fields: [syncId], references: [id])
+  post SourcePost @relation(fields: [sourcePostId], references: [id])
+  preparedVariant ContentVariant? @relation(fields: [preparedVariantId], references: [id])
+  commentScan CommentScan? @relation(fields: [commentScanId], references: [id])
+  @@id([syncId, sourcePostId])
+  @@index([commentScanId])
+  @@map("profile_sync_items")
+}
+
+model CommentScan {
+  id           String            @id @default(uuid()) @db.Uuid
+  sourcePostId String            @map("source_post_id") @db.Uuid
+  status       CommentScanStatus @default(QUEUED)
+  readCount    Int               @default(0) @map("read_count")
+  expectedCount Int?             @map("expected_count")
+  detail       String?
+  requestedBy  String            @map("requested_by")
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  post SourcePost @relation(fields: [sourcePostId], references: [id])
+  syncItems ProfileSyncItem[]
+  @@index([sourcePostId, createdAt])
+  @@map("comment_scans")
+}
+
+model SourceComment {
+  id               String    @id @default(uuid()) @db.Uuid
+  sourcePostId     String    @map("source_post_id") @db.Uuid
+  externalId       String    @map("external_id")
+  parentExternalId String?   @map("parent_external_id")
+  text             String
+  authorName       String?   @map("author_name")
+  permalink        String?
+  postedAt         DateTime? @map("posted_at") @db.Timestamptz(3)
+  position         Int
+  lastSeenAt       DateTime  @map("last_seen_at") @db.Timestamptz(3)
+
+  post    SourcePost           @relation(fields: [sourcePostId], references: [id])
+  replays PublicationComment[]
+  @@unique([sourcePostId, externalId])
+  @@index([sourcePostId, position, id])
+  @@map("source_comments")
+}
+
+model SourcePostRevision {
+  id           String      @id @default(uuid()) @db.Uuid
+  sourcePostId String      @map("source_post_id") @db.Uuid
+  contentHash  String      @map("content_hash")
+  text         String
+  albumTitle   String?     @map("album_title")
+  incomplete   Json        @default("[]") // CAPTION_TRUNCATED, MEDIA_COUNT_UNKNOWN, MEDIA_UNAVAILABLE ...
+  raw          Json?
+  mediaStatus  MediaStatus @map("media_status")
+  // Caption + media checksums once media is settled (see domain contentKey). '' = nothing to compare.
+  contentKey   String?     @map("content_key")
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  post     SourcePost       @relation(fields: [sourcePostId], references: [id])
+  assets   PostAsset[]
+  variants ContentVariant[]
+
+  @@unique([sourcePostId, contentHash])
+  @@index([contentKey])
+  @@map("source_post_revisions")
+}
+
+model Asset {
+  id               String      @id @default(uuid()) @db.Uuid
+  kind             String // image | video
+  sourceUrl        String?     @map("source_url")
+  sourceRef        String?     @map("source_ref") // connector-specific locator
+  connector        String // read connector that can fetch the bytes
+  status           AssetStatus @default(PENDING)
+  checksum         String? // sha256 of stored bytes
+  expectedChecksum String?     @map("expected_checksum")
+  objectKey        String?     @map("object_key")
+  mime             String?
+  bytes            BigInt?
+  width            Int?
+  height           Int?
+  durationMs       Int?        @map("duration_ms")
+  fetchAttempts    Int         @default(0) @map("fetch_attempts")
+  lastError        String?     @map("last_error")
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  posts PostAsset[]
+
+  @@map("assets")
+}
+
+model PostAsset {
+  revisionId String @map("revision_id") @db.Uuid
+  position   Int
+  assetId    String @map("asset_id") @db.Uuid
+
+  revision SourcePostRevision @relation(fields: [revisionId], references: [id])
+  asset    Asset              @relation(fields: [assetId], references: [id])
+
+  @@id([revisionId, position])
+  @@map("post_assets")
+}
+
+// ─────────────────────────── Content per target ───────────────────────────
+
+model ContentVariant {
+  id              String        @id @default(uuid()) @db.Uuid
+  revisionId      String        @map("revision_id") @db.Uuid
+  targetId        String        @map("target_id") @db.Uuid
+  sourcePostId    String        @map("source_post_id") @db.Uuid
+  contentType     ContentType   @map("content_type")
+  status          VariantStatus
+  caption         String?
+  factsToPreserve Json?         @map("facts_to_preserve")
+  attribution     String?
+  reviewReasons   Json          @default("[]") @map("review_reasons")
+  promptVersion   String?       @map("prompt_version")
+  modelId         String?       @map("model_id")
+  cacheKey        String?       @map("cache_key")
+  rewriteTries    Int           @default(0) @map("rewrite_tries")
+  // Frozen snapshot (set when READY). Never rewritten at publish time.
+  snapshot        Json?
+  snapshotHash    String?       @map("snapshot_hash")
+  readyAt         DateTime?     @map("ready_at") @db.Timestamptz(3)
+  expiresAt       DateTime?     @map("expires_at") @db.Timestamptz(3)
+  reviewedBy      String?       @map("reviewed_by")
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  revision     SourcePostRevision @relation(fields: [revisionId], references: [id])
+  target       TargetAccount      @relation(fields: [targetId], references: [id])
+  checks       ContentCheck[]
+  publications Publication[]
+  syncItems ProfileSyncItem[]
+
+  @@unique([revisionId, targetId])
+  @@index([targetId, status, readyAt])
+  @@index([sourcePostId, targetId, createdAt(sort: Desc)], map: "content_variants_source_post_target_created_idx")
+  @@map("content_variants")
+}
+
+model ContentCheck {
+  id        String   @id @default(uuid()) @db.Uuid
+  variantId String   @map("variant_id") @db.Uuid
+  kind      String
+  passed    Boolean
+  details   Json?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  variant ContentVariant @relation(fields: [variantId], references: [id])
+
+  @@map("content_checks")
+}
+
+// ─────────────────────────── Scheduling & publishing ───────────────────────────
+
+model PublicationSlot {
+  id            String     @id @default(uuid()) @db.Uuid
+  targetId      String     @map("target_id") @db.Uuid
+  slotAt        DateTime   @map("slot_at") @db.Timestamptz(3) // Scheduled slots start on the hour.
+  manual        Boolean    @default(false)
+  status        SlotStatus @default(PLANNED)
+  reason        String?
+  publicationId String?    @map("publication_id") @db.Uuid
+  createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  target TargetAccount @relation(fields: [targetId], references: [id])
+
+  @@unique([targetId, slotAt])
+  @@index([status, slotAt])
+  @@map("publication_slots")
+}
+
+model Publication {
+  id             String            @id @default(uuid()) @db.Uuid
+  targetId       String            @map("target_id") @db.Uuid
+  sourcePostId   String            @map("source_post_id") @db.Uuid
+  variantId      String            @map("variant_id") @db.Uuid
+  slotId         String?           @map("slot_id") @db.Uuid
+  workflow       Workflow
+  contentType    ContentType       @map("content_type")
+  status         PublicationStatus
+  jobVersion     Int               @default(1) @map("job_version")
+  snapshotHash   String            @map("snapshot_hash")
+  permalink      String?
+  externalPostId String?           @map("external_post_id")
+  committedAt    DateTime?         @map("committed_at") @db.Timestamptz(3)
+  verifiedAt     DateTime?         @map("verified_at") @db.Timestamptz(3)
+  reconcileTries Int               @default(0) @map("reconcile_tries")
+  publishTries   Int               @default(0) @map("publish_tries")
+  lastReason     String?           @map("last_reason")
+  createdAt      DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  target   TargetAccount        @relation(fields: [targetId], references: [id])
+  post     SourcePost           @relation(fields: [sourcePostId], references: [id])
+  variant  ContentVariant       @relation(fields: [variantId], references: [id])
+  attempts PublicationAttempt[]
+
+  // Initial publication: one per (target, source post), independent of revision & connector.
+  @@unique([targetId, sourcePostId])
+  @@index([targetId, status])
+  @@map("publications")
+}
+
+model PublicationComment {
+  id              String              @id @default(uuid()) @db.Uuid
+  destinationId   String              @map("destination_id") @db.Uuid
+  sourceCommentId String              @map("source_comment_id") @db.Uuid
+  authorTargetId  String?             @map("author_target_id") @db.Uuid
+  text            String
+  status          CommentReplayStatus @default(DRAFT)
+  sendVersion     Int                 @default(0) @map("send_version")
+  sendDetail      String?             @map("send_detail")
+  externalId      String?             @map("external_id")
+  permalink       String?
+  updatedAt       DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  destination TargetAccount  @relation("CommentDestination", fields: [destinationId], references: [id])
+  source      SourceComment @relation(fields: [sourceCommentId], references: [id])
+  author      TargetAccount? @relation("CommentAuthor", fields: [authorTargetId], references: [id])
+  @@unique([destinationId, sourceCommentId])
+  @@unique([destinationId, externalId])
+  @@index([destinationId, status])
+  @@map("publication_comments")
+}
+
+model PublicationAttempt {
+  id               String         @id @default(uuid()) @db.Uuid
+  publicationId    String         @map("publication_id") @db.Uuid
+  attemptNo        Int            @map("attempt_no")
+  kind             String         @default("publish") // publish | verify | reconcile | operator
+  connector        String
+  connectorVersion String         @map("connector_version")
+  workerId         String         @map("worker_id")
+  fencingToken     BigInt         @map("fencing_token")
+  outcome          AttemptOutcome @default(RUNNING)
+  stage            String? // last stage reached: PREPARE | PREVIEW | COMMIT | VERIFY ...
+  errorClass       String?        @map("error_class")
+  errorMessage     String?        @map("error_message")
+  evidence         Json? // commit signal, permalink, match details
+  startedAt        DateTime       @map("started_at") @db.Timestamptz(3)
+  committingAt     DateTime?      @map("committing_at") @db.Timestamptz(3)
+  finishedAt       DateTime?      @map("finished_at") @db.Timestamptz(3)
+
+  publication Publication @relation(fields: [publicationId], references: [id])
+
+  @@unique([publicationId, attemptNo])
+  @@map("publication_attempts")
+}
+
+// ─────────────────────────── Coordination ───────────────────────────
+
+model OutboxEvent {
+  id           BigInt    @id @default(autoincrement())
+  queue        String
+  payload      Json
+  singletonKey String?   @map("singleton_key")
+  startAfter   DateTime? @map("start_after") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  publishedAt  DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts     Int       @default(0)
+  lastError    String?   @map("last_error")
+
+  @@index([publishedAt, id])
+  @@map("outbox_events")
+}
+
+// Lease with fencing token. resource = "account:<targetId>" | "source:<sourceId>".
+// The account lease is shared by standard, album, video and (later) Android workflows.
+model AccountLease {
+  resource     String    @id
+  holder       String
+  fencingToken BigInt    @map("fencing_token")
+  purpose      String?
+  acquiredAt   DateTime  @map("acquired_at") @db.Timestamptz(3)
+  heartbeatAt  DateTime  @map("heartbeat_at") @db.Timestamptz(3)
+  expiresAt    DateTime  @map("expires_at") @db.Timestamptz(3)
+  releasedAt   DateTime? @map("released_at") @db.Timestamptz(3)
+
+  @@map("account_leases")
+}
+
+// ─────────────────────────── Operations ───────────────────────────
+
+model OperatorTask {
+  id            String             @id @default(uuid()) @db.Uuid
+  kind          OperatorTaskKind
+  status        OperatorTaskStatus @default(OPEN)
+  targetId      String?            @map("target_id") @db.Uuid
+  publicationId String?            @map("publication_id") @db.Uuid
+  variantId     String?            @map("variant_id") @db.Uuid
+  reason        String
+  details       Json?
+  claimedBy     String?            @map("claimed_by")
+  resolvedBy    String?            @map("resolved_by")
+  resolution    Json?
+  createdAt     DateTime           @map("created_at") @db.Timestamptz(3)
+  closedAt      DateTime?          @map("closed_at") @db.Timestamptz(3)
+
+  @@index([status, createdAt])
+  @@map("operator_tasks")
+}
+
+model AuditEvent {
+  id         BigInt   @id @default(autoincrement())
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  action     String
+  fromState  String?  @map("from_state")
+  toState    String?  @map("to_state")
+  actor      String
+  data       Json?
+  at         DateTime @db.Timestamptz(3)
+
+  @@index([entityType, entityId])
+  @@map("audit_events")
+}
+
+// Kill switches. paused=true stops new work for that scope.
+model Control {
+  id        String       @id @default(uuid()) @db.Uuid
+  scope     ControlScope
+  scopeKey  String       @map("scope_key") // "*" for GLOBAL, otherwise source/target id, content type or connector key
+  paused    Boolean      @default(true)
+  reason    String?
+  setBy     String       @map("set_by")
+  updatedAt DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([scope, scopeKey])
+  @@map("controls")
+}
+
+model LlmUsage {
+  id           BigInt   @id @default(autoincrement())
+  profile      String // editor | exception
+  modelId      String   @map("model_id")
+  day          String // YYYY-MM-DD in Asia/Ho_Chi_Minh
+  inputTokens  Int      @map("input_tokens")
+  outputTokens Int      @map("output_tokens")
+  costMicroUsd BigInt   @map("cost_micro_usd")
+  refType      String?  @map("ref_type")
+  refId        String?  @map("ref_id")
+  at           DateTime @db.Timestamptz(3)
+
+  @@index([profile, day])
+  @@map("llm_usage")
+}
+
+model LlmCache {
+  cacheKey  String   @id @map("cache_key")
+  output    Json
+  modelId   String   @map("model_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@map("llm_cache")
+}

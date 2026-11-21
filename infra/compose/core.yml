@@ -1,0 +1,73 @@
+# Core server (~4 vCPU / 8 GB): PostgreSQL, API, operations web (behind Caddy HTTPS), scheduler/outbox/LLM worker.
+#   docker compose -f infra/compose/core.yml --env-file .env.core up -d
+# Secrets (ANTHROPIC_API_KEY, R2_*, API_TOKENS) live only here, never on worker hosts.
+name: seedingsys-core
+
+x-app: &app
+  build: { context: ../.., dockerfile: infra/Dockerfile }
+  image: seedingsys:${SEEDINGSYS_VERSION:-dev}
+  restart: unless-stopped
+  env_file: ../../.env.core
+  environment:
+    DATABASE_URL: postgresql://seedingsys:${POSTGRES_PASSWORD}@postgres:5432/seedingsys
+  depends_on:
+    migrate: { condition: service_completed_successfully }
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: seedingsys
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: seedingsys
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C
+    volumes: [pgdata:/var/lib/postgresql/data]
+    # Only reachable from the WireGuard network (worker hosts), never from the internet.
+    ports: ["${WG_BIND_IP:-10.88.0.1}:5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seedingsys"]
+      interval: 5s
+      retries: 20
+
+  migrate:
+    build: { context: ../.., dockerfile: infra/Dockerfile }
+    image: seedingsys:${SEEDINGSYS_VERSION:-dev}
+    environment:
+      DATABASE_URL: postgresql://seedingsys:${POSTGRES_PASSWORD}@postgres:5432/seedingsys
+    command: ["pnpm", "db:migrate"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *app
+    command: ["node", "--import", "tsx", "apps/api/src/main.ts"]
+    expose: ["3001"] # internal only — operators reach it through the web app
+
+  worker-core:
+    <<: *app
+    command: ["node", "--import", "tsx", "apps/worker-core/src/main.ts"]
+
+  web:
+    build: { context: ../.., dockerfile: infra/Dockerfile.web }
+    image: seedingsys-web:${SEEDINGSYS_VERSION:-dev}
+    restart: unless-stopped
+    environment:
+      API_URL: http://api:3001
+    depends_on: [api]
+    expose: ["3000"]
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on: [web]
+
+volumes:
+  pgdata:
+  caddy_data:
