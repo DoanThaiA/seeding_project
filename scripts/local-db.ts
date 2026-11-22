@@ -12,6 +12,9 @@ const PORT = Number(process.env.LOCAL_PG_PORT ?? 54329);
 const DIR = join(__dirname, '..', '.data', 'pg');
 
 async function main() {
+  if (existsSync(join(__dirname, '..', '.data', 'MOVED.json'))) {
+    throw new Error('Hệ thống đã chuyển sang máy khác (.data/MOVED.json). Hủy chuyển: node scripts/move-machine.mjs reactivate');
+  }
   const pg = new EmbeddedPostgres({
     databaseDir: DIR,
     user: 'seedingsys',

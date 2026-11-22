@@ -133,7 +133,7 @@ function holderSql(target: Prisma.Sql, post: Prisma.Sql, key: Prisma.Sql, now: D
     UNION ALL
     SELECT o.source_post_id FROM content_variants o
     JOIN source_post_revisions orv ON orv.id = o.revision_id
-    JOIN source_posts osp ON osp.id = o.source_post_id AND osp.archived_at IS NULL
+    JOIN source_posts osp ON osp.id = o.source_post_id AND osp.archived_at IS NULL AND osp.latest_revision_id = o.revision_id
     JOIN source_posts me ON me.id = ${post}
     WHERE o.target_id = ${target} AND o.source_post_id <> ${post} AND orv.content_key = ${key}
       AND o.status IN ('REWRITING', 'VALIDATING', 'READY', 'NEEDS_REVIEW')
@@ -172,7 +172,7 @@ export async function retireDuplicateVariants(t: Q, args: { now: Date; actor: st
   const rows = await t.$queryRaw<Array<{ id: string; status: VariantStatus; holder: string }>>`
     SELECT v.id, v.status::text AS status, h.id AS holder
     FROM content_variants v
-    JOIN source_posts vsp ON vsp.id = v.source_post_id AND vsp.archived_at IS NULL
+    JOIN source_posts vsp ON vsp.id = v.source_post_id AND vsp.archived_at IS NULL AND vsp.latest_revision_id = v.revision_id
     JOIN source_post_revisions r ON r.id = v.revision_id AND r.content_key <> ''
     CROSS JOIN LATERAL (${holderSql(Prisma.sql`v.target_id`, Prisma.sql`v.source_post_id`, Prisma.sql`r.content_key`, args.now)}) h
     WHERE v.status::text IN (${Prisma.join(WAITING)}) ${target}

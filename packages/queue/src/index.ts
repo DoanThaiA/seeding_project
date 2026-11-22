@@ -1,5 +1,5 @@
 import PgBoss from 'pg-boss';
-import { Q, parseJob, type JobPayload, type QueueName } from '@seedingsys/contracts';
+import { COMMENT_PUBLISH_RETRIES, Q, parseJob, type JobPayload, type QueueName } from '@seedingsys/contracts';
 import { claimOutbox, markOutboxPublished, tx, type Db } from '@seedingsys/db';
 import { captureError, type Logger } from '@seedingsys/observability';
 
@@ -14,7 +14,8 @@ export const QUEUE_SETTINGS: Record<QueueName, Omit<PgBoss.Queue, 'name'>> = {
   [Q.SourcePoll]: { policy: 'stately', retryLimit: 0, expireInSeconds: 4 * 60 },
   [Q.ProfileSync]: { policy: 'standard', retryLimit: 8, retryDelay: 25, expireInSeconds: 5 * 60 },
   [Q.CommentScan]: { policy: 'standard', retryLimit: 6, retryDelay: 30, expireInSeconds: 4 * 60 },
-  [Q.CommentPublish]: { policy: 'standard', retryLimit: 6, retryDelay: 30, expireInSeconds: 4 * 60 },
+  // A reply waits for its parent through retries: the handler gives up after COMMENT_PUBLISH_RETRIES.
+  [Q.CommentPublish]: { policy: 'standard', retryLimit: COMMENT_PUBLISH_RETRIES, retryDelay: 30, expireInSeconds: 4 * 60 },
   [Q.AssetFetch]: { policy: 'standard', retryLimit: 5, retryDelay: 30, retryBackoff: true, expireInSeconds: 15 * 60 },
   [Q.ContentRewrite]: { policy: 'standard', retryLimit: 2, retryDelay: 20, retryBackoff: true, expireInSeconds: 5 * 60 },
   [Q.ContentValidate]: { policy: 'standard', retryLimit: 1, retryDelay: 10, expireInSeconds: 5 * 60 },
@@ -40,7 +41,9 @@ export async function createBoss(connectionString: string, log: Logger): Promise
   await withDeadlockRetry(() => boss.start());
   for (const [name, opts] of Object.entries(QUEUE_SETTINGS)) {
     await withDeadlockRetry(async () => {
+      // Existing queues keep the settings they were created with unless they are updated here.
       if (!(await boss.getQueue(name))) await boss.createQueue(name, { name, ...opts });
+      else await boss.updateQueue(name, { name, ...opts });
     });
   }
   return boss;

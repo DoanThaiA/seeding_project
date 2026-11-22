@@ -84,6 +84,9 @@ export const label = (s: string): string => TONES[s]?.[1] ?? s;
 const REASONS: Record<string, string> = {
   MANUAL_REVIEW_MODE: 'Tài khoản đang ở chế độ duyệt tay',
   PROFILE_SYNC_REVIEW: 'Bản sao từ lượt đồng bộ profile',
+  SOURCE_REVISION_RESTORED: 'Bài nguồn đã quay lại phiên bản cũ, cần duyệt lại',
+  SOURCE_REVISION_CHANGED: 'Bài nguồn đã có bản mới, cần chuẩn bị lại bản đăng',
+  PAGINATION_INCOMPLETE: 'Nguồn còn trang chưa đọc',
   SOURCE_INCOMPLETE: 'Nguồn đọc chưa đầy đủ (caption bị cắt / thiếu media)',
   MEDIA_FETCH_FAILED: 'Không tải được toàn bộ media',
   UNSUPPORTED_FORMAT: 'Định dạng chưa hỗ trợ',

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FB_WEB_VERSION, FbWebPublishConnector } from '@seedingsys/connectors-fb-web';
+import { dispatchBacklogItem, editBacklogCaption, listBacklog } from '@seedingsys/db';
 import { createHarness, cycle, MIN, pubsOf, type Harness } from '../helpers/harness';
 import { MockFb } from '../helpers/mock-fb';
 
@@ -82,13 +83,42 @@ describe.skipIf(!BROWSER)('scheduler + publish handler with the real fb-web conn
     expect(mock.posts[0].media).toBe(3);
   });
 
-  it('does not dispatch a format that has not passed its capability test', async () => {
-    await h.db.capabilityCheck.deleteMany({ where: { contentType: 'TEXT' } });
-    await readyPost('Bài chưa được chứng nhận');
+  it('requires explicit approval when a queued draft has older audience settings', async () => {
+    await readyPost('Nội dung đã duyệt');
+    await h.db.targetAccount.updateMany({ data: { audience: 'PUBLIC' } });
+    const [item] = await listBacklog(h.db, h.clock.now());
+    expect(item.blockReason).toBe('AUDIENCE_CONFIG_CHANGED');
+    await expect(dispatchBacklogItem(h.core, item.id)).rejects.toMatchObject({ reason: 'AUDIENCE_CONFIG_CHANGED' });
+    const review = { variantId: item.id, snapshotHash: item.snapshotHash!, caption: item.caption!, now: h.clock.now(), actor: 'test-reviewer' };
+    await expect(h.db.$transaction(t => editBacklogCaption(t, { ...review, audience: 'FRIENDS' }))).resolves.toBe(false);
+    await expect(h.db.$transaction(t => editBacklogCaption(t, { ...review, audience: 'PUBLIC' }))).resolves.toBe(true);
     h.setTime(TEN);
     await cycle(h);
-    expect(mock.posts).toHaveLength(0);
+    expect((await pubsOf(h, 'B1'))[0].status).toBe('PUBLISHED_VERIFIED');
+    expect(mock.posts).toHaveLength(1);
+    expect(mock.posts[0].audience).toBe('Công khai');
+  });
+
+  it('dispatches an enabled Facebook format without a capability record', async () => {
+    await h.db.capabilityCheck.deleteMany({ where: { contentType: 'TEXT' } });
+    await readyPost('Bài đăng khi chưa có kết quả kiểm thử');
+    expect((await listBacklog(h.db, h.clock.now()))[0].blockReason).toBeNull();
+    h.setTime(TEN);
+    await cycle(h);
+    expect((await pubsOf(h, 'B1'))[0].status).toBe('PUBLISHED_VERIFIED');
+    expect(mock.posts).toHaveLength(1);
+  });
+
+  it('still blocks a Facebook format with no browser publishing flow', async () => {
+    await readyPost('Bài có định dạng không hỗ trợ');
+    await h.db.contentVariant.updateMany({ where: { status: 'READY' }, data: { contentType: 'NAMED_ALBUM' } });
+    const [item] = await listBacklog(h.db, h.clock.now());
+    expect(item.blockReason).toBe('FORMAT_UNSUPPORTED');
+    await expect(dispatchBacklogItem(h.core, item.id)).rejects.toMatchObject({ reason: 'FORMAT_UNSUPPORTED' });
+    h.setTime(TEN);
+    await cycle(h);
     expect(await h.db.publication.count()).toBe(0);
+    expect(mock.posts).toHaveLength(0);
   });
 
   it('a checkpoint stops the account before anything is posted and opens a takeover task', async () => {

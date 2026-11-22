@@ -11,7 +11,10 @@ export type VerifyOutcome = 'PUBLISHED_VERIFIED' | 'FAILED_CONFIRMED' | 'UNKNOWN
  */
 export async function applyVerifyResult(
   ctx: BrowserCtx,
-  a: { publicationId: string; from: 'VERIFYING' | 'RECONCILING'; attemptId: string; result: VerifyResult; committedAt: Date; fence: Lease; reconcileTries?: number; commitSignal?: CommitSignal },
+  a: {
+    publicationId: string; from: 'VERIFYING' | 'RECONCILING'; attemptId: string; result: VerifyResult;
+    committedAt: Date; fence: Lease; reconcileTries?: number; commitSignal?: CommitSignal; targetExternalId?: string;
+  },
 ): Promise<VerifyOutcome> {
   const now = ctx.clock.now();
   const r = a.result;
@@ -28,7 +31,7 @@ export async function applyVerifyResult(
         actor: ctx.actor,
         now,
         fence: a.fence,
-        data: { permalink: r.permalink, externalPostId: r.externalPostId ?? null, verifiedAt: now },
+        data: { permalink: r.permalink, externalPostId: r.externalPostId ?? null, verifiedAt: now, lastReason: null },
       });
       if (!ok) return 'FENCED';
       await attempt({ outcome: 'SUCCEEDED', stage: 'VERIFIED', evidence: { verify: r } });
@@ -56,7 +59,9 @@ export async function applyVerifyResult(
 
     const ok = await movePublication(t, { id: a.publicationId, from: a.from, to: 'UNKNOWN', actor: ctx.actor, now, fence: a.fence, reason: `VERIFY_${r.kind}` });
     if (!ok) return 'FENCED';
-    await attempt({ outcome: 'UNKNOWN', stage: 'VERIFY', evidence: { verify: r, ...(a.commitSignal && { commitSignal: a.commitSignal }) } });
+    await attempt({ outcome: 'UNKNOWN', stage: 'VERIFY', evidence: {
+      verify: r, ...(a.commitSignal && { commitSignal: a.commitSignal }), ...(a.targetExternalId && { targetExternalId: a.targetExternalId }),
+    } });
     await enqueue(t, Q.PublishReconcile, { publicationId: a.publicationId }, { startAfter: new Date(now.getTime() + ctx.reconcileDelaySec * 1000) });
     return 'UNKNOWN';
   });

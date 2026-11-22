@@ -1,5 +1,5 @@
 import { Prisma, type ContentType, type SlotStatus } from '@prisma/client';
-import { ACTIVE, PUBLISH_QUEUE_BY_WORKFLOW, UNRESOLVED, workflowFor } from '@seedingsys/contracts';
+import { ACTIVE, FB_WEB_PUBLISH_FORMATS, PUBLISH_QUEUE_BY_WORKFLOW, UNRESOLVED, workflowFor } from '@seedingsys/contracts';
 import { HOUR, isPastLaunchWindow, type Clock } from '@seedingsys/domain';
 import { accountResource, activeLease } from './lease';
 import { activeKillSwitch } from './controls';
@@ -52,16 +52,19 @@ function backlogBlocker(now: Date) {
   return Prisma.sql`CASE
     WHEN sp.archived_at IS NOT NULL OR v.status <> 'READY' OR v.snapshot_hash IS NULL THEN 'ITEM_UNAVAILABLE'
     WHEN v.expires_at <= ${now} THEN 'ITEM_EXPIRED'
+    WHEN v.revision_id IS DISTINCT FROM sp.latest_revision_id THEN 'SOURCE_REVISION_CHANGED'
     WHEN NOT ta.enabled THEN 'TARGET_DISABLED'
+    WHEN v.snapshot->>'audience' IS DISTINCT FROM ta.audience THEN 'AUDIENCE_CONFIG_CHANGED'
     WHEN NOT coalesce(m.enabled, false) THEN 'MAPPING_DISABLED'
     WHEN r.raw->>'sharedPermalink' IS NOT NULL OR latest.raw->>'sharedPermalink' IS NOT NULL THEN 'NATIVE_SHARE_REQUIRED'
     WHEN r.media_status IN ('FAILED','PENDING')
-      OR (coalesce(r.raw->>'reader', s.connector) IN ('fb-public','fb-session') AND r.incomplete ?| ARRAY['MEDIA_COUNT_UNKNOWN','MEDIA_UNAVAILABLE'])
+      OR r.incomplete ?| ARRAY['MEDIA_COUNT_UNKNOWN','MEDIA_UNAVAILABLE']
       THEN 'MEDIA_INCOMPLETE'
     WHEN p.id IS NOT NULL AND p.status NOT IN ('FAILED_CONFIRMED','CANCELLED') THEN 'ITEM_UNAVAILABLE'
     WHEN p.id IS NOT NULL AND p.publish_tries >= m.max_publish_tries THEN 'RETRY_LIMIT_REACHED'
     WHEN rel.version IS NULL THEN 'NO_CONNECTOR_RELEASE'
-    WHEN NOT EXISTS (
+    WHEN ta.connector = 'fb-web' AND v.content_type::text <> ALL(${[...FB_WEB_PUBLISH_FORMATS]}::text[]) THEN 'FORMAT_UNSUPPORTED'
+    WHEN ta.connector <> 'fb-web' AND NOT EXISTS (
       SELECT 1 FROM capability_checks cc WHERE cc.target_id = v.target_id AND cc.content_type = v.content_type
         AND cc.connector = ta.connector AND cc.connector_version = rel.version AND cc.passed
     ) THEN 'FORMAT_NOT_CERTIFIED'
@@ -72,9 +75,9 @@ function backlogBlocker(now: Date) {
 
 export function listBacklog(db: Db, now: Date) {
   return db.$queryRaw<Array<{ id: string; source: string; target: string; contentType: ContentType; readyAt: Date | null;
-    expiresAt: Date | null; preview: string | null; caption: string | null; snapshotHash: string | null; blockReason: string | null }>>`
+    expiresAt: Date | null; preview: string | null; caption: string | null; snapshotHash: string | null; targetAudience: string; blockReason: string | null }>>`
     SELECT v.id, s.code AS source, ta.code AS target, v.content_type AS "contentType", v.ready_at AS "readyAt", v.expires_at AS "expiresAt",
-      left(v.caption, 160) AS preview, v.caption, v.snapshot_hash AS "snapshotHash", ${backlogBlocker(now)} AS "blockReason"
+      left(v.caption, 160) AS preview, v.caption, v.snapshot_hash AS "snapshotHash", ta.audience AS "targetAudience", ${backlogBlocker(now)} AS "blockReason"
     ${backlogJoins}
     WHERE v.status = 'READY' AND sp.archived_at IS NULL AND (v.expires_at IS NULL OR v.expires_at > ${now})
       AND (p.id IS NULL OR p.status IN ('FAILED_CONFIRMED','CANCELLED'))
@@ -84,7 +87,7 @@ export function listBacklog(db: Db, now: Date) {
 
 /**
  * Oldest READY content for the target that is still valid, not yet published to it (or whose
- * earlier attempt failed without side effects), certified for the active connector and not paused.
+ * earlier attempt failed without side effects), supported by the active connector and not paused.
  */
 async function selectCandidate(t: Tx, targetId: string, connector: string, version: string, now: Date, variantId?: string): Promise<Candidate | null> {
   const rows = await t.$queryRaw<Candidate[]>`
@@ -95,17 +98,20 @@ async function selectCandidate(t: Tx, targetId: string, connector: string, versi
     JOIN source_post_revisions r ON r.id = v.revision_id
     LEFT JOIN source_post_revisions latest ON latest.id = sp.latest_revision_id
     JOIN sources s ON s.id = sp.source_id AND (s.enabled OR ${variantId !== undefined})
+    JOIN target_accounts ta ON ta.id = v.target_id
     JOIN source_target_mappings m ON m.source_id = sp.source_id AND m.target_id = v.target_id AND m.enabled
     LEFT JOIN publications p ON p.target_id = v.target_id AND p.source_post_id = v.source_post_id
     WHERE v.target_id = ${targetId}::uuid
       AND sp.archived_at IS NULL
+      AND v.revision_id = sp.latest_revision_id
       AND v.status = 'READY'
       AND v.snapshot_hash IS NOT NULL
+      AND v.snapshot->>'audience' = ta.audience
       AND r.raw->>'sharedPermalink' IS NULL
       AND latest.raw->>'sharedPermalink' IS NULL
       AND r.media_status NOT IN ('FAILED','PENDING')
       AND (${variantId ?? null}::uuid IS NULL OR v.id = ${variantId ?? null}::uuid)
-      AND NOT (COALESCE(r.raw->>'reader', s.connector) IN ('fb-public','fb-session') AND r.incomplete ?| ARRAY['MEDIA_COUNT_UNKNOWN','MEDIA_UNAVAILABLE'])
+      AND NOT (r.incomplete ?| ARRAY['MEDIA_COUNT_UNKNOWN','MEDIA_UNAVAILABLE'])
       AND (v.expires_at IS NULL OR v.expires_at > ${now})
       AND (p.id IS NULL OR (p.status IN ('FAILED_CONFIRMED','CANCELLED') AND p.publish_tries < m.max_publish_tries))
       -- Never the same content twice on one account, whichever source post it came from.
@@ -116,10 +122,11 @@ async function selectCandidate(t: Tx, targetId: string, connector: string, versi
         WHERE dp.target_id = v.target_id AND dp.source_post_id <> v.source_post_id
           AND dp.status NOT IN ('FAILED_CONFIRMED','CANCELLED')
           AND r.content_key <> '' AND dr.content_key = r.content_key)
-      AND EXISTS (
+      AND ((${connector} = 'fb-web' AND v.content_type::text = ANY(${[...FB_WEB_PUBLISH_FORMATS]}::text[]))
+        OR (${connector} <> 'fb-web' AND EXISTS (
         SELECT 1 FROM capability_checks cc
         WHERE cc.target_id = v.target_id AND cc.content_type = v.content_type
-          AND cc.connector = ${connector} AND cc.connector_version = ${version} AND cc.passed)
+          AND cc.connector = ${connector} AND cc.connector_version = ${version} AND cc.passed)))
       AND NOT EXISTS (
         SELECT 1 FROM controls c WHERE c.paused AND (
           (c.scope = 'FORMAT' AND c.scope_key = v.content_type::text) OR
@@ -138,6 +145,7 @@ async function olderPendingExists(t: Tx, targetId: string, before: Date | null, 
     JOIN source_target_mappings m ON m.source_id = sp.source_id AND m.target_id = v.target_id AND m.enabled AND m.strict_order
     WHERE v.target_id = ${targetId}::uuid
       AND sp.archived_at IS NULL
+      AND v.revision_id = sp.latest_revision_id
       AND v.status IN ('FETCHING_MEDIA','REWRITING','VALIDATING','NEEDS_REVIEW')
       AND (v.expires_at IS NULL OR v.expires_at > ${now})
       AND (${before}::timestamptz IS NULL OR COALESCE(sp.posted_at, sp.first_seen_at) < ${before})
@@ -233,7 +241,11 @@ async function dispatch(t: Tx, ctx: DispatchContext, slotId: string, variantId?:
       actor: ctx.actor,
       now,
       reason: 'RESELECTED',
-      data: { slotId: slot.id, variantId: cand.variant_id, snapshotHash: cand.snapshot_hash, contentType: cand.content_type, workflow, jobVersion: { increment: 1 } },
+      data: {
+        slotId: slot.id, variantId: cand.variant_id, snapshotHash: cand.snapshot_hash,
+        contentType: cand.content_type, workflow, jobVersion: { increment: 1 },
+        reconcileTries: 0, committedAt: null, verifiedAt: null, permalink: null, externalPostId: null,
+      },
     });
     if (!ok) return wait('RACE');
     publicationId = existing.id;

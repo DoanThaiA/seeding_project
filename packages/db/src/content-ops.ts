@@ -1,4 +1,4 @@
-import type { ContentType, Prisma } from '@prisma/client';
+import { Prisma, type ContentType } from '@prisma/client';
 import { Q as QN, REVIEW_REASONS, SUCCESS, UNRESOLVED, ACTIVE, workflowFor, type IncompleteFlag, type PublishSnapshot } from '@seedingsys/contracts';
 import { HOUR, contentKey, hashObject, isFacebookTimelineReader, removeAdvertisingLinks, revisionContentHash } from '@seedingsys/domain';
 import { audit } from './audit';
@@ -35,7 +35,7 @@ const OPEN_VARIANT: Array<'FETCHING_MEDIA' | 'REWRITING' | 'VALIDATING' | 'READY
   'NEEDS_REVIEW',
 ];
 
-/** Prepare credited comment copies for review. Existing edits, omissions and receipts win. */
+/** Prepare comment drafts for review. Preserve existing edits, omissions and receipts. */
 export async function prepareCommentDrafts(t: Q, sourcePostId: string, targetIds: string[], now: Date) {
   if (!targetIds.length) return 0;
   return t.$executeRaw`
@@ -71,7 +71,8 @@ export async function ingestPost(
   const { now } = args;
   let post = args.connector.startsWith('fb-') ? { ...args.post, text: removeAdvertisingLinks(args.post.text) } : args.post;
   const isPublic = isFacebookTimelineReader(args.connector);
-  const missingMedia = isPublic && post.incomplete.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE');
+  const trackIncompleteMedia = isPublic || args.connector === 'fb-graph';
+  const missingMedia = post.incomplete.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE');
 
   let sp = await findSourcePost(t, args.sourceId, post.externalId);
   if (!sp && hasUnstablePostIds(args.connector)) {
@@ -103,14 +104,17 @@ export async function ingestPost(
   }
 
   const promoteBaseline = isPublic && sp.isBaseline;
-  const latest = isPublic && sp.latestRevisionId
+  const latest = trackIncompleteMedia && sp.latestRevisionId
     ? await t.sourcePostRevision.findUnique({ where: { id: sp.latestRevisionId } })
     : null;
   if (latest && post.incomplete.includes('CAPTION_TRUNCATED')
     && Array.isArray(latest.incomplete) && !latest.incomplete.includes('CAPTION_TRUNCATED')) {
     post = { ...post, text: latest.text, incomplete: post.incomplete.filter(flag => flag !== 'CAPTION_TRUNCATED') };
   }
-  const latestInfo = latest?.raw as { postedAtExact?: boolean; sharedPermalink?: string; linkPreviews?: string[] } | null;
+  const latestInfo = latest?.raw as { postedAtExact?: boolean; sharedPermalink?: string; linkPreviews?: string[]; updated_time?: string } | null;
+  const graphUpdatedAt = args.connector === 'fb-graph' && typeof post.raw?.updated_time === 'string' ? post.raw.updated_time : undefined;
+  const graphUpdate = Date.parse(graphUpdatedAt ?? '');
+  if (graphUpdate < Date.parse(latestInfo?.updated_time ?? '')) return 'UNCHANGED';
   // A later read can miss the link preview the reader appended to the caption: same post, keep the known text.
   const knownPreviews = Array.isArray(latestInfo?.linkPreviews) ? latestInfo.linkPreviews : [];
   if (latest && knownPreviews.length && !post.raw?.linkPreviews && latest.text !== post.text
@@ -119,12 +123,17 @@ export async function ingestPost(
   }
   const baseHash = revisionContentHash({ text: post.text, albumTitle: post.albumTitle, media: post.media.map((m) => ({ ref: m.ref })) });
   const sharedPermalink = post.raw?.sharedPermalink ?? latestInfo?.sharedPermalink;
-  const contentHash = isPublic
+  const contentHash = trackIncompleteMedia
     ? hashObject({ baseHash, type: post.contentType, incomplete: [...post.incomplete].sort(), ...(sharedPermalink && { sharedPermalink }) })
     : baseHash;
   const improveDate = isPublic && post.postedAt && (!sp.postedAt || (post.raw?.postedAtExact === true && latestInfo?.postedAtExact !== true));
-  if (!isNewPost && (improveDate || (post.isShared && !sp.isShared))) {
-    await t.sourcePost.update({ where: { id: sp.id }, data: { ...(improveDate && { postedAt: post.postedAt }), ...(post.isShared && { isShared: true }) } });
+  const improveLink = post.identityConfidence === 'HIGH' && post.permalink && (isPublic || !sp.permalink) && post.permalink !== sp.permalink;
+  if (!isNewPost && (improveDate || improveLink || (post.isShared && !sp.isShared))) {
+    await t.sourcePost.update({ where: { id: sp.id }, data: {
+      ...(improveDate && { postedAt: post.postedAt }),
+      ...(improveLink && { permalink: post.permalink, identityConfidence: 'HIGH' }),
+      ...(post.isShared && { isShared: true }),
+    } });
   }
   // A guest preview can regress on a later read. Preserve a known complete manifest.
   const missing = (flags: unknown) => Array.isArray(flags) && flags.some(f => ['CAPTION_TRUNCATED', 'MEDIA_COUNT_UNKNOWN', 'MEDIA_UNAVAILABLE'].includes(f));
@@ -138,18 +147,19 @@ export async function ingestPost(
   const equivalent = !sharedPermalink && latest?.contentHash === baseHash && sp.contentType === post.contentType
     && JSON.stringify(latest.incomplete) === JSON.stringify(post.incomplete) ? latest : null;
   const stored = existingRev ?? equivalent;
-  if (isPublic && stored && stored.id === sp.latestRevisionId) {
+  if (trackIncompleteMedia && stored) {
     if (post.media.length) await refreshAssetUrls(t, stored.id, post.media);
     const raw = stored.raw as Record<string, unknown> | null;
     const expected = post.raw?.expectedPhotoCount;
     const details: Record<string, unknown> = {};
+    if (Number.isFinite(graphUpdate) && graphUpdatedAt !== raw?.updated_time) details.updated_time = graphUpdatedAt;
     if (typeof expected === 'number' && raw?.expectedPhotoCount !== expected) details.expectedPhotoCount = expected;
     if (improveDate && post.raw?.postedAtExact === true) Object.assign(details, { postedAtExact: true, stamp: post.raw.stamp ?? null });
     if (Object.keys(details).length) {
       await t.sourcePostRevision.update({ where: { id: stored.id }, data: { raw: { ...raw, ...details } as Prisma.InputJsonValue } });
     }
   }
-  if (stored && !promoteBaseline) return 'UNCHANGED';
+  if (stored?.id === sp.latestRevisionId && !promoteBaseline) return 'UNCHANGED';
 
   // Known now when there is no media or every file's bytes are known (stored or imported with a checksum).
   const checksums = post.media.map(m => m.stored?.checksum ?? m.expectedChecksum);
@@ -198,7 +208,9 @@ export async function ingestPost(
       if (rejected) continue;
     }
 
-    const open = await t.contentVariant.findMany({ where: { sourcePostId: sp.id, targetId: m.targetId, status: { in: OPEN_VARIANT } } });
+    const open = await t.contentVariant.findMany({
+      where: { sourcePostId: sp.id, targetId: m.targetId, revisionId: { not: rev.id }, status: { in: OPEN_VARIANT } },
+    });
     const recoveredCaption = latest && missing(latest.incomplete)
       ? open.find(v => v.revisionId === latest.id && v.caption && v.caption !== latest.text)?.caption
       : undefined;
@@ -211,6 +223,18 @@ export async function ingestPost(
     const base = isPublic ? now : post.postedAt ?? now;
     const expiresAt = new Date(base.getTime() + m.contentTtlHours * HOUR);
     const holder = await contentHolder(t, { targetId: m.targetId, sourcePostId: sp.id, contentKey: key, now });
+    const prior = stored && await t.contentVariant.findUnique({
+      where: { revisionId_targetId: { revisionId: rev.id, targetId: m.targetId } },
+    });
+    if (prior) {
+      if (!holder && prior.status === 'SUPERSEDED') {
+        const reason = 'SOURCE_REVISION_RESTORED';
+        const changed = await moveVariant(t, { id: prior.id, from: prior.status, to: 'NEEDS_REVIEW', actor: args.actor, now, reason,
+          data: { expiresAt, reviewReasons: [reason], snapshot: Prisma.DbNull, snapshotHash: null, readyAt: null, reviewedBy: null } });
+        if (changed) await openOperatorTask(t, { kind: 'REVIEW_CONTENT', reason, targetId: m.targetId, variantId: prior.id, now });
+      }
+      continue;
+    }
     if (holder) {
       // The target already has this content from another source post: keep a trace, never a second copy.
       const v = await t.contentVariant.create({
@@ -306,35 +330,44 @@ export async function advanceRevisionMedia(t: Q, revisionId: string, now: Date, 
   }
 }
 
+export class SnapshotBlockedError extends Error {}
+
 /** Build and freeze the publication snapshot (caption + ordered media manifest + audience). */
 export async function freezeSnapshot(
   t: Q,
   args: { variantId: string; from: 'VALIDATING' | 'NEEDS_REVIEW'; now: Date; actor: string; caption?: string; reviewedBy?: string },
 ): Promise<boolean> {
+  const variant = await t.contentVariant.findUnique({ where: { id: args.variantId }, select: { sourcePostId: true } });
+  if (!variant) return false;
+  const [sourcePost] = await t.$queryRaw<Array<{ archived_at: Date | null; latest_revision_id: string | null }>>`
+    SELECT archived_at, latest_revision_id FROM source_posts WHERE id=${variant.sourcePostId}::uuid FOR SHARE`;
+  if (!sourcePost || sourcePost.archived_at) return false;
+  await t.$queryRaw`SELECT id FROM content_variants WHERE id=${args.variantId}::uuid FOR NO KEY UPDATE`;
   const v = await t.contentVariant.findUnique({
     where: { id: args.variantId },
-    include: { target: true, revision: { include: { post: { include: { source: { select: { connector: true } } } }, assets: { include: { asset: true }, orderBy: { position: 'asc' } } } } },
+    include: { target: true, revision: { include: { assets: { include: { asset: true }, orderBy: { position: 'asc' } } } } },
   });
-  if (!v) return false;
-  const [sourcePost] = await t.$queryRaw<Array<{ archived_at: Date | null }>>`
-    SELECT archived_at FROM source_posts WHERE id=${v.sourcePostId}::uuid FOR SHARE`;
-  if (sourcePost?.archived_at) return false;
-  if (!workflowFor(v.contentType)) throw new Error('Định dạng bài hiện chưa có luồng đăng.');
+  if (!v || v.status !== args.from || v.revisionId !== sourcePost.latest_revision_id || (v.expiresAt && v.expiresAt <= args.now)) return false;
+  if (!workflowFor(v.contentType)) throw new SnapshotBlockedError('Định dạng bài hiện chưa có luồng đăng.');
   const flags = v.revision.incomplete;
-  const raw = v.revision.raw as { reader?: string; sharedPermalink?: string; expectedPhotoCount?: number } | null;
-  if (raw?.sharedPermalink) throw new Error('Mở bài gốc để chia sẻ trực tiếp trên Facebook.');
-  if (isFacebookTimelineReader(raw?.reader ?? v.revision.post.source.connector) && Array.isArray(flags)
-    && flags.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE')) {
-    throw new Error('Bài nguồn chưa tải đủ ảnh hoặc video. Quét lại nguồn để hoàn tất media trước khi duyệt.');
+  const raw = v.revision.raw as { sharedPermalink?: string; expectedPhotoCount?: number } | null;
+  if (raw?.sharedPermalink) throw new SnapshotBlockedError('Mở bài gốc để chia sẻ trực tiếp trên Facebook.');
+  if (v.revision.mediaStatus === 'FAILED' || v.revision.mediaStatus === 'PENDING' ||
+    (Array.isArray(flags) && flags.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE'))) {
+    throw new SnapshotBlockedError('Bài nguồn chưa tải đủ ảnh hoặc video. Quét lại nguồn để hoàn tất media trước khi duyệt.');
   }
-  const caption = removeAdvertisingLinks(args.caption ?? v.caption ?? '');
-  if (!caption) return false;
+  const inputCaption = args.caption ?? v.caption ?? (args.from === 'NEEDS_REVIEW' ? v.revision.text : '');
+  const caption = removeAdvertisingLinks(inputCaption).trim();
+  if (!caption && (v.contentType !== 'REEL' || inputCaption.trim())) throw new SnapshotBlockedError('Nhập caption hợp lệ trước khi duyệt.');
   const media = v.revision.assets.map((pa) => {
-    if (pa.asset.status !== 'STORED' || !pa.asset.checksum || !pa.asset.objectKey) throw new Error(`asset ${pa.assetId} not stored`);
+    if (pa.asset.status !== 'STORED' || !pa.asset.checksum || !pa.asset.objectKey) throw new SnapshotBlockedError('Bài chưa lưu đủ ảnh hoặc video.');
     return { position: pa.position, assetId: pa.assetId, checksum: pa.asset.checksum, objectKey: pa.asset.objectKey, mime: pa.asset.mime ?? 'application/octet-stream', kind: pa.asset.kind };
   });
   if (typeof raw?.expectedPhotoCount === 'number' && media.filter(asset => asset.kind === 'image').length !== raw.expectedPhotoCount) {
-    throw new Error('Số ảnh đã lưu chưa khớp số ảnh xác nhận trong bài gốc.');
+    throw new SnapshotBlockedError('Số ảnh đã lưu chưa khớp số ảnh xác nhận trong bài gốc.');
+  }
+  if (['VIDEO', 'REEL'].includes(v.contentType) && (media.length !== 1 || media[0].kind !== 'video')) {
+    throw new SnapshotBlockedError('Cần đủ một video đã lưu trước khi duyệt.');
   }
   const snapshot: PublishSnapshot = {
     variantId: v.id,
@@ -364,13 +397,13 @@ export async function freezeSnapshot(
 /** Edit the frozen caption while a variant is still waiting for a publication. */
 export async function editBacklogCaption(
   t: Q,
-  args: { variantId: string; snapshotHash: string; caption: string; actor: string; now: Date },
+  args: { variantId: string; snapshotHash: string; caption: string; audience?: string; actor: string; now: Date },
 ): Promise<boolean> {
   const item = await t.contentVariant.findUnique({ where: { id: args.variantId }, select: { targetId: true } });
   if (!item) return false;
   // Share the dispatch lock so an edit either precedes queueing or is rejected.
   await t.$queryRaw`SELECT id FROM target_accounts WHERE id = ${item.targetId}::uuid FOR UPDATE`;
-  const v = await t.contentVariant.findUnique({ where: { id: args.variantId } });
+  const v = await t.contentVariant.findUnique({ where: { id: args.variantId }, include: { target: { select: { audience: true } } } });
   if (!v || v.status !== 'READY' || v.snapshotHash !== args.snapshotHash || (v.expiresAt && v.expiresAt <= args.now)) return false;
   const [source] = await t.$queryRaw<Array<{ archived_at: Date | null }>>`
     SELECT archived_at FROM source_posts WHERE id=${v.sourcePostId}::uuid FOR SHARE`;
@@ -382,15 +415,17 @@ export async function editBacklogCaption(
   if (p && p.status !== 'FAILED_CONFIRMED' && p.status !== 'CANCELLED') return false;
   const snapshot = v.snapshot as unknown as PublishSnapshot | null;
   if (!snapshot || hashObject(snapshot) !== v.snapshotHash) return false;
-  const caption = removeAdvertisingLinks(args.caption);
-  if (!caption) return false;
-  const next = { ...snapshot, caption };
+  if (args.audience !== undefined && args.audience !== v.target.audience) return false;
+  const caption = removeAdvertisingLinks(args.caption).trim();
+  if (!caption && (v.contentType !== 'REEL' || args.caption.trim())) return false;
+  const next = { ...snapshot, caption, audience: args.audience ?? snapshot.audience };
   const changed = await t.contentVariant.updateMany({
     where: { id: v.id, status: 'READY', snapshotHash: args.snapshotHash },
     data: { caption, snapshot: next as unknown as Prisma.InputJsonValue, snapshotHash: hashObject(next) },
   });
   if (!changed.count) return false;
-  await audit(t, { entityType: 'variant', entityId: v.id, action: 'caption_edited', actor: args.actor, at: args.now });
+  await audit(t, { entityType: 'variant', entityId: v.id, action: args.audience === undefined ? 'caption_edited' : 'audience_updated',
+    actor: args.actor, at: args.now, ...(args.audience !== undefined && { data: { from: snapshot.audience, to: next.audience } }) });
   return true;
 }
 

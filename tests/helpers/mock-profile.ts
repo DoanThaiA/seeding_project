@@ -19,6 +19,8 @@ export interface ProfilePost {
   sharedReel?: 'attached' | 'shorts';
   comments?: boolean;
   structuredComments?: boolean;
+  commentDelayMs?: number;
+  commentPermalinkId?: string;
   emptyComments?: boolean;
   detailCaption?: string;
   messageRoleOnly?: boolean;
@@ -159,11 +161,11 @@ export class MockProfile {
             const thread = { comments: { count: 1, edges: [{ node: parent }] } };
             const story = { feedback_context: { feedback_target_with_context: { total_comment_count: 2,
               comment_list_renderer: { feedback: { comment_rendering_instance_for_feed_location: thread } } } } };
-            const node = { id: 'story', permalink_url: this.baseUrl + oldPath, comet_sections: {
+            const node = { id: p.id, permalink_url: this.baseUrl + oldPath, comet_sections: {
               content: { story: { actors: [{ name: this.owner }] } }, feedback: { story: { story_ufi_container: { story } } },
             } };
             const data = { recommendation: { __typename: 'Comment', legacy_fbid: '999', body: { text: 'Khác bài' } }, __bbox: { result: { data: { node_v2: node } } } };
-            return html(`<main data-comment-count="2"><button>Tất cả bình luận</button>
+            const content = `<main data-comment-count="2"><button>Tất cả bình luận</button>
               <article aria-label="Bình luận dưới bài"><a href="/profile?comment_id=${encoded('101')}">Khách A</a>
                 <a href="${oldPath}?comment_id=101">1 giờ</a><div data-comment-text>Bình luận chính</div>
                 <button onclick="document.getElementById('reply').hidden=false;this.hidden=true">Xem 1 câu trả lời</button>
@@ -174,9 +176,14 @@ export class MockProfile {
                 </article>
               </article>
               <article aria-label="Bình luận dưới bài"><a href="/user/posts/other?comment_id=999">1 giờ</a><div data-comment-text>Khác bài</div></article>
-              <script type="application/json">${JSON.stringify(data)}</script></main>`);
+              <script type="application/json">${JSON.stringify(data)}</script></main>`;
+            return html(p.commentDelayMs
+              ? `<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(content).replace(/</g, '\\u003c')}), ${p.commentDelayMs})</script>`
+              : content);
           }
-          const link = url.pathname + '?comment_id=101';
+          const link = p.commentPermalinkId
+            ? url.pathname.replace(/[^/]+$/, p.commentPermalinkId) + '?comment_id=101'
+            : url.pathname + '?comment_id=101';
           return html(`<main data-comment-count="2">
             <button>Tất cả bình luận</button>
             <article data-commentid="101">

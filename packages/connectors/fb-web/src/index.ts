@@ -83,6 +83,11 @@ export class FbWebPublishConnector implements PublishConnector {
       // Most common cause: the profile is already open (another process / a person logged in).
       throw new ConnectorError('TRANSIENT', `cannot open browser profile for ${target.code}: ${(e as Error).message.split('\n')[0]}`);
     }
-    return new FbWebSession(ctx, this.opts, target.code, this.opts.now).init();
+    try {
+      return await new FbWebSession(ctx, this.opts, target.code, this.opts.now).init();
+    } catch (error) {
+      await ctx.close().catch(() => undefined);
+      throw error;
+    }
   }
 }

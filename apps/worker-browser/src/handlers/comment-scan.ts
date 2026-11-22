@@ -4,13 +4,18 @@ import { removeAdvertisingLinks, RetryLaterError } from '@seedingsys/domain';
 import type { BrowserCtx } from '../ctx';
 
 export async function handleCommentScan(ctx: BrowserCtx, { scanId, readTargetId, manual }: { scanId: string; readTargetId?: string; manual?: boolean }, retryCount = 0): Promise<void> {
-  const scan = await ctx.db.commentScan.findUnique({ where: { id: scanId }, include: { post: { include: { source: true } } } });
+  const scan = await ctx.db.commentScan.findUnique({ where: { id: scanId }, include: { post: { include: {
+    source: true, aliases: { select: { externalId: true } },
+  } } } });
   if (!scan || scan.status !== 'QUEUED') return;
   const { post } = scan;
   const { source } = post;
-  const started = await ctx.db.commentScan.updateMany({ where: { id: scanId, status: 'QUEUED' }, data: { status: 'RUNNING', detail: null } });
+  const started = await ctx.db.commentScan.updateMany({ where: { id: scanId, status: 'QUEUED' }, data: {
+    status: 'RUNNING', detail: null, readCount: 0, expectedCount: null, updatedAt: ctx.clock.now(),
+  } });
   if (!started.count) return;
   let accountLease: Lease | null = null;
+  let accountTargetId: string | undefined;
   try {
     if (post.archivedAt) throw new ConnectorError('SOURCE_UNREADABLE', 'Bài nguồn đã chuyển vào thùng rác.');
     if ((!source.enabled && !manual) || await activeKillSwitch(ctx.db, { sourceId: source.id, connector: source.connector })) {
@@ -25,9 +30,13 @@ export async function handleCommentScan(ctx: BrowserCtx, { scanId, readTargetId,
         include: { target: { include: { profile: { include: { workerNode: true } } } } },
       });
       const target = links[0]?.target;
-      if (links.length !== 1 || !target?.profile || (target.profile.workerNode && target.profile.workerNode.name !== ctx.actor)) {
-        throw new ConnectorError('SOURCE_UNREADABLE', 'Cần một hồ sơ Facebook đang bật trên worker này để mở bài.');
+      if (links.length !== 1 || !target?.profile) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Cần một hồ sơ Facebook đang bật và đã có trình duyệt trong luồng để mở bài.');
       }
+      if (target.profile.workerNode && target.profile.workerNode.name !== ctx.actor) {
+        throw new RetryLaterError('Chờ worker quản lý hồ sơ đọc bình luận.');
+      }
+      accountTargetId = target.id;
       if (await activeKillSwitch(ctx.db, { targetId: target.id, connector: target.connector })) {
         throw new ConnectorError('SOURCE_UNREADABLE', 'Phiên Facebook dùng để đọc đang bị tạm dừng.');
       }
@@ -38,30 +47,39 @@ export async function handleCommentScan(ctx: BrowserCtx, { scanId, readTargetId,
     }
     let lastRead = -1;
     let lastExpected: number | undefined;
-    const result = await reader.readComments(sourceRef, { externalId: post.externalId, permalink: post.permalink ?? undefined },
+    const result = await reader.readComments(sourceRef, {
+      externalId: post.externalId, permalink: post.permalink ?? undefined, aliases: post.aliases.map(alias => alias.externalId),
+    },
       async (readCount, expectedCount) => {
         if (lastRead === readCount && lastExpected === expectedCount) return;
         lastRead = readCount;
         lastExpected = expectedCount;
-        await ctx.db.commentScan.updateMany({ where: { id: scanId, status: 'RUNNING' }, data: { readCount, expectedCount } });
+        await ctx.db.commentScan.updateMany({ where: { id: scanId, status: 'RUNNING' }, data: {
+          readCount, expectedCount: expectedCount ?? null, updatedAt: ctx.clock.now(),
+        } });
       });
     await tx(ctx.db, async t => {
       const now = ctx.clock.now();
       const [current] = await t.$queryRaw<Array<{ archived_at: Date | null }>>`
         SELECT archived_at FROM source_posts WHERE id=${post.id}::uuid FOR SHARE`;
-      if (current?.archived_at) throw new ConnectorError('SOURCE_UNREADABLE', 'Bài nguồn đã chuyển vào thùng rác.');
+      if (!current || current.archived_at) throw new ConnectorError('SOURCE_UNREADABLE', 'Bài nguồn không còn trong kho đang hoạt động.');
       if (accountLease && !await assertLeaseHeld(t, accountLease, now)) throw new Error('Phiên đọc đã hết hiệu lực.');
+      if (await activeKillSwitch(t, { sourceId: source.id, connector: source.connector }) ||
+        (accountTargetId && await activeKillSwitch(t, { targetId: accountTargetId, connector: 'fb-web' }))) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn hoặc phiên đọc đã được tạm dừng.');
+      }
       if (!await persistCommentScan(t, scanId, post.id, result, now)) return;
       const mappings = await t.sourceTargetMapping.findMany({ where: { sourceId: source.id, enabled: true }, select: { targetId: true } });
       await prepareCommentDrafts(t, post.id, mappings.map(m => m.targetId), now);
     }, 60_000);
   } catch (error) {
-    if (error instanceof RetryLaterError && retryCount < 6) {
-      await ctx.db.commentScan.updateMany({ where: { id: scanId, status: 'RUNNING' }, data: { status: 'QUEUED', detail: error.message } });
-      throw error;
-    }
     const detail = error instanceof ConnectorError || error instanceof RetryLaterError ? error.message : 'Lượt quét bị gián đoạn. Các bình luận đã lưu trước đó vẫn còn trong kho bài.';
-    await ctx.db.commentScan.updateMany({ where: { id: scanId, status: 'RUNNING' }, data: { status: 'FAILED', detail: detail.slice(0, 400) } });
+    const retryable = error instanceof RetryLaterError || (error instanceof ConnectorError && ['TRANSIENT', 'RATE_LIMITED'].includes(error.kind));
+    const retry = retryable && retryCount < 6;
+    const stopped = await ctx.db.commentScan.updateMany({ where: { id: scanId, status: 'RUNNING' }, data: {
+      status: retry ? 'QUEUED' : 'FAILED', detail: detail.slice(0, 400), updatedAt: ctx.clock.now(),
+    } });
+    if (retry && stopped.count) throw new RetryLaterError(detail);
     ctx.log.warn({ scanId, errorKind: error instanceof ConnectorError ? error.kind : 'INTERNAL' }, 'comment scan stopped');
   } finally {
     if (accountLease) await releaseLease(ctx.db, accountLease, ctx.clock.now());
@@ -70,7 +88,8 @@ export async function handleCommentScan(ctx: BrowserCtx, { scanId, readTargetId,
 
 export async function persistCommentScan(t: Tx, scanId: string, sourcePostId: string, result: ReadCommentsResult, now: Date) {
   const saved = await t.commentScan.updateMany({ where: { id: scanId, sourcePostId, status: 'RUNNING' }, data: {
-    status: result.complete ? 'COMPLETE' : 'PARTIAL', readCount: result.comments.length, expectedCount: result.expectedCount ?? null, detail: result.detail ?? null,
+    status: result.complete ? 'COMPLETE' : 'PARTIAL', readCount: result.comments.length, expectedCount: result.expectedCount ?? null,
+    detail: result.detail ?? null, updatedAt: now,
   } });
   if (!saved.count) return false;
   for (const [position, { externalId, ...fields }] of result.comments.entries()) {

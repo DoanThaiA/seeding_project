@@ -66,6 +66,11 @@ interface GraphPost {
   attachments?: { data?: GraphAttachment[] };
 }
 
+interface GraphPostsPage {
+  data?: GraphPost[];
+  paging?: { next?: string; cursors?: { after?: string } };
+}
+
 const POST_FIELDS = [
   'id',
   'message',
@@ -115,25 +120,70 @@ export class FbGraphReadConnector implements ReadConnector {
     if (code === 190) throw new ConnectorError('SOURCE_UNREADABLE', `Token Graph API hết hạn hoặc không hợp lệ: ${msg}`);
     if (code === 10 || code === 200 || (code !== undefined && code >= 200 && code < 300)) throw new ConnectorError('SOURCE_UNREADABLE', `Token thiếu quyền đọc bài: ${msg}`);
     if (code === 4 || code === 17 || code === 32 || code === 613 || res.status === 429) throw new ConnectorError('RATE_LIMITED', `Graph API giới hạn tần suất: ${msg}`);
-    if (code === 100 || res.status === 404) throw new ConnectorError('SOURCE_UNREADABLE', `Không đọc được nguồn (sai ID trang?): ${msg}`);
+    if (code === 100 || res.status === 404) {
+      throw new ConnectorError('SOURCE_UNREADABLE', `Không đọc được nguồn (sai ID trang?): ${msg}`, false, { graphCode: code });
+    }
     throw new ConnectorError(res.status >= 500 ? 'TRANSIENT' : 'PERMANENT', `Graph API lỗi: ${msg}`);
   }
 
   async readSince(source: SourceRef, watermark: Record<string, unknown> | null, overlap: number): Promise<ReadResult> {
     const token = this.token(source.code);
-    const limit = source.history ? '50' : String(Math.max(this.opts.pageSize ?? 25, overlap, 5));
-    const cursor = source.history?.cursor;
-    const r = await this.get<{ data?: GraphPost[]; paging?: { next?: string; cursors?: { after?: string } } }>(
-      `${encodeURIComponent(source.externalRef)}/posts`, { fields: POST_FIELDS, limit, ...(cursor && { after: cursor }) },
-      token, source.history ? AbortSignal.timeout(45_000) : undefined);
-    const posts = (r.data ?? []).map((p) => this.toPost(p, source.code));
-    const newest = posts.reduce((m, p) => Math.max(m, p.postedAt?.getTime() ?? 0), Number((watermark as { newest?: number } | null)?.newest ?? 0));
-    const next = r.paging?.next ? r.paging.cursors?.after : undefined;
-    const nextCursor = next && next !== cursor ? next : undefined;
-    return { posts, nextWatermark: { newest }, incomplete: [],
-      ...(source.history && { history: { complete: !r.paging?.next, nextCursor,
-        detail: r.paging?.next && !nextCursor ? 'Graph API chưa trả con trỏ hợp lệ cho trang lịch sử tiếp theo.' : undefined } }),
+    const limit = source.history ? '50' : String(Math.min(100, Math.max(Math.floor(this.opts.pageSize || 25), overlap, 5)));
+    const path = `${encodeURIComponent(source.externalRef)}/posts`;
+    const signal = AbortSignal.timeout(45_000);
+    const load = async (cursor?: string) => {
+      const page = await this.get<GraphPostsPage>(path, { fields: POST_FIELDS, limit, ...(cursor && { after: cursor }) }, token, signal);
+      if (!Array.isArray(page.data) || page.data.some(p => typeof p?.id !== 'string' || !p.id)) {
+        throw new ConnectorError('TRANSIENT', 'Graph API trả dữ liệu bài viết không hợp lệ.');
+      }
+      return { posts: page.data.map(post => this.toPost(post, source.code)),
+        more: !!page.paging?.next, next: page.paging?.next ? page.paging.cursors?.after : undefined };
     };
+    if (source.history) {
+      const page = await load(source.history.cursor);
+      const nextCursor = page.next && page.next !== source.history.cursor ? page.next : undefined;
+      return { posts: page.posts, nextWatermark: {}, incomplete: [],
+        history: { complete: !page.more, nextCursor,
+          detail: page.more && !nextCursor ? 'Graph API chưa trả con trỏ hợp lệ cho trang lịch sử tiếp theo.' : undefined } };
+    }
+
+    const previous = typeof watermark?.newest === 'number' ? watermark.newest : 0;
+    let newest = typeof watermark?.pendingNewest === 'number' ? Math.max(previous, watermark.pendingNewest) : previous;
+    let cursor = typeof watermark?.nextCursor === 'string' ? watermark.nextCursor : undefined;
+    const seen = new Set<string>();
+    const posts = new Map<string, ReadPost>();
+    let overlapRead = typeof watermark?.pendingOverlapRead === 'number' ? watermark.pendingOverlapRead : 0;
+    // Retain the previous watermark until a burst of posts is fully read across poll batches.
+    for (let i = 0; i < 5; i++) {
+      if (cursor) seen.add(cursor);
+      const page = await load(cursor).catch(error => {
+        if (i || !cursor || !(error instanceof ConnectorError) || error.evidence?.graphCode !== 100) throw error;
+        // Graph can invalidate a cursor between polls. Restart from the previous settled watermark.
+        cursor = undefined;
+        newest = previous;
+        overlapRead = 0;
+        seen.clear();
+        return load();
+      });
+      for (const post of page.posts) {
+        const stamp = post.postedAt?.getTime();
+        if (stamp) {
+          newest = Math.max(newest, stamp);
+          if (stamp <= previous && !posts.has(post.externalId)) overlapRead++;
+        }
+        posts.set(post.externalId, post);
+      }
+      if (!page.more || !watermark || overlapRead >= Math.max(overlap, 1)) {
+        return { posts: [...posts.values()], nextWatermark: { newest }, incomplete: [] };
+      }
+      if (!page.next || seen.has(page.next)) {
+        return { posts: [...posts.values()], nextWatermark: { newest: previous }, incomplete: ['PAGINATION_INCOMPLETE'] };
+      }
+      cursor = page.next;
+    }
+    return { posts: [...posts.values()],
+      nextWatermark: { newest: previous, pendingNewest: newest, pendingOverlapRead: overlapRead, nextCursor: cursor },
+      incomplete: ['PAGINATION_INCOMPLETE'] };
   }
 
   async readComments(source: SourceRef, post: { externalId: string },
@@ -154,12 +204,15 @@ export class FbGraphReadConnector implements ReadConnector {
             fields: 'id,message,from,permalink_url,created_time,comment_count', order: 'chronological', filter: 'toplevel', limit: '100',
             ...(after && { after }),
           }, token, signal);
-          for (const raw of page.data ?? []) {
-            if (!raw.id || comments.has(raw.id)) continue;
+          if (!Array.isArray(page.data) || page.data.some(raw => typeof raw?.id !== 'string' || !raw.id)) {
+            throw new ConnectorError('TRANSIENT', 'Graph API trả dữ liệu bình luận không hợp lệ.');
+          }
+          for (const raw of page.data) {
+            if (comments.has(raw.id)) continue;
             const postedAt = raw.created_time ? new Date(raw.created_time) : undefined;
             comments.set(raw.id, { externalId: raw.id, parentExternalId: parent, text: raw.message ?? '',
               authorName: raw.from?.name, permalink: raw.permalink_url, postedAt: postedAt && Number.isFinite(+postedAt) ? postedAt : undefined });
-            if (raw.comment_count) edges.push({ node: raw.id, parent: raw.id });
+            if (typeof raw.comment_count === 'number' && raw.comment_count > 0) edges.push({ node: raw.id, parent: raw.id });
           }
           await onProgress(comments.size);
           if (comments.size >= 10_000) throw new Error('Đã đạt giới hạn lưu của một lượt quét.');
@@ -188,7 +241,7 @@ export class FbGraphReadConnector implements ReadConnector {
         if (att.subattachments?.paging?.next) incomplete.push('MEDIA_COUNT_UNKNOWN');
         const photos = subs.filter(isPhoto);
         const videos = subs.filter(isVideo);
-        if (videos.length && photos.length) {
+        if ((videos.length && photos.length) || videos.length > 1 || videos.length + photos.length !== subs.length) {
           contentType = 'UNSUPPORTED'; // mixed photo + video post: no publish flow for it
         } else if (videos.length === 1 && !photos.length) {
           contentType = 'VIDEO';
@@ -212,11 +265,12 @@ export class FbGraphReadConnector implements ReadConnector {
     }
     if (media.some((m) => !m.sourceUrl && !m.ref.startsWith('fbgraph-video:'))) incomplete.push('MEDIA_UNAVAILABLE');
 
+    const postedAt = p.created_time ? new Date(p.created_time) : undefined;
     return {
       externalId: p.id,
       identityConfidence: 'HIGH',
       permalink: p.permalink_url,
-      postedAt: p.created_time ? new Date(p.created_time) : undefined,
+      postedAt: postedAt && Number.isFinite(postedAt.getTime()) ? postedAt : undefined,
       text: p.message ?? '',
       contentType,
       isPinned: false,

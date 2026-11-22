@@ -82,7 +82,7 @@ async function main() {
     update: activate ? { active: true } : {},
   });
   const passed = results.filter((r) => r.passed).map((r) => r.format);
-  console.log(passed.length ? `\nĐể cho phép đăng các định dạng đạt, đặt trên máy worker: FB_ENABLED_FORMATS=${passed.join(',')}` : '\nKhông có định dạng nào đạt: hệ thống sẽ không giao việc cho fb-web.');
+  console.log(passed.length ? `\nĐịnh dạng đã đạt kiểm thử: ${passed.join(', ')}` : '\nLượt kiểm thử chưa có định dạng đạt.');
   console.log('Nhớ xóa tay các bài thử "[SeedingSys capability test ...]" trên tài khoản.');
   await db.$disconnect();
 }

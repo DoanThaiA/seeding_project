@@ -20,7 +20,6 @@ const MIME = /^(?:image\/(?:jpeg|png|gif|webp)|video\/mp4)$/;
 
 interface Card {
   id: string;
-  author: string;
   authorUrl: string;
 }
 
@@ -79,7 +78,7 @@ const FIND_CARDS = String.raw`(() => {
     const author = card.querySelector(heading);
     if (author.closest(article) && author.closest(article) !== card) continue;
     card.dataset.ssPublicCard ||= String(next++);
-    result.push({ id: card.dataset.ssPublicCard, author: author.innerText.trim(), authorUrl: author.href });
+    result.push({ id: card.dataset.ssPublicCard, authorUrl: author.href });
   }
   document.body.dataset.ssPublicNext = String(next);
   return result;
@@ -348,7 +347,8 @@ function profileIdentity(url: URL): string {
 }
 
 function postLink(value: string, base: URL): { id: string; url: string } | undefined {
-  const link = new URL(value, base);
+  let link: URL;
+  try { link = new URL(value, base); } catch { return; }
   if (!postLinkHost(link, base)) return;
   const path = link.pathname.replace(/\/$/, '');
   const story = /^\/(?:permalink|story)\.php$/.test(path);
@@ -468,10 +468,21 @@ export class FbPublicReadConnector implements ReadConnector {
       throw new ConnectorError('SOURCE_UNREADABLE', accountCode ? `Facebook chuyển hướng khỏi trang nguồn khi dùng phiên ${accountCode}.`
         : 'Facebook chuyển hướng khỏi trang nguồn. Trang phải xem được khi chưa đăng nhập.');
     }
-    if (accountIdentity && profileIdentity(observed) === accountIdentity) {
+    const expectedId = profileIdentity(profile);
+    const observedId = profileIdentity(observed);
+    if (/^\d+$/.test(expectedId) && /^\d+$/.test(observedId) && observedId !== expectedId) {
+      throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook chuyển hướng sang profile khác với nguồn đã cấu hình.');
+    }
+    aliases.add(observedId);
+    const canonicalLinks = await page.locator('link[rel="canonical"],meta[property="og:url"]').evaluateAll(elements =>
+      elements.map(element => element.getAttribute('href') ?? element.getAttribute('content') ?? ''));
+    for (const url of canonicalLinks) {
+      const canonical = this.profileAt(url);
+      if (canonical) aliases.add(profileIdentity(canonical));
+    }
+    if (accountIdentity && aliases.has(accountIdentity)) {
       throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn trùng với tài khoản đích. Chọn một trang nguồn khác để tránh đăng lặp.');
     }
-    aliases.add(profileIdentity(observed));
     return this.collect(page, aliases, limit, deadline, history);
   }
 
@@ -488,10 +499,12 @@ export class FbPublicReadConnector implements ReadConnector {
     return expected;
   }
 
-  async readComments(source: SourceRef, post: { externalId: string; permalink?: string },
+  async readComments(source: SourceRef, post: { externalId: string; permalink?: string; aliases?: string[] },
     onProgress: (readCount: number, expectedCount?: number) => Promise<void>): Promise<ReadCommentsResult> {
     const link = post.permalink && postLink(post.permalink, this.base);
-    if (!link || link.id !== post.externalId) throw new ConnectorError('SOURCE_UNREADABLE', 'Cần liên kết chính xác của bài nguồn để quét bình luận.');
+    if (!link || (link.id !== post.externalId && !post.aliases?.includes(link.id))) {
+      throw new ConnectorError('SOURCE_UNREADABLE', 'Cần liên kết chính xác của bài nguồn để quét bình luận.');
+    }
     const account = this.key === 'fb-session' ? source.readAccount : undefined;
     if (this.key === 'fb-session' && !account) throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn chưa có phiên Facebook để đọc.');
     const launch = { headless: account ? this.opts.headless : true, channel: this.opts.channel, executablePath: this.opts.executablePath, timeout: 15_000 };
@@ -513,7 +526,7 @@ export class FbPublicReadConnector implements ReadConnector {
       if (!response?.ok() || postLink(page.url(), this.base)?.id !== link.id || (!account && await sel.loginForm(page).isVisible())) {
         throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook chưa mở được đúng bài và phần bình luận với phiên này.');
       }
-      return await collectVisibleComments(page, link.id, Date.now() + 85_000, onProgress);
+      return await collectVisibleComments(page, link.id, Date.now() + 85_000, onProgress, [post.externalId, ...(post.aliases ?? [])]);
     } finally {
       if (browser) await browser.close();
       else await context?.close();
@@ -533,7 +546,8 @@ export class FbPublicReadConnector implements ReadConnector {
   }
 
   private async readPermalink(feed: Page, link: { id: string; url: string }, aliases: Set<string>): Promise<{ post: ReadPost; data: CardContent } | null> {
-    const page = await feed.context().newPage();
+    const page = await feed.context().newPage().catch(() => null);
+    if (!page) return null;
     page.setDefaultTimeout(1300);
     try {
       const url = new URL(link.url);
@@ -598,7 +612,6 @@ export class FbPublicReadConnector implements ReadConnector {
     const settled = new Set<string>();
     let idle = 0;
     let scroll = '';
-    let owner: string | undefined;
     let blockedMidScan = false;
     const scanUntil = Math.min(deadline, Date.now() + (history ? 48_000 : 38_000));
     for (let step = 0; step < (history ? 64 : 34) && idle < 4 && posts.size < max && Date.now() < scanUntil; step++) {
@@ -615,17 +628,16 @@ export class FbPublicReadConnector implements ReadConnector {
       if (!cards.length) {
         const body = await page.locator('body').innerText();
         if (LOGIN_WALL.test(body)) {
+          if (posts.size) { blockedMidScan = true; break; }
           throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook yêu cầu đăng nhập hoặc trang nguồn không khả dụng cho khách.');
         }
         if (!posts.size && NO_POSTS.test(body)) return { posts: [], partial: false };
-      } else if (!owner) {
-        owner = (await page.locator('h1,[role="heading"][aria-level="1"]').first().textContent({ timeout: 250 }).catch(() => ''))?.trim().toLowerCase();
       }
       const before = settled.size;
       for (const card of cards) {
         if (settled.has(card.id) || posts.size >= max || Date.now() >= scanUntil) continue;
         const author = this.profileAt(card.authorUrl);
-        if (!author || (!aliases.has(profileIdentity(author)) && !(owner && card.author.toLowerCase() === owner))) continue;
+        if (!author || !aliases.has(profileIdentity(author))) continue;
         const found = await this.readCard(page, card.id, undefined, aliases);
         if (!found) continue;
         settled.add(card.id);

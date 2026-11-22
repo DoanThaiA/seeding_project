@@ -52,7 +52,10 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
   const s = useSubmit();
   const edited = caption.trim() !== (v.caption ?? '').trim();
   const missingMedia = v.revision.incomplete.some(flag => flag === 'MEDIA_UNAVAILABLE' || flag === 'MEDIA_COUNT_UNKNOWN');
-  const mediaOk = !missingMedia && v.revision.assets.every((a) => a.asset.status === 'STORED');
+  const mediaOk = !missingMedia && ['READY', 'NOT_REQUIRED'].includes(v.revision.mediaStatus)
+    && (!['VIDEO', 'REEL'].includes(v.contentType) || (v.revision.assets.length === 1 && v.revision.assets[0].asset.kind === 'video'))
+    && v.revision.assets.every((a) => a.asset.status === 'STORED');
+  const validCaption = v.contentType === 'REEL' || !!caption.trim();
   const share = v.revision.sharedPermalink;
   const failed = v.checks.filter((c) => !c.passed && c.kind !== 'not_verbatim');
 
@@ -122,12 +125,12 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
             <div className="actions">
               {!share && <button
                 className="primary"
-                disabled={s.pending || !mediaOk || v.contentType === 'UNSUPPORTED' || !caption.trim()}
-                onClick={() => s.run(() => bff('POST', `review/${v.id}/approve`, edited ? { caption: caption.trim() } : {}), 'Đã duyệt')}
+                disabled={s.pending || !mediaOk || v.contentType === 'UNSUPPORTED' || !validCaption}
+                onClick={() => s.run(() => bff('POST', `review/${v.id}/approve`, { caption: caption.trim() }), 'Đã duyệt')}
               >
                 {edited ? 'Duyệt với caption đã sửa' : 'Duyệt'}
               </button>}
-              <button disabled={s.pending || !edited || !caption.trim()}
+              <button disabled={s.pending || !edited || (!caption.trim() && (!validCaption || !!share))}
                 onClick={() => s.run(() => bff('PATCH', `review/${v.id}/caption`, { caption }), 'Đã lưu caption')}>Lưu caption</button>
               {!share && <ActionButton path={`review/${v.id}/rewrite`} confirm="Cho AI viết lại caption từ bài gốc? Caption hiện tại sẽ bị thay.">Viết lại bằng AI</ActionButton>}
               <button className="danger" onClick={() => setRejecting(true)}>Loại bài</button>

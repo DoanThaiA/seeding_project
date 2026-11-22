@@ -44,9 +44,9 @@ export class ImportController {
   @Post('sources/:id/manual-posts')
   @Roles('reviewer', 'operator')
   @UseInterceptors(FilesInterceptor('media', MAX_FILES, { limits: { fileSize: MAX_FILE, files: MAX_FILES, fields: 10 } }))
-  async create(@Param('id') id: string, @Body() body: unknown, @UploadedFiles() files: UploadedFile[] | undefined, @Actor() a: Principal) {
+  async create(@Param('id', ParseUUIDPipe) id: string, @Body() body: unknown, @UploadedFiles() files: UploadedFile[] | undefined, @Actor() a: Principal) {
     const d = parse(Body_, body ?? {});
-    const source = await this.db.source.findUnique({ where: { id } }).catch(() => null);
+    const source = await this.db.source.findUnique({ where: { id } });
     if (!source) throw new NotFoundException('Không có nguồn này');
     if (source.connector !== 'manual') throw new ConflictException('Nguồn này không phải nguồn nhập tay');
     if (!source.enabled) throw new ConflictException('Nguồn đang tắt');
@@ -78,6 +78,9 @@ export class ImportController {
     const now = this.clock.now();
     const outcome = await tx(this.db, async (t) => {
       await t.$queryRaw`SELECT id FROM sources WHERE id = ${source.id}::uuid FOR UPDATE`; // serialise concurrent imports
+      const current = await t.source.findUnique({ where: { id } });
+      if (!current) throw new NotFoundException('Không có nguồn này');
+      if (current.connector !== 'manual' || !current.enabled) throw new ConflictException('Nguồn nhập tay đã đổi cấu hình hoặc đang tắt.');
       await this.rejectImportedCopy(t, source, key);
       return ingestPost(t, {
         sourceId: source.id,
@@ -126,7 +129,9 @@ export class ImportController {
       where: { id },
       include: { revision: { include: { post: { include: { source: true } }, assets: true } } },
     });
-    if (!v || v.status !== 'NEEDS_REVIEW') throw new ConflictException('Bài đã đổi trạng thái.');
+    if (!v || v.status !== 'NEEDS_REVIEW' || v.revision.post.archivedAt || v.revision.post.latestRevisionId !== v.revisionId) {
+      throw new ConflictException('Bài đã đổi trạng thái.');
+    }
     const r = v.revision;
     const post = r.post;
     const flags = r.incomplete as IncompleteFlag[];
@@ -160,8 +165,9 @@ export class ImportController {
     const now = this.clock.now();
     const outcome = await tx(this.db, async t => {
       await t.$queryRaw`SELECT id FROM sources WHERE id = ${post.sourceId}::uuid FOR UPDATE`;
+      await t.$queryRaw`SELECT id FROM source_posts WHERE id = ${post.id}::uuid FOR UPDATE`;
       const current = await t.contentVariant.findUnique({ where: { id }, include: { revision: { include: { post: { include: { source: true } } } } } });
-      if (!current || current.status !== 'NEEDS_REVIEW' || current.revision.post.latestRevisionId !== r.id
+      if (!current || current.status !== 'NEEDS_REVIEW' || current.revision.post.archivedAt || current.revision.post.latestRevisionId !== r.id
         || !isFacebookTimelineReader(current.revision.post.source.connector) || (current.expiresAt && current.expiresAt <= now)) {
         throw new ConflictException('Bài gốc vừa thay đổi hoặc hết hiệu lực. Tải lại trang trước khi bổ sung.');
       }

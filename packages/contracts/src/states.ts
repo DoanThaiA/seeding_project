@@ -101,7 +101,7 @@ const V: Record<VariantStatus, readonly VariantStatus[]> = {
   REJECTED: [],
   UNSUPPORTED: ['NEEDS_REVIEW'],
   EXPIRED: [],
-  SUPERSEDED: [],
+  SUPERSEDED: ['NEEDS_REVIEW'], // a confirmed reappearance of this revision needs a fresh review
   // Another source post holds this content for the target. Terminal: the target gets it once.
   DUPLICATE: [],
 };

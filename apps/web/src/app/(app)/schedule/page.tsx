@@ -24,6 +24,8 @@ interface BacklogItem {
   preview: string | null;
   caption: string | null;
   snapshotHash: string | null;
+  targetAudience: string;
+  blockReason: string | null;
   blockedText: string | null;
 }
 
@@ -88,7 +90,8 @@ export default async function Schedule({ searchParams }: { searchParams: Promise
                         <td className="num" style={{ width: 28 }}>{i + 1}</td>
                         <td style={{ width: 60 }}>{b.source}</td>
                         <td style={{ width: 110 }}>{label(b.contentType)}</td>
-                        <td>{b.preview}{can.review(session.role) && b.snapshotHash && <BacklogCaption key={b.snapshotHash} id={b.id} value={b.caption ?? ''} snapshotHash={b.snapshotHash} />}</td>
+                        <td>{b.preview}{can.review(session.role) && b.snapshotHash && <BacklogCaption key={b.snapshotHash} id={b.id} value={b.caption ?? ''} snapshotHash={b.snapshotHash} optional={b.contentType === 'REEL'}
+                          audience={b.blockReason === 'AUDIENCE_CONFIG_CHANGED' ? b.targetAudience : undefined} />}</td>
                         <td style={{ whiteSpace: 'nowrap' }} className="muted">hết hạn {fmtTime(b.expiresAt)}</td>
                         {canPublish && <td>{b.blockedText
                           ? <span className="muted">{b.blockedText}</span>

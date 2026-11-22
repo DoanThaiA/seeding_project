@@ -1,5 +1,5 @@
 import { REVIEW_REASONS } from '@seedingsys/contracts';
-import { freezeSnapshot, moveVariant, openOperatorTask, tx } from '@seedingsys/db';
+import { freezeSnapshot, moveVariant, openOperatorTask, SnapshotBlockedError, tx } from '@seedingsys/db';
 import { runCaptionChecks } from '@seedingsys/domain';
 import type { CoreCtx } from '../ctx';
 
@@ -40,12 +40,20 @@ export async function handleContentValidate(ctx: CoreCtx, p: { variantId: string
     await t.contentCheck.createMany({
       data: checks.map((c) => ({ variantId: v.id, kind: c.kind, passed: c.passed, details: (c.details ?? {}) as object })),
     });
-    if (reasons.size) {
-      const list = [...reasons, ...editorReasons];
-      const ok = await moveVariant(t, { id: v.id, from: 'VALIDATING', to: 'NEEDS_REVIEW', actor: ctx.actor, now, reason: [...reasons].join(','), data: { reviewReasons: list } });
-      if (ok) await openOperatorTask(t, { kind: 'REVIEW_CONTENT', reason: [...reasons].join(','), targetId: v.targetId, variantId: v.id, now });
-      return;
+    if (!reasons.size) {
+      try {
+        if (await freezeSnapshot(t, { variantId: v.id, from: 'VALIDATING', now, actor: ctx.actor })) return;
+        reasons.add(REVIEW_REASONS.INCOMPLETE);
+      } catch (error) {
+        if (!(error instanceof SnapshotBlockedError)) throw error;
+        reasons.add(error.message);
+      }
     }
-    await freezeSnapshot(t, { variantId: v.id, from: 'VALIDATING', now, actor: ctx.actor });
+    const reason = [...reasons].join(',');
+    const [post] = await t.$queryRaw<Array<{ archived_at: Date | null }>>`
+      SELECT archived_at FROM source_posts WHERE id=${v.sourcePostId}::uuid FOR SHARE`;
+    const ok = await moveVariant(t, { id: v.id, from: 'VALIDATING', to: 'NEEDS_REVIEW', actor: ctx.actor, now, reason,
+      data: { reviewReasons: [...reasons, ...editorReasons] } });
+    if (ok && post && !post.archived_at) await openOperatorTask(t, { kind: 'REVIEW_CONTENT', reason, targetId: v.targetId, variantId: v.id, now });
   });
 }

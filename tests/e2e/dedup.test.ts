@@ -40,12 +40,13 @@ describe('one source post is collected once', () => {
 
     expect(await ingest('A1', read({ externalId: 'pfbidAAA', text: caption, contentType: 'SINGLE_PHOTO', media: [photo('pfbidAAA')] }))).toBe('NEW_POST');
     // Another session: Facebook shows the same post under another pfbid (now with its exact time).
-    const rotated = read({ externalId: 'pfbidBBB', text: caption, contentType: 'SINGLE_PHOTO', media: [photo('pfbidBBB')], postedAt: exact, raw: { postedAtExact: true } });
+    const rotated = read({ externalId: 'pfbidBBB', text: caption, contentType: 'SINGLE_PHOTO', media: [photo('pfbidBBB')],
+      permalink: 'https://www.facebook.com/photo.owner/posts/pfbidBBB', postedAt: exact, raw: { postedAtExact: true } });
     expect(await ingest('A1', rotated)).toBe('UNCHANGED');
     expect(await ingest('A1', rotated)).toBe('UNCHANGED'); // the alias now maps straight to the record
 
     const [post] = await h.db.sourcePost.findMany();
-    expect(post).toMatchObject({ externalId: 'pfbidAAA', postedAt: exact });
+    expect(post).toMatchObject({ externalId: 'pfbidAAA', postedAt: exact, permalink: rotated.permalink });
     expect(await h.db.sourcePostAlias.findMany({ select: { externalId: true, sourcePostId: true } })).toEqual([{ externalId: 'pfbidBBB', sourcePostId: post.id }]);
     expect(await h.db.sourcePostRevision.count()).toBe(1);
     expect(await h.db.contentVariant.count()).toBe(1);
@@ -72,6 +73,25 @@ describe('one source post is collected once', () => {
     expect(await h.db.sourcePost.count()).toBe(1);
     expect(await h.db.sourcePostRevision.count()).toBe(1);
     expect(await h.db.contentVariant.count()).toBe(1);
+  });
+
+  it('restores a previously stored revision for review when the source caption reverts', async () => {
+    const original = read({ externalId: 'post-edited', text: 'Caption đầu của bài viết' });
+    await ingest('A1', original);
+    await h.drain();
+    const prior = await h.db.contentVariant.findFirstOrThrow();
+    expect(prior.status).toBe('READY');
+    await ingest('A1', { ...original, text: 'Caption được sửa ở nguồn' });
+    await h.drain();
+    expect(await ingest('A1', original)).toBe('NEW_REVISION');
+    const post = await h.db.sourcePost.findFirstOrThrow();
+    expect(post.latestRevisionId).toBe(prior.revisionId);
+    expect(await h.db.sourcePostRevision.count()).toBe(2);
+    expect(await h.db.contentVariant.findUnique({ where: { id: prior.id } })).toMatchObject({
+      status: 'NEEDS_REVIEW', reviewReasons: ['SOURCE_REVISION_RESTORED'], snapshotHash: null,
+    });
+    expect(await h.db.contentVariant.count({ where: { status: 'READY' } })).toBe(0);
+    expect(h.failures).toEqual([]);
   });
 
   it('keeps the most complete read when a feed returns one id twice', () => {

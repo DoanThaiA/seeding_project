@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FbGraphReadConnector } from '@seedingsys/connectors-fb-graph';
-import { dispatchBacklogItem, dispatchSlot, ingestPost, listBacklog } from '@seedingsys/db';
+import { dispatchBacklogItem, dispatchSlot, ingestPost, listBacklog, setControl } from '@seedingsys/db';
 import { HOUR } from '@seedingsys/domain';
 import { Q, type JobPayload } from '@seedingsys/contracts';
 import { LibraryController } from '../../apps/api/src/library.controller';
 import { handleProfileSync } from '../../apps/worker-browser/src/handlers/profile-sync';
 import { handleCommentPublish } from '../../apps/worker-browser/src/handlers/comment-publish';
 import { handlePublish } from '../../apps/worker-browser/src/handlers/publish';
+import { handleSourcePoll } from '../../apps/worker-browser/src/handlers/source-poll';
 import { createHarness, MIN, type Harness } from '../helpers/harness';
 
 const actor = { actor: 'test-profile-admin', role: 'admin' } as const;
@@ -137,4 +138,113 @@ describe('profile sync and source trash', () => {
     expect(await h.db.contentVariant.count({ where: { targetId, status: 'NEEDS_REVIEW' } })).toBe(2);
     expect(await h.db.source.findUnique({ where: { id: sourceId } })).toMatchObject({ watermark: { newest: 123 } });
   }, 45_000);
+
+  it('continues Graph polls through a burst larger than the page budget and leaves no gaps', async () => {
+    const sourceId = h.ids.sources.A1;
+    const anchor = new Date('2026-11-20T02:35:00.000Z').getTime();
+    const requested: number[] = [];
+    h.browser.registry.addReader(new FbGraphReadConnector({ tokens: { A1: 'test' }, fetch: async input => {
+      const index = Number(new URL(String(input)).searchParams.get('after') ?? 0);
+      requested.push(index);
+      return new Response(JSON.stringify({
+        data: [{ id: `100_${index}`, message: `Bài nguồn ${index}`, created_time: new Date(anchor + (6 - index) * MIN).toISOString() }],
+        ...(index < 6 && { paging: { next: 'https://graph.facebook.com/example', cursors: { after: String(index + 1) } } }),
+      }));
+    } }));
+    await h.db.source.update({ where: { id: sourceId }, data: {
+      connector: 'fb-graph', externalRef: '100', baselineDone: true, watermark: { newest: anchor }, overlapCount: 1,
+    } });
+    expect(await handleSourcePoll(h.browser, { sourceId })).toMatchObject({ outcome: 'OK', counts: { NEW_POST: 5 } });
+    expect(await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).toMatchObject({
+      watermark: { newest: anchor, nextCursor: '5' }, lastIncomplete: ['PAGINATION_INCOMPLETE'],
+    });
+    expect(await handleSourcePoll(h.browser, { sourceId })).toMatchObject({ outcome: 'OK', counts: { NEW_POST: 2 } });
+    expect(requested).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(await h.db.sourcePost.count()).toBe(7);
+    expect(await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).toMatchObject({
+      watermark: { newest: anchor + 6 * MIN }, lastIncomplete: [],
+    });
+  });
+
+  it('does not write posts or advance the watermark after the source is paused during the read', async () => {
+    const sourceId = h.ids.sources.A1;
+    h.browser.registry.addReader(new FbGraphReadConnector({ tokens: { A1: 'test' }, fetch: async () => {
+      await setControl(h.db, 'SOURCE', sourceId, true, actor.actor);
+      return new Response(JSON.stringify({ data: [{ id: '100_1', message: 'Bài đang đọc' }] }));
+    } }));
+    await h.db.source.update({ where: { id: sourceId }, data: { connector: 'fb-graph', externalRef: '100' } });
+    expect(await handleSourcePoll(h.browser, { sourceId })).toEqual({ outcome: 'PAUSED' });
+    expect(await h.db.sourcePost.count()).toBe(0);
+    expect(await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).toMatchObject({
+      baselineDone: false, watermark: null, lastSuccessAt: null,
+    });
+  });
+
+  it('scans a source post and comment, then publishes each exactly once to a simulated destination', async () => {
+    const sourceId = h.ids.sources.A1;
+    const destinationId = h.ids.targets.B1;
+    const authorId = h.ids.targets.B2;
+    const originalText = 'Bài thử giới thiệu chương trình tại cửa hàng.';
+    const commentText = 'Mình quan tâm tới chương trình này.';
+    const destinationLink = 'https://www.facebook.com/mock-destination/posts/900';
+    const commentLink = destinationLink + '?comment_id=400';
+    h.browser.registry.addReader(new FbGraphReadConnector({ tokens: { A1: 'test' }, fetch: async input => {
+      const path = new URL(String(input)).pathname;
+      const data = path === '/100/posts'
+        ? [{ id: '100_21', message: originalText, created_time: h.clock.now().toISOString(),
+          permalink_url: 'https://www.facebook.com/100/posts/21' }]
+        : path === '/100_21/comments' ? [{ id: '100_42', message: commentText, from: { name: 'Khách thử nghiệm' } }] : null;
+      if (!data) throw new Error('Unexpected Graph fixture request: ' + path);
+      return new Response(JSON.stringify({ data }));
+    } }));
+    await h.db.source.update({ where: { id: sourceId }, data: {
+      connector: 'fb-graph', externalRef: '100', baselineDone: true, collectComments: true,
+    } });
+    await h.db.targetAccount.update({ where: { id: destinationId }, data: { audience: 'FRIENDS' } });
+    await h.db.targetAccount.update({ where: { id: authorId }, data: { connector: 'fb-web' } });
+
+    expect(await handleSourcePoll(h.browser, { sourceId })).toMatchObject({ outcome: 'OK', counts: { NEW_POST: 1 } });
+    await h.drain();
+    const post = await h.db.sourcePost.findFirstOrThrow({ where: { sourceId, externalId: '100_21' } });
+    const variant = await h.db.contentVariant.findFirstOrThrow({ where: { sourcePostId: post.id, targetId: destinationId } });
+    const detail = await library.detail(post.id);
+    expect(detail.revision.text).toBe(originalText);
+    expect(detail.scan).toMatchObject({ status: 'COMPLETE', readCount: 1 });
+    const [comment] = detail.comments;
+    expect(comment).toMatchObject({ text: commentText, replays: [{ status: 'DRAFT' }] });
+
+    const publicationId = await dispatchBacklogItem(h.core, variant.id);
+    await h.drain();
+    expect(await h.db.publication.findUnique({ where: { id: publicationId } })).toMatchObject({ status: 'PUBLISHED_VERIFIED' });
+    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+    await library.confirmPublishedLink(post.id, destinationId, { permalink: destinationLink }, actor);
+
+    const submissions: string[] = [];
+    h.browser.registry.addPublisher({
+      key: 'fb-web', version: 'test', capabilities: () => ({}),
+      openSession: async target => {
+        expect(target.id).toBe(authorId);
+        const session = await h.browser.registry.publisher('fake').openSession(target);
+        session.postComment = async ({ post, text }, beforeSubmit) => {
+          expect(post.href).toBe(destinationLink);
+          await beforeSubmit();
+          submissions.push(text);
+          return { externalId: '400', permalink: commentLink };
+        };
+        return session;
+      },
+    });
+    await library.updateComment(post.id, destinationId, comment.id, { action: 'approve', authorTargetId: authorId, text: commentText }, actor);
+    await library.updateComment(post.id, destinationId, comment.id, { action: 'send' }, actor);
+    const job = await h.db.outboxEvent.findFirstOrThrow({ where: { queue: Q.CommentPublish } });
+    const payload = job.payload as JobPayload<typeof Q.CommentPublish>;
+    const commentWorker = { ...h.browser, actor: 'browser:test' };
+    await handleCommentPublish(commentWorker, payload);
+    await handleCommentPublish(commentWorker, payload);
+    expect(submissions).toEqual([commentText]);
+    expect(await h.db.publicationComment.findUnique({ where: { id: payload.replayId } })).toMatchObject({
+      status: 'POSTED', permalink: commentLink,
+    });
+    expect(h.failures).toEqual([]);
+  });
 });

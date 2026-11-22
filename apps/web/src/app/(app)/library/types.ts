@@ -6,7 +6,7 @@ export interface Profile {
 }
 
 export interface Profiles {
-  sources: Array<Profile & { connector: string; lastSuccessAt: string | null; lastError: string | null; _count: { posts: number } }>;
+  sources: Array<Profile & { connector: string; lastSuccessAt: string | null; lastError: string | null; lastIncomplete: string[]; _count: { posts: number } }>;
   targets: Array<Profile & { _count: { publications: number } }>;
 }
 

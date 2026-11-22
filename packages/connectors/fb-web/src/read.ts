@@ -120,6 +120,7 @@ export class FbWebReadConnector implements ReadConnector {
         headless: this.opts.headless,
         channel: this.opts.channel,
         executablePath: this.opts.executablePath,
+        timeout: 15_000,
         locale: 'vi-VN',
         timezoneId: 'Asia/Ho_Chi_Minh',
         viewport: { width: 1280, height: 900 },
@@ -127,6 +128,9 @@ export class FbWebReadConnector implements ReadConnector {
     } catch (e) {
       throw new ConnectorError('TRANSIENT', `Không mở được profile trình duyệt của nguồn ${source.code}: ${(e as Error).message.split('\n')[0]}`);
     }
+    let closing: Promise<void> | undefined;
+    const close = () => (closing ??= ctx.close().catch(() => undefined));
+    const timer = setTimeout(() => { void close(); }, 90_000);
     try {
       const page = ctx.pages()[0] ?? (await ctx.newPage());
       page.setDefaultTimeout(this.opts.stepTimeoutMs);
@@ -137,7 +141,8 @@ export class FbWebReadConnector implements ReadConnector {
       const newest = posts.reduce((m, p) => Math.max(m, p.postedAt?.getTime() ?? 0), Number((watermark as { newest?: number } | null)?.newest ?? 0));
       return { posts, nextWatermark: { newest }, incomplete: [] };
     } finally {
-      await ctx.close().catch(() => undefined);
+      clearTimeout(timer);
+      await close();
     }
   }
 

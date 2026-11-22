@@ -4,6 +4,7 @@ import { dispatchDuePolls } from './scheduler/poll-dispatcher';
 import { dispatchDueSlots, ensureSlots, sweepLateDispatches } from './scheduler/slots';
 import { requeueReviewedCopies } from './maintenance/requeue-reviewed-copies';
 import { settleDuplicates } from './maintenance/duplicates';
+import { settleStalledComments } from './maintenance/comments';
 
 /**
  * One scheduler pass. pg-boss fires it every minute (singleton cron across instances); every
@@ -11,6 +12,7 @@ import { settleDuplicates } from './maintenance/duplicates';
  */
 export async function schedulerTick(ctx: CoreCtx) {
   const leases = await sweepExpiredLeases(ctx);
+  const comments = await settleStalledComments(ctx);
   const expired = await expireContent(ctx);
   const requeuedCaptions = await requeueReviewedCopies(ctx);
   const duplicates = await settleDuplicates(ctx);
@@ -18,5 +20,5 @@ export async function schedulerTick(ctx: CoreCtx) {
   const created = await ensureSlots(ctx);
   const late = await sweepLateDispatches(ctx);
   const slots = await dispatchDueSlots(ctx);
-  return { leases, expired, requeuedCaptions, duplicates, polls, created, late, slots };
+  return { leases, comments, expired, requeuedCaptions, duplicates, polls, created, late, slots };
 }

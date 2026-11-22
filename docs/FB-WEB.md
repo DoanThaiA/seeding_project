@@ -6,30 +6,30 @@
 
 | Hạng mục | Trạng thái |
 |---|---|
-| Phiên, danh tính, soạn nháp, xem trước, bấm đăng, xác minh trên timeline, đối soát | ✅ Viết xong, **kiểm thử với giao diện Facebook giả** (`tests/helpers/mock-fb.ts`) bằng trình duyệt thật: 20 test connector + 8 test tích hợp lịch → đăng → xác minh |
+| Phiên, danh tính, soạn nháp, xem trước, đăng và đối soát | ✅ Kiểm thử với giao diện Facebook giả (`tests/helpers/mock-fb.ts`) bằng Chromium |
 | **Selector trên giao diện Facebook thật** | ⚠️ **CHƯA kiểm chứng.** `selectors.ts` được viết theo giao diện vi-VN thường gặp (role + tên hiển thị). Facebook đổi giao diện thường xuyên nên rất có thể cần chỉnh khi thử lần đầu |
-| Định dạng | TEXT, QUOTE_IMAGE, SINGLE_PHOTO, MULTI_PHOTO, VIDEO, REEL. Reel có trình tạo riêng và cần chứng nhận trên hồ sơ đích. |
-| Đọc nguồn (A) từ Facebook | ⛔ **Không làm có chủ đích** — xem mục “Phía đọc” |
+| Định dạng | TEXT, QUOTE_IMAGE, SINGLE_PHOTO, MULTI_PHOTO, VIDEO, REEL. Reel có trình tạo riêng. |
+| Đọc nguồn (A) từ Facebook | Có kết nối khách, kết nối dùng phiên đã đăng nhập và Graph API. Xem mục “Phía đọc” để biết phạm vi từng kết nối. |
 | Chuyển mã video, tiếp quản qua noVNC, agent UI | ❌ Chưa làm |
 
-Vì chưa kiểm chứng trên giao diện thật, connector được thiết kế **đóng theo mặc định**: `FB_ENABLED_FORMATS` rỗng thì không định dạng nào được đăng; và bộ lập lịch chỉ giao việc cho (tài khoản × định dạng) đã có bản ghi `capability_checks` đạt với **đúng phiên bản connector đang hoạt động**.
+Worker đăng các định dạng được bật trong `FB_ENABLED_FORMATS` với phiên bản connector đang hoạt động. Giá trị rỗng tắt mọi định dạng. Kết quả `capability_checks` được lưu để theo dõi các lượt kiểm thử tự chọn.
 
 ## Cách hoạt động và các chốt an toàn
 
 1. **Người đăng nhập tay.** `pnpm fb:login B1` mở cửa sổ trình duyệt thấy được trên profile của B1. Bạn tự nhập mật khẩu/xác minh 2 bước. Hệ thống không bao giờ nhập mật khẩu và không có mã nào vượt checkpoint.
 2. Trước mỗi lần đăng: mở trang chủ → nếu bị đưa tới đăng nhập/checkpoint thì dừng (`LOGGED_OUT`/`CHECKPOINT`); vào `/me` để lấy ID đang đăng nhập và so với `external_id` của tài khoản (số hoặc tên người dùng) → sai thì dừng.
 3. **Soạn nháp không có tác dụng ngoài:** mở composer, gõ caption, đính media (một lần, đúng thứ tự manifest), chọn/kiểm tra đối tượng xem. Sau đó `previewCheck` đọc lại caption, số ảnh, nút Đăng và đối tượng xem; sai là dừng, **chưa bấm gì**.
-4. Hệ thống ghi `COMMITTING` rồi mới `commit()` — hàm duy nhất bấm “Đăng”. Mọi lỗi sau đó chuyển `UNKNOWN` và đối soát, không bao giờ tự đăng lại.
+4. Hệ thống ghi `COMMITTING` trước khi bấm “Đăng”. Khi kết quả chưa rõ, bài chuyển sang `UNKNOWN` để đối soát. Bài chỉ có thể quay lại hàng đăng sau khi xác nhận lần trước chưa xuất hiện.
 5. **Xác minh** (`FB_VERIFY`) mở trang cá nhân, cuộn và tìm bài theo **nội dung caption** (bài trên trang cá nhân không có dấu “bài viết” như trang chủ).
-   - `caption` (mặc định): thấy caption trên trang là coi như đã đăng. Không đòi thời gian/số ảnh vì Facebook ẩn liên kết thời gian của bài mới. Thấy **2 bản cùng lúc** → `AMBIGUOUS` (nghi trùng) → chuyển người.
+   - `caption` (mặc định): xác minh khi caption khớp và nhận diện được liên kết riêng của bài. Nếu đọc được thời gian, bài phải nằm trong cửa sổ xác minh. Nhiều ứng viên trùng khớp cần người đối soát.
    - `strict`: caption + mốc thời gian trong cửa sổ + đúng số ảnh.
-   - `off`: **không kiểm tra**; lần đăng được ghi là “không kiểm tra” trong bằng chứng. Bài đăng hỏng sẽ không bị phát hiện.
+   - `off`: bỏ qua kiểm tra và giữ kết quả ở trạng thái chưa xác minh để người vận hành đối soát.
    “Không thấy” chỉ được coi là **chắc chắn** khi đã cuộn qua một bài cũ hơn thời điểm bấm đăng *và* mọi mốc thời gian đọc được; ngược lại vẫn là chưa rõ (tránh đăng trùng).
 6. Không có chế độ tàng hình, giả dấu vân tay trình duyệt, hay giãn cách ngẫu nhiên để lẩn tránh phát hiện.
 
 ### Giới hạn đã biết
 
-- Reel cần đúng một tệp video. Chạy công cụ chứng nhận với `--formats REEL --video <tệp>` khi đã chuẩn bị hồ sơ thử. Công cụ chứng nhận tạo bài thật theo đối tượng “Chỉ mình tôi”.
+- Reel cần đúng một tệp video. Reel không có caption cần liên kết trực tiếp trả về sau khi đăng để xác minh. Chạy công cụ chứng nhận với `--formats REEL --video <tệp>` khi đã chuẩn bị hồ sơ thử. Công cụ chứng nhận tạo bài thật theo đối tượng “Chỉ mình tôi”.
 - Bình luận vào bài đã xác minh được phân công theo hồ sơ. Điều phối viên duyệt từng bình luận rồi gửi từ Kho bài. Phản hồi cần có liên kết bình luận cha đã xác minh. Bài ở chế độ “Chỉ mình tôi” chỉ cho phép dùng chính hồ sơ đăng bài.
 - Thứ tự ảnh đảm bảo nhờ thứ tự tải lên, **không** kiểm tra được bằng mắt (không đọc được checksum từ ảnh thu nhỏ); số ảnh thì được kiểm tra.
 - Mốc thời gian trên timeline là tương đối (“5 phút”, “2 giờ”); hệ thống hiểu các dạng phổ biến bằng tiếng Việt. Dạng lạ → coi là không đọc được.
@@ -50,12 +50,12 @@ Vì chưa kiểm chứng trên giao diện thật, connector được thiết k�
    pnpm fb:capability B1 --formats TEXT --cases 1 --pause-sec 5 --yes
    ```
    Nếu báo `UI_UNEXPECTED`, mở `selectors.ts` và chỉnh theo giao diện thật (đặt `FB_HEADLESS=false` và `FB_SCREENSHOT_DIR` để xem), rồi thử lại. Nâng `SELECTORS_VERSION` khi đổi.
-5. **Chứng nhận đủ:** mỗi định dạng ≥20 ca, ngưỡng 95% (chữ, một ảnh) / 90% (nhiều ảnh, video):
+5. **Kiểm thử tùy chọn:** mỗi định dạng ≥20 ca, ngưỡng 95% (chữ, một ảnh) / 90% (nhiều ảnh, video):
    ```powershell
    pnpm fb:capability B1 --yes --activate
    ```
    Lệnh giãn cách mỗi bài 60 giây (đổi bằng `--pause-sec`), dừng ngay khi gặp checkpoint, đăng xuất, sai danh tính, sai đối tượng hoặc kết quả chưa rõ. Kết quả ghi vào `capability_checks` và hiện ở trang Cấu hình. Bài thử **không tự xóa**.
-6. Đặt `FB_ENABLED_FORMATS=TEXT,SINGLE_PHOTO,MULTI_PHOTO` (các định dạng đã đạt) trên máy worker rồi bật lại `worker-browser`.
+6. Đặt `FB_ENABLED_FORMATS` theo các định dạng cần đăng trên máy worker rồi bật lại `worker-browser`.
 7. Chỉ khi đã soak ≥7 ngày ở “Chỉ mình tôi” mới cân nhắc đổi đối tượng xem sang thật và `APP_ENV=pilot-live`.
 
 ## Phía đọc (nguồn A)
@@ -68,7 +68,7 @@ Chọn **Cách lấy bài** ở trang **Quản trị luồng đăng**.
 | `fb-session` | Quét bài của chủ trang bằng phiên Facebook của đích trong luồng | URL nguồn và đúng một đích Facebook đang bật, có hồ sơ trình duyệt đã đăng nhập |
 | `fb-web` | Đọc **trang cá nhân của chính tài khoản đang đăng nhập** trong profile trình duyệt của nguồn | Đăng nhập một lần: `pnpm fb:login A1`. "Địa chỉ / ID nguồn" = ID số (hoặc tên người dùng) của chính tài khoản đó |
 | `manual` | Người vận hành nhập bài ở trang **Nhập bài** | Không |
-| `fb-graph` | Graph API chính thức (Page bạn quản trị, hoặc `me`) | Token trong `FB_GRAPH_TOKEN_A1`. **Chưa kiểm thử** |
+| `fb-graph` | Graph API chính thức (Page bạn quản trị, hoặc `me`) | Token trong `FB_GRAPH_TOKEN_A1`. Phân trang bài và bình luận đã kiểm thử với phản hồi API giả lập. |
 
 ### Quét nguồn công khai và đăng theo ánh xạ A1 → B1
 
@@ -97,7 +97,8 @@ Bật công tắc dừng theo connector `fb-web` (trang Công tắc dừng) → 
 
 - Mở **Kho bài viết**, chọn profile nguồn hoặc đích rồi chọn bài. Trang đích hiển thị các bản nháp và bài đăng trong lịch sử SeedingSys. Cột đối chiếu lấy caption và media của đúng bản duyệt hoặc bản đã đăng.
 - Chọn **Quét bình luận** trong một bài hoặc bật **Tự quét bình luận khi phát hiện bài mới** ở tùy chọn nguồn. Bình luận được lưu theo ID của bài và ID bình luận. Nhánh phản hồi giữ ID cha. Trình đọc Facebook lưu phần giao diện hiển thị cho phiên đang dùng, còn Graph API đọc các trang kết quả mà quyền của token cho phép.
-- Để đưa thảo luận sang bài đích, duyệt bản trích dẫn và chọn profile thực hiện cho từng bình luận. Sau khi bài đích đã đăng, mở bài hoặc bình luận cha trên Facebook và ghi nhận bằng liên kết bình luận mới.
+- Để đưa thảo luận sang bài đích, duyệt nội dung và chọn profile gửi cho từng bình luận. Khi bài đích có liên kết trực tiếp, người vận hành có thể gửi qua worker. Với phản hồi, bình luận cha ở đích phải được ghi nhận trước.
+- Nếu lượt gửi chuyển sang **Chờ đối chiếu**, kiểm tra bài hoặc bình luận cha trên Facebook. Nếu đã gửi thành công, dán liên kết bình luận để ghi nhận. Chỉ chọn xác nhận chưa đăng khi đã kiểm tra đúng nơi, sau đó mới gửi lại.
 
 ## Đồng bộ profile và thùng rác
 

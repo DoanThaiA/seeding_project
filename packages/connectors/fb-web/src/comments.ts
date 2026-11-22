@@ -26,18 +26,25 @@ function evaluateCommentPage<T, A>(page: Page, read: (arg: A) => T, arg: A): Pro
   return page.evaluate<T>('((__name) => (' + read.toString() + ')(' + JSON.stringify(arg) + '))((value) => value)');
 }
 
-async function primaryThread(page: Page, postId: string): Promise<PrimaryThread> {
-  return evaluateCommentPage<PrimaryThread, string>(page, id => {
+async function primaryThread(page: Page, postId: string, knownPostIds: string[] = []): Promise<PrimaryThread> {
+  return evaluateCommentPage<PrimaryThread, { id: string; knownPostIds: string[] }>(page, ({ id, knownPostIds }) => {
+    const aliases = new Set([id, ...knownPostIds]);
+    const hasNumericAlias = [...aliases].some(key => /^\d+$/.test(key));
     const roots = new Map<string, any[]>();
     const reels: any[] = [];
     const postKey = (value: string) => {
       try {
         const url = new URL(value, location.href);
-        return url.searchParams.get('story_fbid') || url.searchParams.get('v') || url.pathname.split('/').filter(Boolean).at(-1);
+        if (url.origin !== location.origin && !/^(?:www\.|m\.|web\.)?facebook\.com$/i.test(url.hostname)) return undefined;
+        const path = url.pathname.replace(/\/$/, '');
+        if (path === '/story.php' || path === '/permalink.php') return url.searchParams.get('story_fbid');
+        if (path === '/photo' || path === '/photo.php') return url.searchParams.get('fbid');
+        if (path === '/watch') return url.searchParams.get('v');
+        return path.match(/\/(?:posts|videos|reel)\/([A-Za-z0-9_]+)$/)?.[1];
       } catch { return undefined; }
     };
     for (const script of Array.from(document.querySelectorAll('script[type="application/json"]'))) {
-      if (!script.textContent?.includes('"node_v2"') && !/^\d+$/.test(id)) continue;
+      if (!script.textContent?.includes('"node_v2"') && !hasNumericAlias) continue;
       try {
         const pending = [JSON.parse(script.textContent ?? '')];
         while (pending.length) {
@@ -50,14 +57,17 @@ async function primaryThread(page: Page, postId: string): Promise<PrimaryThread>
             roots.set(node.id, copies);
           }
           const reel = item.result?.data?.video;
-          if (String(reel?.id) === id && reel?.creation_story) reels.push(reel.creation_story);
+          if (aliases.has(String(reel?.id)) && reel?.creation_story) reels.push(reel.creation_story);
           for (const value of Object.values(item)) if (value && typeof value === 'object') pending.push(value);
         }
       } catch {}
     }
-    const ranked = [...roots.values()].filter(copies => copies.some(node => postKey(node.permalink_url) === id));
-    const [nodes] = ranked.length === 1 ? ranked : roots.size === 1 ? [...roots.values()] : [[]];
-    const aliases = new Set([id]);
+    const ranked = [...roots.values()].filter(copies => copies.some(node => {
+      const story = node.comet_sections.content.story;
+      return [node.id, node.legacy_fbid, story.id, story.legacy_fbid].some(value => aliases.has(String(value))) ||
+        [node.permalink_url, story.permalink_url].some(value => value && aliases.has(postKey(value) ?? ''));
+    }));
+    const nodes = ranked.length === 1 ? ranked[0] : [];
     const comments: PrimaryThread['comments'] = [];
     const ids = new Map<string, string>();
     let author: string | undefined;
@@ -66,6 +76,9 @@ async function primaryThread(page: Page, postId: string): Promise<PrimaryThread>
       const sections = node.comet_sections;
       const content = sections?.content?.story ?? node;
       const ufi = sections?.feedback?.story?.story_ufi_container?.story ?? sections?.feedback?.story;
+      for (const value of [node.legacy_fbid, content.legacy_fbid, node.id, content.id]) {
+        if (/^\d+$/.test(String(value))) aliases.add(String(value));
+      }
       for (const url of [node.permalink_url, content.permalink_url, ufi?.permalink_url]) {
         const key = url && postKey(url);
         if (key) aliases.add(key);
@@ -74,12 +87,12 @@ async function primaryThread(page: Page, postId: string): Promise<PrimaryThread>
       author ??= content.actors?.[0]?.name ?? title?.actors?.[0]?.name ?? node.actors?.[0]?.name;
       const feedback = ufi?.feedback_context?.feedback_target_with_context ?? node.feedback;
       const connection = feedback?.comment_list_renderer?.feedback?.comment_rendering_instance_for_feed_location?.comments;
-      const pending = [connection];
+      const pending = [{ connection, parentId: undefined as string | undefined }];
       const total = feedback?.total_comment_count ?? node.feedback?.total_comment_count
         ?? (connection?.total_count === 0 && connection.page_info?.has_next_page === false ? 0 : undefined);
       if (typeof total === 'number') count = Math.max(count ?? 0, total);
       while (pending.length) {
-        const connection = pending.pop();
+        const { connection, parentId } = pending.pop()!;
         for (const edge of connection?.edges ?? []) {
           const c = edge.node;
           if (!c || c.__typename !== 'Comment' || !c.legacy_fbid) continue;
@@ -87,17 +100,21 @@ async function primaryThread(page: Page, postId: string): Promise<PrimaryThread>
           ids.set(String(c.id), externalId);
           const parent = c.comment_direct_parent;
           comments.push({ externalId, text: c.body?.text ?? c.preferred_body?.text ?? '', authorName: c.author?.name,
-            parentExternalId: typeof parent?.legacy_fbid !== 'undefined' ? String(parent.legacy_fbid) : parent?.id,
+            parentExternalId: parentId ?? (parent?.legacy_fbid == null ? parent?.id : String(parent.legacy_fbid)),
             date: typeof c.created_time === 'number' ? new Date(c.created_time * 1000).toISOString() : undefined });
           const replies = c.feedback?.replies ?? c.replies;
-          if (replies?.edges) pending.push(replies);
+          if (replies?.edges) pending.push({ connection: replies, parentId: externalId });
         }
       }
     }
     return { aliases: [...aliases], author, count, comments: comments.map(c => ({
-      ...c, parentExternalId: c.parentExternalId && (ids.get(c.parentExternalId) ?? (/^\d+$/.test(c.parentExternalId) ? c.parentExternalId : undefined)),
+      ...c, parentExternalId: c.parentExternalId && (ids.get(c.parentExternalId) ?? c.parentExternalId),
     })) };
-  }, postId);
+  }, { id: postId, knownPostIds });
+}
+
+export async function confirmedCommentPostIds(page: Page, postId: string): Promise<string[]> {
+  return (await primaryThread(page, postId)).aliases;
 }
 
 export async function collectVisibleComments(
@@ -105,6 +122,7 @@ export async function collectVisibleComments(
   postId: string,
   deadline: number,
   onProgress: (readCount: number, expectedCount?: number) => Promise<void>,
+  knownPostIds: string[] = [],
 ): Promise<ReadCommentsResult> {
   const seen = new Map<string, ReadComment>();
   const exhausted = new Set<string>();
@@ -112,8 +130,9 @@ export async function collectVisibleComments(
   let all = false;
   let empty = false;
   let opened = false;
+  let refreshed = false;
   let idle = 0;
-  const primary = await primaryThread(page, postId);
+  let primary = await primaryThread(page, postId, knownPostIds);
   count = primary.count;
   const store = ({ date, ...comment }: Observation['comments'][number]) => {
     const postedAt = date ? new Date(date) : undefined;
@@ -129,8 +148,14 @@ export async function collectVisibleComments(
     const found = await evaluateCommentPage<Observation, { aliases: string[]; seedIds: string[]; author?: string }>(page, ({ aliases, seedIds, author }) => {
       const article = 'article,[role="article"],[data-commentid],[data-comment-id],[aria-label^="Bình luận dưới "],[aria-label^="Phản hồi bình luận "],[aria-label^="Bình luận của "],[aria-label^="Comment by "],[aria-label^="Reply by "]';
       const anchorSelector = 'a[href*="comment_id="]';
-      const postLinkMatches = (url: URL) => aliases.includes(url.pathname.replace(/\/$/, '').split('/').at(-1) ?? '')
-        || ['story_fbid', 'v', 'fbid'].some(key => aliases.includes(url.searchParams.get(key) ?? ''));
+      const postLinkMatches = (url: URL) => {
+        if (url.origin !== location.origin && !/^(?:www\.|m\.|web\.)?facebook\.com$/i.test(url.hostname)) return false;
+        const path = url.pathname.replace(/\/$/, '');
+        const post = (path === '/story.php' || path === '/permalink.php') ? url.searchParams.get('story_fbid')
+          : (path === '/photo' || path === '/photo.php') ? url.searchParams.get('fbid')
+          : path === '/watch' ? url.searchParams.get('v') : path.match(/\/(?:posts|videos|reel)\/([A-Za-z0-9_]+)$/)?.[1];
+        return !!post && aliases.includes(post);
+      };
       const decodedComment = (value: string | null) => {
         if (!value || /^\d+$/.test(value)) return null;
         try {
@@ -145,7 +170,7 @@ export async function collectVisibleComments(
       for (const a of allLinks) {
         const u = new URL(a.href);
         const thread = threadOf(u);
-        if (thread && seedIds.includes(thread[2]) && u.origin === location.origin) threadIds.add(thread[1]);
+        if (thread && (seedIds.includes(thread[2]) || aliases.includes(thread[1])) && u.origin === location.origin) threadIds.add(thread[1]);
       }
       const belongsToThread = (url: URL) => url.origin === location.origin && threadIds.has(threadOf(url)?.[1] ?? '');
       const label = (el: HTMLElement) => (el.getAttribute('aria-label') ?? el.innerText ?? '').normalize('NFC')
@@ -229,7 +254,7 @@ export async function collectVisibleComments(
         const sameThread = belongsToThread(url) || !!card && Array.from(card.querySelectorAll<HTMLAnchorElement>(anchorSelector))
           .some(link => link.closest(article) === card && belongsToThread(new URL(link.href)));
         const targetsPost = postLinkMatches(url) || seedIds.includes(commentId(url) ?? '') || sameThread;
-        if (!targetsPost || (url.origin !== location.origin && !/^(?:www\.|m\.)?facebook\.com$/.test(url.hostname))) continue;
+        if (!targetsPost || (url.origin !== location.origin && !/^(?:www\.|m\.|web\.)?facebook\.com$/i.test(url.hostname))) continue;
         const root = numericId(url.searchParams.get('comment_id'));
         const reply = numericId(url.searchParams.get('reply_comment_id'));
         const comment = reply ?? root;
@@ -322,6 +347,18 @@ export async function collectVisibleComments(
       }
       const complete = ((seen.size === 0 && (empty || count === 0)) || (all && count !== undefined && seen.size === count)) &&
         [...seen.values()].every(c => !c.parentExternalId || seen.has(c.parentExternalId));
+      // Facebook can mount the thread and its embedded data after the post first renders.
+      const hydrationWait = seen.size ? 750 : 3200;
+      if (!complete && !refreshed && (!seen.size || (count !== undefined && seen.size < count))
+        && Date.now() + hydrationWait < deadline) {
+        refreshed = true;
+        await page.waitForTimeout(hydrationWait);
+        const hydrated = await primaryThread(page, postId, knownPostIds);
+        primary = { ...hydrated, aliases: [...new Set([...primary.aliases, ...hydrated.aliases])], author: hydrated.author ?? primary.author };
+        if (hydrated.count !== undefined) count = Math.max(count ?? 0, hydrated.count);
+        hydrated.comments.forEach(store);
+        continue;
+      }
       if (!complete && count !== undefined && seen.size < count && idle++ < 6) {
         const lastComment = page.locator('[data-ss-last-comment]');
         if (await lastComment.count()) await lastComment.scrollIntoViewIfNeeded({ timeout: 900 }).catch(() => undefined);

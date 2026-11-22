@@ -21,6 +21,8 @@ export async function movePublication(
     now: Date;
     data?: Prisma.PublicationUncheckedUpdateManyInput;
     reason?: string;
+    expectedJobVersion?: number;
+    expectedReconcileTries?: number;
     /** When set, the move only happens if this lease is still held (fencing). */
     fence?: Pick<Lease, 'resource' | 'token'>;
     fenceMinRemainingMs?: number;
@@ -33,7 +35,7 @@ export async function movePublication(
     if (!held) return false;
   }
   const r = await t.publication.updateMany({
-    where: { id: args.id, status: { in: from } },
+    where: { id: args.id, status: { in: from }, jobVersion: args.expectedJobVersion, reconcileTries: args.expectedReconcileTries },
     data: { ...args.data, status: args.to, ...(args.reason !== undefined ? { lastReason: args.reason } : {}) },
   });
   if (r.count === 1) {

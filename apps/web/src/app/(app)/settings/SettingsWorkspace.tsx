@@ -13,14 +13,14 @@ type View = keyof typeof views;
 
 function Readiness({ capabilities }: { capabilities: Capabilities }) {
   return <details className={styles.capability}>
-    <summary>Chứng nhận định dạng đăng</summary>
-    <p className="muted">Lịch đăng chỉ cấp lượt cho định dạng đã đạt kiểm thử trên phiên bản đang hoạt động. Kiểm thử Facebook bằng <code>pnpm fb:capability</code>.</p>
+    <summary>Kết quả kiểm thử định dạng</summary>
+    <p className="muted">Worker dùng định dạng Facebook đang bật trong cấu hình. Xem kết quả kiểm thử theo phiên bản tại đây.</p>
     {capabilities.checks.length ? <div className="tw">
       <table>
         <thead><tr><th>Đích</th><th>Định dạng</th><th>Phiên bản</th><th>Kết quả</th><th>Ca đạt</th><th>Lần kiểm thử</th></tr></thead>
         <tbody>{capabilities.checks.map(c => <tr key={c.id}>
           <td>{c.target.code}</td><td>{label(c.contentType)}</td><td className="mono">{c.connector}@{c.connectorVersion}</td>
-          <td><Badge s={c.passed ? 'DONE' : 'MISSED'} text={c.passed ? 'Đạt' : 'Chưa đạt'} />{c.notes && <div className="muted">{c.notes}</div>}</td>
+          <td><Badge s={c.qualified ? 'DONE' : 'MISSED'} text={c.qualified ? 'Đạt' : c.passed ? 'Thiếu ca kiểm thử' : 'Chưa đạt'} />{c.notes && <div className="muted">{c.notes}</div>}</td>
           <td>{c.cases - c.failures}/{c.cases}</td><td>{fmtTime(c.checkedAt)}</td>
         </tr>)}</tbody>
       </table>

@@ -6,12 +6,13 @@ import type { BrowserCtx } from '../ctx';
 import { handleSourcePoll } from './source-poll';
 
 const BATCH = 40;
+const SYNC_LEASE_MS = 4 * 60_000;
 const HOLD_PUBLICATION = ['QUEUED' as const, ...ACTIVE, ...SUCCESS, ...UNRESOLVED];
 
 export async function handleProfileSync(ctx: BrowserCtx, { syncId, step }: { syncId: string; step: number }, retryCount = 0) {
   const run = await ctx.db.profileSync.findUnique({ where: { id: syncId }, include: { mapping: { include: { source: true, target: true } } } });
   if (!run || run.step !== step || !['DISCOVERING', 'PREPARING'].includes(run.phase)) return;
-  const lease = await acquireLease(ctx.db, { resource: 'profile-sync:' + syncId, holder: ctx.workerId, ttlMs: 120_000, now: ctx.clock.now() });
+  const lease = await acquireLease(ctx.db, { resource: 'profile-sync:' + syncId, holder: ctx.workerId, ttlMs: SYNC_LEASE_MS, now: ctx.clock.now() });
   if (!lease) throw new RetryLaterError('Lượt đồng bộ đang được xử lý.');
   const { source, target } = run.mapping;
   try {
@@ -93,8 +94,8 @@ export async function handleProfileSync(ctx: BrowserCtx, { syncId, step }: { syn
 
         const latestScan = post.commentScans[0];
         let scanId = latestScan?.id;
-        if (!duplicate && canReadComments && (source.connector === 'fb-graph' || post.permalink) && !(latestScan &&
-          (+latestScan.createdAt >= +run.createdAt || (['QUEUED', 'RUNNING'].includes(latestScan.status) && +now - +latestScan.updatedAt < 5 * 60_000)))) {
+        if (canReadComments && (source.connector === 'fb-graph' || post.permalink) && !(latestScan &&
+          (+latestScan.createdAt >= +run.createdAt || ['QUEUED', 'RUNNING'].includes(latestScan.status)))) {
           const scan = await t.commentScan.create({ data: { sourcePostId: post.id, requestedBy: run.requestedBy } });
           scanId = scan.id;
           await enqueue(t, Q.CommentScan, { scanId, ...(source.connector === 'fb-session' && { readTargetId: target.id }) });
@@ -113,7 +114,11 @@ export async function handleProfileSync(ctx: BrowserCtx, { syncId, step }: { syn
   } catch (error) {
     if (retryCount < 8) throw error;
     ctx.log.warn({ syncId, error }, 'profile sync stopped');
-    await ctx.db.profileSync.updateMany({ where: { id: syncId, step }, data: { phase: 'FAILED', detail: 'Lượt đồng bộ bị gián đoạn. Bài đã thu thập vẫn còn trong kho.' } });
+    await tx(ctx.db, async t => {
+      if (!await assertLeaseHeld(t, lease, ctx.clock.now())) return;
+      await t.profileSync.updateMany({ where: { id: syncId, step, phase: { in: ['DISCOVERING', 'PREPARING'] } },
+        data: { phase: 'FAILED', detail: 'Lượt đồng bộ bị gián đoạn. Bài đã thu thập vẫn còn trong kho.' } });
+    });
   } finally {
     await releaseLease(ctx.db, lease, ctx.clock.now());
   }

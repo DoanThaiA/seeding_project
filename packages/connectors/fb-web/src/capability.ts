@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { ConnectorError, type MediaFile, type PublishConnector, type TargetRef } from '@seedingsys/connectors-core';
-import type { ContentType, PublishSnapshot } from '@seedingsys/contracts';
+import { FB_CAPABILITY_MIN_CASES, type ContentType, type PublishSnapshot } from '@seedingsys/contracts';
 import { captionFingerprint } from '@seedingsys/domain';
 
 /** Pass thresholds from the pilot acceptance criteria (spec §18). */
@@ -14,7 +14,7 @@ export const THRESHOLDS: Partial<Record<ContentType, number>> = {
   VIDEO: 0.9,
   REEL: 0.9,
 };
-export const MIN_CASES = 20;
+export const MIN_CASES = FB_CAPABILITY_MIN_CASES;
 
 export interface CaseResult {
   n: number;

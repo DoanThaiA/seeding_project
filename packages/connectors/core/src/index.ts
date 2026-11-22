@@ -99,7 +99,7 @@ export interface ReadConnector {
   readonly version: string;
   /** Read new posts plus a bounded overlap before the watermark. Throws ConnectorError when the source cannot be read. */
   readSince(source: SourceRef, watermark: Record<string, unknown> | null, overlap: number): Promise<ReadResult>;
-  readComments?(source: SourceRef, post: { externalId: string; permalink?: string },
+  readComments?(source: SourceRef, post: { externalId: string; permalink?: string; aliases?: string[] },
     onProgress: (readCount: number, expectedCount?: number) => Promise<void>): Promise<ReadCommentsResult>;
   /** Fetch media bytes the organisation is permitted to store. */
   fetchMedia(media: { ref: string; sourceUrl?: string | null }): Promise<{ bytes: Buffer; mime: string }>;

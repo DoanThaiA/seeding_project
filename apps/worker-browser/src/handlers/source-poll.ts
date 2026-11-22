@@ -24,12 +24,8 @@ export function uniqueReads(posts: ReadPost[]): ReadPost[] {
 export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; collectComments?: boolean; history?: { targetId: string; cursor?: string } }): Promise<{
   outcome: string; counts?: Record<string, number>; history?: ReadResult['history']; error?: string;
 }> {
-  const source = await ctx.db.source.findUnique({ where: { id: p.sourceId } });
-  if (!source || !source.enabled) return { outcome: 'DISABLED' };
-  if (await activeKillSwitch(ctx.db, { sourceId: source.id, connector: source.connector })) return { outcome: 'PAUSED' };
-
   const lease = await acquireLease(ctx.db, {
-    resource: sourceResource(source.id),
+    resource: sourceResource(p.sourceId),
     holder: `${ctx.workerId}:poll`,
     ttlMs: ctx.leaseTtlMs.POLL,
     now: ctx.clock.now(),
@@ -38,7 +34,13 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
   if (!lease) return { outcome: 'ALREADY_RUNNING' };
 
   let accountLease: Lease | null = null;
+  let readTargetId: string | undefined;
   try {
+    const source = await ctx.db.source.findUnique({ where: { id: p.sourceId } });
+    if (!source || !source.enabled) return { outcome: 'DISABLED' };
+    const sourceControl = { sourceId: source.id, connector: source.connector };
+    if (await activeKillSwitch(ctx.db, sourceControl)) return { outcome: 'PAUSED' };
+
     const currentSource = {
       id: source.id, connector: source.connector, externalRef: source.externalRef,
       baselineDone: source.baselineDone, lastSuccessAt: source.lastSuccessAt, enabled: true,
@@ -60,7 +62,8 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
         if (target.profile.workerNode && target.profile.workerNode.name !== ctx.actor) {
           throw new ConnectorError('TRANSIENT', 'Phiên ' + target.code + ' nằm trên worker khác. Hệ thống sẽ thử lại ở lượt sau.');
         }
-        if (await activeKillSwitch(ctx.db, { targetId: target.id, connector: target.connector })) {
+        readTargetId = target.id;
+        if (await activeKillSwitch(ctx.db, { targetId: readTargetId, connector: target.connector })) {
           throw new ConnectorError('SOURCE_UNREADABLE', 'Phiên ' + target.code + ' đang bị tạm dừng.');
         }
         accountLease = await acquireLease(ctx.db, {
@@ -87,15 +90,20 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
         p.history ? null : source.watermark as Record<string, unknown> | null, source.overlapCount,
       );
       // The session reader closes its browser at its own deadline. Await that cleanup before releasing B's lock.
-      result = isFacebookTimelineReader(source.connector) || p.history ? await reading : await withTimeout(reading, ctx.timeouts.stepMs, 'read');
+      result = isFacebookTimelineReader(source.connector) || ['fb-web', 'fb-graph'].includes(source.connector)
+        ? await reading : await withTimeout(reading, ctx.timeouts.stepMs, 'read');
     } catch (e) {
-      const msg = isConnectorError(e) ? `${e.kind}: ${e.message}` : String((e as Error).message ?? e);
-      if (!p.history) await ctx.db.source.updateMany({ where: currentSource, data: { lastErrorAt: ctx.clock.now(), lastError: msg.slice(0, 500) } });
+      const msg = isConnectorError(e) ? `${e.kind}: ${e.message}` : e instanceof Error ? e.message : String(e);
+      if (!p.history) await tx(ctx.db, async t => {
+        const now = ctx.clock.now();
+        if (await assertLeaseHeld(t, lease, now)) {
+          await t.source.updateMany({ where: currentSource, data: { lastErrorAt: now, lastError: msg.slice(0, 500) } });
+        }
+      });
       ctx.log.warn({ source: source.code, err: msg }, 'source read failed');
       return { outcome: 'READ_ERROR', error: msg.slice(0, 400) };
     }
 
-    const now = ctx.clock.now();
     const baseline = !p.history && !source.baselineDone && !isFacebookTimelineReader(source.connector);
     const posts = await Promise.all(uniqueReads(result.posts).map(async post => {
       const media = await Promise.all(post.media.map(async item => {
@@ -116,12 +124,14 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
       return { ...post, media: media.filter(item => item !== null),
         incomplete: media.includes(null) ? [...new Set([...post.incomplete, 'MEDIA_UNAVAILABLE' as const])] : post.incomplete };
     }));
-    const counts: Record<string, number> = {};
     const committed = await tx(
       ctx.db,
       async (t) => {
-        if (!(await assertLeaseHeld(t, lease, now))) return false; // another poll took over: discard
-        if (accountLease && !(await assertLeaseHeld(t, accountLease, now))) return false;
+        const now = ctx.clock.now();
+        if (!(await assertLeaseHeld(t, lease, now))) return 'FENCED';
+        if (accountLease && !(await assertLeaseHeld(t, accountLease, now))) return 'FENCED';
+        if (await activeKillSwitch(t, sourceControl)
+          || (readTargetId && await activeKillSwitch(t, { targetId: readTargetId, connector: 'fb-web' }))) return 'PAUSED';
         const updated = await t.source.updateMany({
           where: currentSource,
           data: p.history ? { updatedAt: now } : {
@@ -132,8 +142,9 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
             lastIncomplete: result.incomplete,
           },
         });
-        if (!updated.count) return false;
+        if (!updated.count) return 'FENCED';
         // Different ids for one post (rotated pfbid) are recognised by ingestPost.
+        const counts: Record<string, number> = {};
         for (const post of posts) {
           const o = await ingestPost(t, { sourceId: source.id, connector: source.connector, post, baseline, now, actor: ctx.actor, archiveOnly: !!p.history });
           counts[o] = (counts[o] ?? 0) + 1;
@@ -164,16 +175,24 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
               AND (cs.status IS NULL OR (cs.status IN ('PARTIAL','FAILED') AND cs.updated_at<${retryBefore}))
             ORDER BY coalesce(sp.posted_at,sp.first_seen_at) DESC,sp.id
             LIMIT 8 FOR UPDATE OF sp SKIP LOCKED`;
-          for (const { id } of [...newlyRead, ...latest]) {
+          const candidates = [...newlyRead, ...latest];
+          const active = await t.commentScan.findMany({
+            where: { sourcePostId: { in: candidates.map(post => post.id) }, status: { in: ['QUEUED', 'RUNNING'] } },
+            select: { sourcePostId: true },
+          });
+          const scanning = new Set(active.map(scan => scan.sourcePostId));
+          for (const { id } of candidates) {
+            if (scanning.has(id)) continue;
             const scan = await t.commentScan.create({ data: { sourcePostId: id, requestedBy: ctx.actor } });
-            await enqueue(t, Q.CommentScan, { scanId: scan.id });
+            await enqueue(t, Q.CommentScan, { scanId: scan.id, readTargetId });
           }
         }
-        return true;
+        return counts;
       },
       60_000,
     );
-    return { outcome: committed ? (baseline ? 'BASELINE' : 'OK') : 'FENCED', counts, history: committed ? result.history : undefined };
+    return typeof committed === 'string' ? { outcome: committed } :
+      { outcome: baseline ? 'BASELINE' : 'OK', counts: committed, history: result.history };
   } finally {
     try {
       if (accountLease) await releaseLease(ctx.db, accountLease, ctx.clock.now());

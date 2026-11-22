@@ -58,15 +58,18 @@ export async function dispatchDueSlots(ctx: CoreCtx): Promise<Record<string, num
  */
 export async function sweepLateDispatches(ctx: CoreCtx): Promise<number> {
   const now = ctx.clock.now();
-  const slots = await ctx.db.publicationSlot.findMany({ where: { status: 'DISPATCHED', slotAt: { lt: now } } });
+  const slots = await ctx.db.publicationSlot.findMany({ where: { status: { in: ['DISPATCHED', 'STARTED'] }, slotAt: { lt: now } } });
   let n = 0;
   for (const s of slots) {
     const lw = await targetLateWindowMin(ctx.db, s.targetId);
     if (!isPastLaunchWindow(s.slotAt, lw, now) || !s.publicationId) continue;
     await tx(ctx.db, async (t) => {
-      const cancelled = await movePublication(t, { id: s.publicationId!, from: 'QUEUED', to: 'CANCELLED', actor: ctx.actor, now, reason: 'LAUNCH_WINDOW_EXPIRED' });
+      const p = await t.publication.findUnique({ where: { id: s.publicationId! }, select: { jobVersion: true, slotId: true } });
+      if (p?.slotId !== s.id) return;
+      const cancelled = await movePublication(t, { id: s.publicationId!, from: 'QUEUED', to: 'CANCELLED', actor: ctx.actor, now, reason: 'LAUNCH_WINDOW_EXPIRED', expectedJobVersion: p.jobVersion });
       if (cancelled) {
-        await moveSlot(t, { id: s.id, from: 'DISPATCHED', to: 'MISSED', actor: ctx.actor, now, reason: 'NOT_STARTED_IN_WINDOW' });
+        if (s.status === 'DISPATCHED') await moveSlot(t, { id: s.id, from: 'DISPATCHED', to: 'MISSED', actor: ctx.actor, now, reason: 'NOT_STARTED_IN_WINDOW' });
+        else await moveSlot(t, { id: s.id, from: 'STARTED', to: 'DONE', actor: ctx.actor, now, reason: 'RETRY_WINDOW_EXPIRED' });
         n++;
       }
     });
@@ -75,7 +78,7 @@ export async function sweepLateDispatches(ctx: CoreCtx): Promise<number> {
   const started = await ctx.db.publicationSlot.findMany({ where: { status: 'STARTED' } });
   for (const s of started) {
     const p = s.publicationId ? await ctx.db.publication.findUnique({ where: { id: s.publicationId }, select: { status: true, slotId: true } }) : null;
-    if (!p || !ACTIVE.includes(p.status) || p.slotId !== s.id) {
+    if (!p || (p.status !== 'QUEUED' && !ACTIVE.includes(p.status)) || p.slotId !== s.id) {
       await moveSlot(ctx.db as unknown as Tx, { id: s.id, from: 'STARTED', to: 'DONE', actor: ctx.actor, now });
     }
   }

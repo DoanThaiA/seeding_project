@@ -1,13 +1,12 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
-import { COMMENT_READERS, Q, SUCCESS, UNRESOLVED, workflowFor, type PublishSnapshot } from '@seedingsys/contracts';
-import { activeKillSwitch, audit, closeVariantReviewTasks, enqueue, freezeSnapshot, movePublication, moveSlot, openOperatorTask, Prisma, tx, type Db } from '@seedingsys/db';
-import { facebookPostId as postId, facebookUrl, hashObject, removeAdvertisingLinks, type Clock } from '@seedingsys/domain';
+import { COMMENT_QUEUE_MS, COMMENT_READERS, COMMENT_STALL_MS, Q, SUCCESS, UNRESOLVED, workflowFor, type PublishSnapshot } from '@seedingsys/contracts';
+import { activeKillSwitch, audit, closeVariantReviewTasks, enqueue, freezeSnapshot, movePublication, moveSlot, openOperatorTask, Prisma, SnapshotBlockedError, tx, type Db, type Tx } from '@seedingsys/db';
+import { commentBody, commentReplayBody, facebookCommentId, facebookPostId as postId, facebookPostLink, facebookUrl, hashObject, removeAdvertisingLinks, type Clock } from '@seedingsys/domain';
 import { Roles, type Principal } from './auth';
 import { CLOCK, DB } from './tokens';
 import { Actor, parse } from './util';
 
-const SCAN_TIMEOUT_MS = 5 * 60_000;
 const SYNC_TIMEOUT_MS = 8 * 60_000;
 const PAGE_SIZE = 25;
 const profileFields = { id: true, code: true, name: true, enabled: true } as const;
@@ -38,12 +37,14 @@ export class LibraryController {
   @Get('profiles')
   async profiles() {
     const [sources, targets] = await Promise.all([
-      this.db.source.findMany({ select: { ...profileFields, connector: true, lastSuccessAt: true, lastError: true,
+      this.db.source.findMany({ select: { ...profileFields, connector: true, lastSuccessAt: true, lastError: true, lastIncomplete: true,
         _count: { select: { posts: { where: { archivedAt: null } } } } } }),
       this.db.targetAccount.findMany({ select: { ...profileFields, _count: { select: { publications: { where: { status: { in: [...SUCCESS] } } } } } } }),
     ]);
     const order = (a: { code: string }, b: { code: string }) => a.code.localeCompare(b.code, 'en', { numeric: true });
-    return { sources: sources.sort(order), targets: targets.sort(order) };
+    return { sources: sources.sort(order).map(source => ({ ...source,
+      lastIncomplete: Array.isArray(source.lastIncomplete) ? source.lastIncomplete.filter(flag => typeof flag === 'string') : [],
+    })), targets: targets.sort(order) };
   }
 
   @Get('profiles/:code')
@@ -109,18 +110,19 @@ export class LibraryController {
     const ids = [...new Set([...post.source.mappings.map(m => m.target.id), ...variants.map(v => v.targetId), ...publications.map(p => p.targetId)])];
     const targets = await this.db.targetAccount.findMany({ where: { id: { in: ids } }, select: { ...profileFields, audience: true }, orderBy: { code: 'asc' } });
     const { source, ...record } = post;
-    const timedOut = scan && ['QUEUED', 'RUNNING'].includes(scan.status) && +this.clock.now() - +scan.updatedAt >= SCAN_TIMEOUT_MS;
+    const timedOut = scan?.status === 'RUNNING' && +this.clock.now() - +scan.updatedAt >= COMMENT_STALL_MS;
     return {
       post: { ...record, permalink: facebookUrl(record.permalink)?.href ?? null },
       source: { id: source.id, code: source.code, name: source.name, enabled: source.enabled, connector: source.connector },
       revision: revisionView(revision),
       scan: timedOut ? { ...scan, status: 'FAILED', detail: 'Lượt quét đã hết thời gian. Có thể quét lại.' } : scan,
       canScan: !post.archivedAt && COMMENT_READERS.includes(source.connector) && (source.connector === 'fb-graph' || !!post.permalink),
-      comments: comments.map(c => ({ ...c, permalink: facebookUrl(c.permalink)?.href ?? null, replays: c.replays.map(r => {
-        const stale = +this.clock.now() - +r.updatedAt >= SCAN_TIMEOUT_MS;
-        if (stale && r.status === 'QUEUED') return { ...r, status: 'FAILED', sendDetail: 'Hết thời gian chờ worker. Có thể gửi lại.' };
+      comments: comments.map(c => ({ ...c, text: commentBody(c.text), permalink: facebookUrl(c.permalink)?.href ?? null, replays: c.replays.map(r => {
+        const stale = +this.clock.now() - +r.updatedAt >= (r.status === 'QUEUED' ? COMMENT_QUEUE_MS : COMMENT_STALL_MS);
+        const text = ['DRAFT', 'APPROVED', 'QUEUED', 'FAILED'].includes(r.status) ? commentReplayBody(r.text, c.text) : r.text;
+        if (stale && r.status === 'QUEUED') return { ...r, text, status: 'FAILED', sendDetail: 'Hết thời gian chờ worker. Có thể gửi lại.' };
         if (stale && r.status === 'SENDING') return { ...r, status: 'UNKNOWN', sendDetail: 'Chưa rõ kết quả. Đối chiếu trên Facebook.' };
-        return r;
+        return { ...r, text };
       }) })),
       authors,
       destinations: targets.map(target => {
@@ -131,7 +133,7 @@ export class LibraryController {
         return {
           target,
           publication: publication ? { id: publication.id, status: publication.status, verifiedAt: publication.verifiedAt,
-            permalink: permalink?.href ?? null, directLink: !!(permalink && postId(permalink)), lastReason: publication.lastReason } : null,
+            permalink: permalink?.href ?? null, directLink: !!facebookPostLink(publication.permalink), lastReason: publication.lastReason } : null,
           variant: variant ? variantView(variant, target.audience) : null,
         };
       }),
@@ -150,6 +152,10 @@ export class LibraryController {
       if (archived && await t.publication.findFirst({ where: { sourcePostId: id, status: { in: [...UNRESOLVED] } }, select: { id: true } })) {
         throw new ConflictException('Bài đang đăng hoặc chờ đối soát. Hoàn tất lượt đăng trước khi xóa khỏi kho.');
       }
+      const comments = { source: { sourcePostId: id } } satisfies Prisma.PublicationCommentWhereInput;
+      if (archived && await t.publicationComment.findFirst({ where: { ...comments, status: { in: ['SENDING', 'UNKNOWN'] } }, select: { id: true } })) {
+        throw new ConflictException('Có bình luận đang gửi hoặc chờ đối chiếu. Hoàn tất lượt gửi trước khi xóa bài khỏi kho.');
+      }
       await t.sourcePost.update({ where: { id }, data: { archivedAt: archived ? now : null, archivedBy: archived ? actor.actor : null } });
       if (archived) {
         const queued = await t.publication.findMany({ where: { sourcePostId: id, status: 'QUEUED' }, select: { id: true, slotId: true } });
@@ -159,7 +165,9 @@ export class LibraryController {
           }
         }
         await t.commentScan.updateMany({ where: { sourcePostId: id, status: { in: ['QUEUED', 'RUNNING'] } },
-          data: { status: 'FAILED', detail: 'Bài nguồn đã chuyển vào thùng rác.' } });
+          data: { status: 'FAILED', detail: 'Bài nguồn đã chuyển vào thùng rác.', updatedAt: now } });
+        await t.publicationComment.updateMany({ where: { ...comments, status: 'QUEUED' },
+          data: { status: 'FAILED', sendDetail: 'Lượt gửi đã dừng vì bài nguồn được chuyển vào thùng rác.', updatedAt: now } });
       }
       const reviews = await t.contentVariant.findMany({ where: { sourcePostId: id, status: 'NEEDS_REVIEW',
         publications: { none: { status: { in: [...SUCCESS] } } } }, select: { id: true, targetId: true, reviewReasons: true } });
@@ -250,31 +258,37 @@ export class LibraryController {
   @Post('syncs/:id/approve')
   @Roles('reviewer')
   async approveProfileSync(@Param('id', ParseUUIDPipe) id: string, @Actor() actor: Principal) {
-    const run = await this.db.profileSync.findUnique({ where: { id }, include: { mapping: { select: { enabled: true, targetId: true } } } });
+    const run = await this.db.profileSync.findUnique({ where: { id }, select: { phase: true, mapping: { select: { enabled: true } } } });
     if (!run || !run.mapping.enabled || run.phase !== 'PREPARED') throw new ConflictException('Lượt đồng bộ chưa chuẩn bị xong hoặc luồng đã tắt.');
-    const items = await this.db.$queryRaw<Array<{ id: string }>>`SELECT v.id FROM profile_sync_items i
+    const now = this.clock.now();
+    const eligible = (variantId?: string) => Prisma.sql`
+      SELECT v.id, r.text AS caption FROM profile_sync_items i
+      JOIN profile_syncs ps ON ps.id=i.sync_id AND ps.phase='PREPARED'
+      JOIN source_target_mappings m ON m.id=ps.mapping_id AND m.enabled
       JOIN source_posts sp ON sp.id=i.source_post_id AND sp.archived_at IS NULL
       JOIN content_variants v ON v.id=i.prepared_variant_id AND v.revision_id=sp.latest_revision_id
       JOIN source_post_revisions r ON r.id=v.revision_id
-      WHERE i.sync_id=${id}::uuid AND v.status='NEEDS_REVIEW' AND v.target_id=${run.mapping.targetId}::uuid
-        AND v.content_type NOT IN ('UNSUPPORTED','NAMED_ALBUM') AND v.caption=r.text AND (length(trim(r.text))>0 OR v.content_type='REEL')
+      WHERE i.sync_id=${id}::uuid AND v.status='NEEDS_REVIEW' AND v.target_id=m.target_id AND (v.expires_at IS NULL OR v.expires_at>${now})
+        AND v.content_type NOT IN ('UNSUPPORTED','NAMED_ALBUM') AND coalesce(v.caption,r.text)=r.text AND (length(trim(r.text))>0 OR v.content_type='REEL')
         AND r.media_status IN ('READY','NOT_REQUIRED') AND r.incomplete='[]'::jsonb AND r.raw->>'sharedPermalink' IS NULL
         AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.source_post_id=sp.id AND p.target_id=v.target_id AND p.status NOT IN ('CANCELLED','FAILED_CONFIRMED'))
-      ORDER BY sp.posted_at NULLS LAST, v.id LIMIT 50`;
+      ${variantId ? Prisma.sql`AND v.id=${variantId}::uuid FOR SHARE OF sp,m FOR NO KEY UPDATE OF v`
+        : Prisma.sql`ORDER BY sp.posted_at NULLS LAST, v.id LIMIT 50`}`;
+    const items = await this.db.$queryRaw<Array<{ id: string }>>(eligible());
     let approved = 0;
-    const now = this.clock.now();
     for (const { id: variantId } of items) {
-      const ok = await tx(this.db, async t => {
-        const [v] = await t.$queryRaw<Array<{ caption: string }>>`SELECT v.caption FROM content_variants v JOIN source_posts sp
-          ON sp.id=v.source_post_id AND sp.latest_revision_id=v.revision_id AND sp.archived_at IS NULL
-          JOIN source_post_revisions r ON r.id=v.revision_id
-          WHERE v.id=${variantId}::uuid AND v.status='NEEDS_REVIEW' AND v.caption=r.text FOR SHARE OF sp FOR UPDATE OF v`;
-        if (!v) return false;
-        const frozen = await freezeSnapshot(t, { variantId, now, from: 'NEEDS_REVIEW', actor: actor.actor, reviewedBy: actor.actor, caption: v.caption });
-        if (frozen) await closeVariantReviewTasks(t, variantId, actor.actor, now, 'profile_sync_approved');
-        return frozen;
-      });
-      if (ok) approved++;
+      try {
+        const ok = await tx(this.db, async t => {
+          const [v] = await t.$queryRaw<Array<{ caption: string }>>(eligible(variantId));
+          if (!v) return false;
+          const frozen = await freezeSnapshot(t, { variantId, now, from: 'NEEDS_REVIEW', actor: actor.actor, reviewedBy: actor.actor, caption: v.caption });
+          if (frozen) await closeVariantReviewTasks(t, variantId, actor.actor, now, 'profile_sync_approved');
+          return frozen;
+        });
+        if (ok) approved++;
+      } catch (error) {
+        if (!(error instanceof SnapshotBlockedError)) throw error;
+      }
     }
     return { approved };
   }
@@ -293,11 +307,13 @@ export class LibraryController {
       if (await activeKillSwitch(t, { sourceId: record.sourceId, connector: record.source.connector })) {
         throw new ConflictException('Nguồn đang bị tạm dừng bằng công tắc dừng.');
       }
-      const active = await t.commentScan.findFirst({ where: { sourcePostId: id, status: { in: ['QUEUED', 'RUNNING'] } } });
-      if (active && +now - +active.updatedAt < SCAN_TIMEOUT_MS) return { scanId: active.id, queued: false };
-      if (active) await t.commentScan.updateMany({ where: { id: active.id, status: { in: ['QUEUED', 'RUNNING'] } },
-        data: { status: 'FAILED', detail: 'Lượt quét trước đã hết thời gian.' } });
-      const scan = await t.commentScan.create({ data: { sourcePostId: id, requestedBy: actor.actor } });
+      const active = await t.commentScan.findFirst({ where: { sourcePostId: id, OR: [
+        { status: 'QUEUED' }, { status: 'RUNNING', updatedAt: { gt: new Date(+now - COMMENT_STALL_MS) } },
+      ] } });
+      if (active) return { scanId: active.id, queued: false };
+      await t.commentScan.updateMany({ where: { sourcePostId: id, status: 'RUNNING', updatedAt: { lte: new Date(+now - COMMENT_STALL_MS) } },
+        data: { status: 'FAILED', detail: 'Lượt quét trước đã hết thời gian.', updatedAt: now } });
+      const scan = await t.commentScan.create({ data: { sourcePostId: id, requestedBy: actor.actor, updatedAt: now } });
       await enqueue(t, Q.CommentScan, { scanId: scan.id, manual: true });
       await audit(t, { entityType: 'source_post', entityId: id, action: 'comments_scan_requested', actor: actor.actor, at: now, data: { scanId: scan.id } });
       return { scanId: scan.id, queued: true };
@@ -315,9 +331,11 @@ export class LibraryController {
       z.object({ action: z.literal('omit') }),
       z.object({ action: z.literal('send') }),
       z.object({ action: z.literal('posted'), permalink: z.string().max(2000).url() }),
+      z.object({ action: z.literal('confirmed_absent') }),
     ]), body);
-    if (actor.role === 'operator' && !['posted', 'send'].includes(input.action)) throw new ConflictException('Cần quyền duyệt để sửa hoặc duyệt bình luận.');
-    if (actor.role === 'reviewer' && input.action === 'send') throw new ConflictException('Cần quyền vận hành để gửi bình luận.');
+    const operation = input.action === 'send' || input.action === 'confirmed_absent';
+    if (actor.role === 'operator' && !operation && input.action !== 'posted') throw new ConflictException('Cần quyền duyệt để sửa hoặc duyệt bình luận.');
+    if (actor.role === 'reviewer' && operation) throw new ConflictException('Cần quyền vận hành để gửi hoặc đối chiếu lượt gửi bình luận.');
     return tx(this.db, async t => {
       await t.$queryRaw`SELECT id FROM source_posts WHERE id=${id}::uuid FOR UPDATE`;
       const post = await t.sourcePost.findUnique({ where: { id }, select: { sourceId: true, archivedAt: true } });
@@ -330,37 +348,34 @@ export class LibraryController {
       const where = { destinationId_sourceCommentId: { destinationId: targetId, sourceCommentId: commentId } };
       const current = await t.publicationComment.findUnique({ where });
       if (current?.status === 'POSTED') throw new ConflictException('Bình luận này đã ghi nhận đăng.');
-      const stale = !!current && +this.clock.now() - +current.updatedAt >= SCAN_TIMEOUT_MS;
+      const now = this.clock.now();
+      const stale = !!current && +now - +current.updatedAt >= (current.status === 'QUEUED' ? COMMENT_QUEUE_MS : COMMENT_STALL_MS);
       const inFlight = current?.status === 'QUEUED' || current?.status === 'SENDING';
       if (inFlight && !stale) throw new ConflictException('Worker đang xử lý bình luận này.');
       const uncertain = current?.status === 'UNKNOWN' || current?.status === 'SENDING';
-      if (uncertain && input.action !== 'posted') throw new ConflictException('Cần đối chiếu bình luận trên Facebook trước.');
+      if (uncertain && input.action !== 'posted' && input.action !== 'confirmed_absent') {
+        throw new ConflictException('Cần đối chiếu bình luận trên Facebook trước.');
+      }
+      const dest = facebookPostLink(pub?.permalink);
       if (input.action === 'send') {
-        const dest = facebookUrl(pub?.permalink);
-        if (!current || !['APPROVED', 'FAILED', 'QUEUED'].includes(current.status) || !pub || !SUCCESS.includes(pub.status) || !dest || !postId(dest)) {
-          throw new ConflictException('Cần duyệt bình luận và xác nhận liên kết trực tiếp của bài đích.');
-        }
-        const author = current.authorTargetId && await t.targetAccount.findFirst({ where: { id: current.authorTargetId, enabled: true, connector: 'fb-web', profile: { isNot: null } } });
-        const target = await t.targetAccount.findUniqueOrThrow({ where: { id: targetId } });
-        if (!author || !target.enabled) throw new ConflictException('Cần chọn hồ sơ Facebook đang bật và có trình duyệt đã đăng nhập.');
-        const snapshot = (await t.contentVariant.findUnique({ where: { id: pub.variantId }, select: { snapshot: true } }))?.snapshot as PublishSnapshot | null;
-        if (author.id !== targetId && (snapshot?.audience ?? target.audience) === 'ONLY_ME') {
-          throw new ConflictException('Bài đích ở chế độ Chỉ mình tôi. Hồ sơ khác không thể bình luận.');
-        }
-        if (comment.parentExternalId && !await t.publicationComment.findFirst({ where: { destinationId: targetId, status: 'POSTED',
-          permalink: { not: null }, source: { sourcePostId: id, externalId: comment.parentExternalId } } })) {
-          throw new ConflictException('Chờ bình luận cha được ghi nhận trên bài đích.');
+        await this.queueCommentSend(t, { postId: id, sourceId: post.sourceId, targetId, pub, comment, current, now });
+      } else if (input.action === 'confirmed_absent') {
+        if (!current || !uncertain || !pub || !SUCCESS.includes(pub.status) || !dest) {
+          throw new ConflictException('Chỉ xác nhận vắng sau khi đối chiếu lượt gửi chưa rõ kết quả trên bài đích.');
         }
         const updated = await t.publicationComment.updateMany({ where: { id: current.id, status: current.status, sendVersion: current.sendVersion },
-          data: { status: 'QUEUED', sendVersion: { increment: 1 }, sendDetail: null } });
+          data: { status: 'FAILED', sendDetail: 'Đã đối chiếu và xác nhận bình luận chưa xuất hiện. Có thể gửi lại.', updatedAt: now } });
         if (!updated.count) throw new ConflictException('Lượt gửi đã thay đổi. Tải lại bài.');
-        await enqueue(t, Q.CommentPublish, { replayId: current.id, sendVersion: current.sendVersion + 1 });
       } else if (input.action === 'posted') {
-        if (!current || (!uncertain && !['APPROVED', 'FAILED'].includes(current.status)) || !pub || !SUCCESS.includes(pub.status)) throw new ConflictException('Cần duyệt bình luận và xác nhận bài đích đã đăng.');
-        const dest = facebookUrl(pub.permalink);
+        if (!current || (!uncertain && !['APPROVED', 'FAILED', 'QUEUED'].includes(current.status)) || !pub || !SUCCESS.includes(pub.status)) throw new ConflictException('Cần duyệt bình luận và xác nhận bài đích đã đăng.');
         const actual = facebookUrl(input.permalink);
+        // Store digits: links copied from notifications carry base64 ids, the worker's receipts carry digits.
+        for (const key of ['comment_id', 'reply_comment_id']) {
+          const value = facebookCommentId(actual?.searchParams.get(key));
+          if (value) actual!.searchParams.set(key, value);
+        }
         const commentId = actual?.searchParams.get('reply_comment_id') ?? actual?.searchParams.get('comment_id');
-        if (!dest || !actual || !postId(dest) || postId(actual) !== postId(dest) || !commentId || !/^[A-Za-z0-9_:-]{1,150}$/.test(commentId)) {
+        if (!dest || !actual || postId(actual) !== dest.id || !commentId || !/^[A-Za-z0-9_:-]{1,150}$/.test(commentId)) {
           throw new BadRequestException('Dán liên kết trực tiếp tới bình luận trên đúng bài đích.');
         }
         if (comment.parentExternalId) {
@@ -368,7 +383,7 @@ export class LibraryController {
             source: { externalId: comment.parentExternalId, sourcePostId: comment.sourcePostId } }, select: { permalink: true, externalId: true } });
           const parentUrl = facebookUrl(parent?.permalink);
           if (!parent || !actual.searchParams.get('reply_comment_id') ||
-            ![parent.externalId, parentUrl?.searchParams.get('comment_id')].includes(actual.searchParams.get('comment_id'))) {
+            ![facebookCommentId(parent.externalId), facebookCommentId(parentUrl?.searchParams.get('comment_id'))].includes(actual.searchParams.get('comment_id'))) {
             throw new ConflictException('Dán liên kết phản hồi trong nhánh của bình luận cha đã đăng.');
           }
         } else if (actual.searchParams.has('reply_comment_id')) {
@@ -380,9 +395,12 @@ export class LibraryController {
         for (const key of [...actual.searchParams.keys()]) {
           if (!['id', 'story_fbid', 'fbid', 'v', 'comment_id', 'reply_comment_id'].includes(key)) actual.searchParams.delete(key);
         }
-        await t.publicationComment.update({ where, data: { status: 'POSTED', externalId: commentId, permalink: actual.href, sendDetail: null } });
+        actual.hash = '';
+        const updated = await t.publicationComment.updateMany({ where: { id: current.id, status: current.status, sendVersion: current.sendVersion },
+          data: { status: 'POSTED', externalId: commentId, permalink: actual.href, sendDetail: null, updatedAt: now } });
+        if (!updated.count) throw new ConflictException('Lượt gửi đã thay đổi. Tải lại bài.');
       } else {
-        const text = input.action === 'omit' ? current?.text ?? comment.text : removeAdvertisingLinks(input.text);
+        const text = input.action === 'omit' ? current?.text ?? comment.text : commentReplayBody(removeAdvertisingLinks(input.text), comment.text);
         if (input.action !== 'omit' && !text) throw new BadRequestException('Nhập nội dung bình luận.');
         const authorTargetId = input.action === 'omit' ? current?.authorTargetId : input.authorTargetId;
         if (input.action !== 'omit' && !await t.targetAccount.findFirst({
@@ -398,26 +416,113 @@ export class LibraryController {
     });
   }
 
+  /**
+   * Queue every approved (or failed) comment of one destination post, top-level comments first.
+   * A reply is queued with its parent: the worker waits for the parent before sending it.
+   */
+  @Post('posts/:id/destinations/:targetId/comments/send')
+  @Roles('operator')
+  async sendApprovedComments(@Param('id', ParseUUIDPipe) id: string, @Param('targetId', ParseUUIDPipe) targetId: string,
+    @Actor() actor: Principal) {
+    return tx(this.db, async t => {
+      await t.$queryRaw`SELECT id FROM source_posts WHERE id=${id}::uuid FOR UPDATE`;
+      const post = await t.sourcePost.findUnique({ where: { id }, select: { sourceId: true, archivedAt: true } });
+      if (!post || post.archivedAt) throw new NotFoundException('Không tìm thấy bài hoặc bài đã chuyển vào thùng rác.');
+      const pub = await t.publication.findUnique({ where: { targetId_sourcePostId: { targetId, sourcePostId: id } } });
+      if (!pub || !SUCCESS.includes(pub.status) || !facebookPostLink(pub.permalink)) {
+        throw new ConflictException('Cần bài đích đã đăng thành công và có liên kết trực tiếp.');
+      }
+      const comments = await t.sourceComment.findMany({ where: { sourcePostId: id }, orderBy: [{ position: 'asc' }, { id: 'asc' }],
+        include: { replays: { where: { destinationId: targetId } } } });
+      const byExternalId = new Map(comments.map(c => [c.externalId, c]));
+      const depth = (comment: typeof comments[number]) => {
+        let level = 0;
+        for (let parent = comment.parentExternalId; parent && level < 50; parent = byExternalId.get(parent)?.parentExternalId ?? null) level++;
+        return level;
+      };
+      // Stable sort: every level in thread order, parents before their replies.
+      const ordered = comments.map(comment => ({ comment, level: depth(comment) })).sort((a, b) => a.level - b.level);
+      const now = this.clock.now();
+      const queuedParents = new Set<string>();
+      const skipped: Array<{ commentId: string; text: string; reason: string }> = [];
+      for (const { comment } of ordered) {
+        const current = comment.replays[0];
+        if (!current || !['APPROVED', 'FAILED'].includes(current.status)) continue;
+        try {
+          await this.queueCommentSend(t, { postId: id, sourceId: post.sourceId, targetId, pub, comment, current, now, queuedParents });
+          queuedParents.add(comment.externalId);
+        } catch (error) {
+          if (!(error instanceof ConflictException)) throw error;
+          skipped.push({ commentId: comment.id, text: commentBody(comment.text).slice(0, 80), reason: error.message });
+        }
+      }
+      await audit(t, { entityType: 'source_post', entityId: id, action: 'comments_send_all', actor: actor.actor, at: now,
+        data: { targetId, queued: queuedParents.size, skipped: skipped.length } });
+      return { queued: queuedParents.size, skipped };
+    });
+  }
+
+  /** Check one approved comment and queue it for the worker; throws ConflictException with the reason it cannot go. */
+  private async queueCommentSend(t: Tx, { postId: id, sourceId, targetId, pub, comment, current, now, queuedParents }: {
+    postId: string; sourceId: string; targetId: string; now: Date; queuedParents?: Set<string>;
+    pub: Prisma.PublicationGetPayload<object> | null;
+    comment: { externalId: string; parentExternalId: string | null; text: string };
+    current: Prisma.PublicationCommentGetPayload<object> | null;
+  }) {
+    if (!current || !['APPROVED', 'FAILED', 'QUEUED'].includes(current.status) || !pub || !SUCCESS.includes(pub.status) || !facebookPostLink(pub.permalink)) {
+      throw new ConflictException('Cần duyệt bình luận và xác nhận liên kết trực tiếp của bài đích.');
+    }
+    const text = commentReplayBody(current.text, comment.text);
+    if (!text) throw new ConflictException('Cần duyệt bình luận có nội dung trước khi gửi.');
+    const author = current.authorTargetId && await t.targetAccount.findFirst({ where: { id: current.authorTargetId, enabled: true, connector: 'fb-web', profile: { isNot: null } } });
+    const target = await t.targetAccount.findUniqueOrThrow({ where: { id: targetId } });
+    if (!author || !target.enabled) throw new ConflictException('Cần chọn hồ sơ Facebook đang bật và có trình duyệt đã đăng nhập.');
+    for (const accountId of new Set([author.id, targetId])) {
+      if (await activeKillSwitch(t, { sourceId, targetId: accountId, connector: 'fb-web' })) {
+        throw new ConflictException('Luồng đăng bình luận đang bị tạm dừng.');
+      }
+    }
+    const snapshot = (await t.contentVariant.findUnique({ where: { id: pub.variantId }, select: { snapshot: true } }))?.snapshot as PublishSnapshot | null;
+    if (author.id !== targetId && (snapshot?.audience ?? target.audience) === 'ONLY_ME') {
+      throw new ConflictException('Bài đích ở chế độ Chỉ mình tôi. Hồ sơ khác không thể bình luận.');
+    }
+    if (comment.parentExternalId && !queuedParents?.has(comment.parentExternalId)) {
+      const parent = await t.publicationComment.findFirst({ where: { destinationId: targetId,
+        source: { sourcePostId: id, externalId: comment.parentExternalId } }, select: { status: true, permalink: true } });
+      if (parent?.status === 'OMITTED') {
+        throw new ConflictException('Bình luận cha đã được bỏ qua trên bài đích nên phản hồi này không có chỗ để đăng.');
+      }
+      // A parent that is being sent is fine: the worker sends the reply once the parent is posted.
+      const parentOnItsWay = parent?.status === 'QUEUED' || parent?.status === 'SENDING';
+      if (!parentOnItsWay && (parent?.status !== 'POSTED' || !parent.permalink)) {
+        throw new ConflictException('Chờ bình luận cha được ghi nhận trên bài đích.');
+      }
+    }
+    const updated = await t.publicationComment.updateMany({ where: { id: current.id, status: current.status, sendVersion: current.sendVersion },
+      data: { status: 'QUEUED', text, sendVersion: { increment: 1 }, sendDetail: null, updatedAt: now } });
+    if (!updated.count) throw new ConflictException('Lượt gửi đã thay đổi. Tải lại bài.');
+    await enqueue(t, Q.CommentPublish, { replayId: current.id, sendVersion: current.sendVersion + 1 });
+  }
+
   @Patch('posts/:id/destinations/:targetId/permalink')
   @Roles('operator')
   async confirmPublishedLink(@Param('id', ParseUUIDPipe) id: string, @Param('targetId', ParseUUIDPipe) targetId: string,
     @Body() body: unknown, @Actor() actor: Principal) {
-    const input = parse(z.object({ permalink: z.string().url().max(2000) }), body);
-    const url = facebookUrl(input.permalink);
-    const externalId = url && postId(url);
-    if (!url || !externalId || url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) {
-      throw new BadRequestException('Dán liên kết trực tiếp tới bài đã đăng trên profile đích.');
-    }
-    for (const key of [...url.searchParams.keys()]) if (!['id', 'story_fbid', 'fbid', 'v'].includes(key)) url.searchParams.delete(key);
-    url.hash = '';
+    const input = parse(z.object({ permalink: z.string().trim().url().max(2000) }), body);
+    const link = facebookPostLink(input.permalink);
+    if (!link) throw new BadRequestException('Dán liên kết trực tiếp tới bài đã đăng trên profile đích.');
+    const { url, id: externalId } = link;
     return tx(this.db, async t => {
       await t.$queryRaw`SELECT id FROM target_accounts WHERE id=${targetId}::uuid FOR UPDATE`;
+      await t.$queryRaw`SELECT id FROM source_posts WHERE id=${id}::uuid FOR SHARE`;
       const pub = await t.publication.findUnique({ where: { targetId_sourcePostId: { targetId, sourcePostId: id } }, include: { post: true } });
       if (!pub || !SUCCESS.includes(pub.status) || pub.post.archivedAt) throw new ConflictException('Bài đích chưa được xác nhận đăng.');
-      const known = facebookUrl(pub.permalink);
-      if (known && postId(known)) throw new ConflictException('Bài đích đã có liên kết trực tiếp.');
+      if (facebookPostLink(pub.permalink)) throw new ConflictException('Bài đích đã có liên kết trực tiếp.');
       const source = facebookUrl(pub.post.permalink);
-      if (pub.post.externalId === externalId || (source && postId(source) === externalId)) throw new BadRequestException('Dán liên kết của bài đích.');
+      if (pub.post.externalId === externalId || (source && postId(source) === externalId)
+        || await t.sourcePostAlias.findFirst({ where: { sourcePostId: id, externalId }, select: { externalId: true } })) {
+        throw new BadRequestException('Dán liên kết của bài đích.');
+      }
       if (await t.publication.findFirst({ where: { targetId, id: { not: pub.id }, OR: [{ externalPostId: externalId }, { permalink: url.href }] } })) {
         throw new ConflictException('Liên kết này đã được ghi nhận cho một bài khác.');
       }
@@ -435,24 +540,25 @@ export class LibraryController {
   async confirmShare(@Param('id', ParseUUIDPipe) id: string, @Param('targetId', ParseUUIDPipe) targetId: string,
     @Body() body: unknown, @Actor() actor: Principal) {
     const input = parse(z.object({ permalink: z.string().trim().url().max(1000) }), body);
-    const observed = facebookUrl(input.permalink);
-    const externalId = observed && postId(observed);
-    if (!observed || !externalId || observed.searchParams.has('comment_id') || observed.searchParams.has('reply_comment_id')) {
-      throw new BadRequestException('Dán liên kết trực tiếp tới bài đã chia sẻ trên profile đích.');
-    }
-    for (const key of [...observed.searchParams.keys()]) if (!['id', 'story_fbid', 'fbid', 'v'].includes(key)) observed.searchParams.delete(key);
-    observed.hash = '';
+    const link = facebookPostLink(input.permalink);
+    if (!link) throw new BadRequestException('Dán liên kết trực tiếp tới bài đã chia sẻ trên profile đích.');
+    const { url: observed, id: externalId } = link;
     const now = this.clock.now();
     return tx(this.db, async t => {
       const [locked] = await t.$queryRaw<Array<{ id: string }>>`SELECT id FROM target_accounts WHERE id=${targetId}::uuid FOR UPDATE`;
       if (!locked) throw new NotFoundException('Không tìm thấy profile đích.');
+      await t.$queryRaw`SELECT id FROM source_posts WHERE id=${id}::uuid FOR SHARE`;
       const post = await t.sourcePost.findUnique({ where: { id } });
       if (!post?.latestRevisionId || post.archivedAt) throw new NotFoundException('Không tìm thấy bài nguồn hoặc bài đã chuyển vào thùng rác.');
       const variant = await t.contentVariant.findFirst({ where: { sourcePostId: id, targetId, status: 'NEEDS_REVIEW', revisionId: post.latestRevisionId },
         select: { id: true, contentType: true, revision: { select: { raw: true } } } });
       const original = facebookUrl((variant?.revision.raw as { sharedPermalink?: string } | null)?.sharedPermalink);
       if (!variant || !original) throw new ConflictException('Bài này chưa có bản chờ duyệt để chia sẻ trực tiếp.');
-      if (externalId === post.externalId || externalId === postId(original)) throw new BadRequestException('Dán liên kết bài mới trên profile đích thay cho bài gốc.');
+      const source = facebookUrl(post.permalink);
+      if (externalId === post.externalId || externalId === postId(original) || (source && postId(source) === externalId)
+        || await t.sourcePostAlias.findFirst({ where: { sourcePostId: id, externalId }, select: { externalId: true } })) {
+        throw new BadRequestException('Dán liên kết bài mới trên profile đích thay cho bài gốc.');
+      }
       const existing = await t.publication.findFirst({ where: { targetId, OR: [{ sourcePostId: id }, { externalPostId: externalId }] }, select: { id: true } });
       if (existing) throw new ConflictException('Bài hoặc liên kết này đã có lượt đăng trong SeedingSys.');
       const pub = await t.publication.create({ data: { targetId, sourcePostId: id, variantId: variant.id, externalPostId: externalId,

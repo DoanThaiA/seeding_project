@@ -1,12 +1,13 @@
 /**
  * Idempotent pilot seed: A1–A5 → B1–B5 (1:1), one browser worker host, profiles pinned to it.
  *   APP_ENV=local      → FakeConnector, fake platform file, capability checks pre-certified
- *   APP_ENV=pilot-test → fb-web; capability checks must come from real capability runs (not seeded)
+ *   APP_ENV=pilot-test → fb-web, register the bundled connector release
  * Real URLs/IDs for A/B are filled in through the API or env (SEED_A1_REF=..., SEED_B1_ID=...).
  */
 import { resolve } from 'node:path';
 import { loadConfig } from '@seedingsys/config';
 import { FakePlatform } from '@seedingsys/connectors-fake';
+import { FB_WEB_VERSION } from '@seedingsys/connectors-fb-web';
 import { CONTENT_TYPES } from '@seedingsys/contracts';
 import { createDb } from '@seedingsys/db';
 
@@ -22,13 +23,12 @@ async function main() {
     create: { name: `browser:${cfg.WORKER_NAME}`, kind: 'BROWSER' },
     update: {},
   });
-  if (local) {
-    await db.connectorRelease.upsert({
-      where: { connector_version: { connector: 'fake', version: 'fake-1.0.0' } },
-      create: { connector: 'fake', version: 'fake-1.0.0', active: true, notes: 'local fake platform' },
-      update: { active: true },
-    });
-  }
+  const version = local ? 'fake-1.0.0' : FB_WEB_VERSION;
+  await db.connectorRelease.upsert({
+    where: { connector_version: { connector, version } },
+    create: { connector, version, active: true },
+    update: local ? { active: true } : {},
+  });
   const platform = local ? new FakePlatform({ file: resolve(cfg.FAKE_PLATFORM_FILE) }) : null;
 
   for (let i = 1; i <= n; i++) {

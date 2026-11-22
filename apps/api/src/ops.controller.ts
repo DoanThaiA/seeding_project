@@ -1,9 +1,9 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Param, ParseUUIDPipe, Patch, Post, Put, Query, Req, Res, StreamableFile } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { Q, SUCCESS } from '@seedingsys/contracts';
-import { audit, BacklogDispatchError, dispatchBacklogItem, editBacklogCaption, enqueue, freezeSnapshot, listBacklog, movePublication, moveVariant, setControl, tx, type Db } from '@seedingsys/db';
-import { removeAdvertisingLinks, vnDay, type Clock } from '@seedingsys/domain';
+import { FB_CAPABILITY_MIN_CASES, Q, SUCCESS } from '@seedingsys/contracts';
+import { audit, BacklogDispatchError, dispatchBacklogItem, editBacklogCaption, enqueue, freezeSnapshot, listBacklog, movePublication, moveVariant, setControl, SnapshotBlockedError, tx, type Db } from '@seedingsys/db';
+import { facebookPostId, facebookPostLink, facebookUrl, removeAdvertisingLinks, vnDay, type Clock } from '@seedingsys/domain';
 import { Roles, type Principal } from './auth';
 import type { ObjectStore } from '@seedingsys/storage';
 import { CLOCK, DB, STORE } from './tokens';
@@ -15,13 +15,16 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   NO_WORKER: 'Tài khoản đích chưa có worker đang hoạt động.',
   NO_CONNECTOR_RELEASE: 'Cách đăng của tài khoản đích chưa có phiên bản hoạt động.',
   TARGET_DISABLED: 'Tài khoản đích đang tắt.',
+  AUDIENCE_CONFIG_CHANGED: 'Quyền xem đã duyệt khác cài đặt hiện tại. Xác nhận quyền xem mới trước khi đăng.',
   MAPPING_DISABLED: 'Luồng từ nguồn đến tài khoản đích đang tắt.',
   STRICT_ORDER_WAIT: 'Luồng đang bật giữ thứ tự và còn bài cũ hơn cần xử lý.',
   ITEM_EXPIRED: 'Bài đã hết hiệu lực.',
+  SOURCE_REVISION_CHANGED: 'Bài nguồn đã có bản mới. Mở Kho bài để chuẩn bị lại bản đăng.',
   ITEM_UNAVAILABLE: 'Bài này không còn sẵn sàng. Tải lại Backlog để kiểm tra.',
   MEDIA_INCOMPLETE: 'Bài chưa lưu đủ ảnh hoặc video.',
   NATIVE_SHARE_REQUIRED: 'Mở bài gốc để chia sẻ trực tiếp trên Facebook.',
   FORMAT_NOT_CERTIFIED: 'Định dạng này chưa được chứng nhận cho tài khoản đích.',
+  FORMAT_UNSUPPORTED: 'Kết nối của tài khoản đích chưa hỗ trợ định dạng này.',
   RETRY_LIMIT_REACHED: 'Bài đã hết số lần thử đăng trong cấu hình luồng.',
   DUPLICATE_CONTENT: 'Tài khoản đích đã đăng hoặc đang chờ đăng nội dung này từ một bài nguồn khác.',
 };
@@ -81,7 +84,9 @@ export class OpsController {
       this.db.capabilityCheck.findMany({ orderBy: [{ target: { code: 'asc' } }, { contentType: 'asc' }], include: { target: { select: { code: true } } } }),
       this.db.connectorRelease.findMany({ orderBy: { releasedAt: 'desc' } }),
     ]);
-    return out({ checks, releases });
+    return out({ checks: checks.map(check => ({ ...check,
+      qualified: check.passed && (check.connector !== 'fb-web' || check.cases >= FB_CAPABILITY_MIN_CASES),
+    })), releases });
   }
 
   @Get('slots')
@@ -107,7 +112,8 @@ export class OpsController {
   @Patch('backlog/:id')
   @Roles('reviewer')
   async updateBacklogCaption(@Param('id', ParseUUIDPipe) id: string, @Body() body: unknown, @Actor() a: Principal) {
-    const data = parse(z.object({ caption: z.string().trim().min(1).max(5000), snapshotHash: z.string().regex(/^[a-f0-9]{64}$/) }), body);
+    const data = parse(z.object({ caption: z.string().trim().max(5000), snapshotHash: z.string().regex(/^[a-f0-9]{64}$/),
+      audience: z.enum(['ONLY_ME', 'FRIENDS', 'PUBLIC']).optional() }), body);
     const updated = await tx(this.db, t => editBacklogCaption(t, { ...data, variantId: id, actor: a.actor, now: this.clock.now() }));
     if (!updated) throw new ConflictException('Bài đã thay đổi, hết hiệu lực hoặc đã được gửi đăng. Tải lại Backlog để kiểm tra.');
     return { ok: true };
@@ -199,12 +205,12 @@ export class OpsController {
         orderBy: { createdAt: 'asc' },
         include: {
           target: { select: { code: true } },
-          revision: { select: { text: true, albumTitle: true, incomplete: true, mediaStatus: true, raw: true, post: { select: { permalink: true, contentType: true, isShared: true, identityConfidence: true, source: { select: { code: true, connector: true } } } }, assets: { orderBy: { position: 'asc' }, select: { position: true, asset: { select: { id: true, kind: true, status: true, mime: true } } } } } },
+          revision: { select: { text: true, albumTitle: true, incomplete: true, mediaStatus: true, raw: true, post: { select: { permalink: true, contentType: true, isShared: true, identityConfidence: true, latestRevisionId: true, source: { select: { code: true, connector: true } } } }, assets: { orderBy: { position: 'asc' }, select: { position: true, asset: { select: { id: true, kind: true, status: true, mime: true } } } } } },
           checks: { where: { kind: { not: 'not_verbatim' } }, orderBy: { createdAt: 'desc' }, take: 8 },
         },
-      }).then(items => items.map(({ revision: { raw, ...revision }, ...item }) => {
-        const share = (raw as { sharedPermalink?: unknown } | null)?.sharedPermalink;
-        return { ...item, revision: { ...revision, sharedPermalink: typeof share === 'string' ? share : null } };
+      }).then(items => items.filter(item => item.revisionId === item.revision.post.latestRevisionId).map(({ revision: { raw, ...revision }, ...item }) => {
+        const share = facebookUrl((raw as { sharedPermalink?: unknown } | null)?.sharedPermalink);
+        return { ...item, revision: { ...revision, post: { ...revision.post, permalink: facebookUrl(revision.post.permalink)?.href ?? null }, sharedPermalink: share?.href ?? null } };
       })),
     );
   }
@@ -212,13 +218,14 @@ export class OpsController {
   @Patch('review/:id/caption')
   @Roles('reviewer')
   async saveReviewCaption(@Param('id', ParseUUIDPipe) id: string, @Body() body: unknown, @Actor() a: Principal) {
-    const data = parse(z.object({ caption: z.string().trim().min(1).max(5000) }), body);
+    const data = parse(z.object({ caption: z.string().trim().max(5000) }), body);
     const caption = removeAdvertisingLinks(data.caption);
-    if (!caption) throw new BadRequestException('Caption chỉ có liên kết quảng cáo.');
+    if (!caption && data.caption) throw new BadRequestException('Caption chỉ có liên kết quảng cáo.');
     const now = this.clock.now();
     const ok = await tx(this.db, async t => {
       const saved = await t.contentVariant.updateMany({
-        where: { id, status: 'NEEDS_REVIEW', OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
+        where: { id, status: 'NEEDS_REVIEW', ...(caption ? {} : { contentType: 'REEL' }),
+          revision: { post: { archivedAt: null } }, OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
         data: { caption },
       });
       if (saved.count) await audit(t, { entityType: 'variant', entityId: id, action: 'caption_edited', actor: a.actor, at: now });
@@ -230,20 +237,21 @@ export class OpsController {
 
   @Post('review/:id/approve')
   @Roles('reviewer')
-  async approve(@Param('id') id: string, @Body() body: unknown, @Actor() a: Principal) {
-    const { caption } = parse(z.object({ caption: z.string().trim().min(1).max(5000).optional() }), body ?? {});
+  async approve(@Param('id', ParseUUIDPipe) id: string, @Body() body: unknown, @Actor() a: Principal) {
+    const { caption } = parse(z.object({ caption: z.string().trim().max(5000).optional() }), body ?? {});
     const now = this.clock.now();
     const ok = await tx(this.db, async (t) => {
       let done: boolean;
       try {
         done = await freezeSnapshot(t, { variantId: id, from: 'NEEDS_REVIEW', now, actor: a.actor, caption, reviewedBy: a.actor });
       } catch (e) {
-        throw new ConflictException(String((e as Error).message)); // e.g. media not stored → cannot approve
+        if (!(e instanceof SnapshotBlockedError)) throw e;
+        throw new ConflictException(e.message);
       }
       if (done) await this.closeTasks(t, { variantId: id, kind: 'REVIEW_CONTENT' }, a.actor, { approved: true, edited: !!caption });
       return done;
     });
-    if (!ok) throw new ConflictException('variant is not waiting for review');
+    if (!ok) throw new ConflictException('Bài đã thay đổi, hết hiệu lực hoặc không còn chờ duyệt.');
     return { ok: true };
   }
 
@@ -301,11 +309,35 @@ export class OpsController {
   /** Operator checked the platform and found the post: record the permalink. */
   @Post('publications/:id/confirm')
   @Roles('operator')
-  async confirm(@Param('id') id: string, @Body() body: unknown, @Actor() a: Principal) {
-    const { permalink } = parse(z.object({ permalink: z.string().url() }), body ?? {});
+  async confirm(@Param('id', ParseUUIDPipe) id: string, @Body() body: unknown, @Actor() a: Principal) {
+    const input = parse(z.object({ permalink: z.string().trim().url().max(2000) }), body ?? {});
+    const url = new URL(input.permalink);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new BadRequestException('Liên kết bài đăng không hợp lệ.');
     const now = this.clock.now();
     const ok = await tx(this.db, async (t) => {
-      const done = await movePublication(t, { id, from: 'NEEDS_OPERATOR', to: 'OPERATOR_CONFIRMED', actor: a.actor, now, data: { permalink, verifiedAt: now }, reason: 'operator found post' });
+      const pub = await t.publication.findUnique({ where: { id }, include: { post: true, target: { select: { connector: true } } } });
+      if (!pub || pub.status !== 'NEEDS_OPERATOR') return false;
+      await t.$queryRaw`SELECT id FROM target_accounts WHERE id=${pub.targetId}::uuid FOR UPDATE`;
+      let externalPostId: string | undefined;
+      let permalink = url.href;
+      if (pub.target.connector === 'fb-web') {
+        const link = facebookPostLink(permalink);
+        if (!link) throw new BadRequestException('Dán liên kết trực tiếp tới bài đã đăng trên profile đích.');
+        const externalId = link.id;
+        const sourceLink = facebookUrl(pub.post.permalink);
+        if (externalId === pub.post.externalId || (sourceLink && facebookPostId(sourceLink) === externalId)
+          || await t.sourcePostAlias.findFirst({ where: { sourcePostId: pub.sourcePostId, externalId }, select: { externalId: true } })) {
+          throw new BadRequestException('Dán liên kết của bài đích.');
+        }
+        externalPostId = externalId;
+        permalink = link.url.href;
+      }
+      if (await t.publication.findFirst({ where: { targetId: pub.targetId, id: { not: id },
+        OR: [{ permalink }, ...(externalPostId ? [{ externalPostId }] : [])] }, select: { id: true } })) {
+        throw new ConflictException('Liên kết này đã được ghi nhận cho một bài khác.');
+      }
+      const done = await movePublication(t, { id, from: 'NEEDS_OPERATOR', to: 'OPERATOR_CONFIRMED', actor: a.actor, now,
+        data: { permalink, externalPostId, verifiedAt: now }, reason: 'operator found post' });
       if (done) await this.closeTasks(t, { publicationId: id, kind: 'CONFIRM_RESULT' }, a.actor, { permalink });
       return done;
     });

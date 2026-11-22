@@ -61,7 +61,7 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
     rmSync(dir, { recursive: true, force: true });
   });
   beforeEach(() => {
-    Object.assign(mock, { session: 'OK', vanity: null, defaultAudience: 'Chỉ mình tôi', audienceLocked: false, mangleCaption: false, reelViaMenu: false, pfbidCommentLinks: false, postMode: 'normal', toast: true, posts: [] });
+    Object.assign(mock, { session: 'OK', vanity: null, defaultAudience: 'Chỉ mình tôi', audienceLocked: false, mangleCaption: false, reelViaMenu: false, pfbidCommentLinks: false, nestedReplies: false, pfbidPhotoStory: false, rotatingPfbid: false, commentReceiptMode: 'normal', postMode: 'normal', toast: true, posts: [], comments: [] });
   });
 
   const withSession = async <T>(fn: (s: PublishSession) => Promise<T>): Promise<T> => {
@@ -176,18 +176,60 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
     });
   });
 
+  it('verifies a captionless Reel only by its direct post receipt', async () => {
+    const location = join(dir, 'reel-without-caption.mp4');
+    writeFileSync(location, Buffer.from('mock video'));
+    const video = { position: 0, checksum: 'reel', mime: 'video/mp4', kind: 'video', location };
+    await withSession(async s => {
+      const draft = await s.prepare(snap('', 0, { contentType: 'REEL' }), [video]);
+      expect(await s.previewCheck(draft, expectation('', 1))).toMatchObject({ ok: true, audienceOk: true });
+      const commitSignal = await s.commit(draft);
+      const verifyHint = { ...hint('', 1), contentType: 'REEL' as const };
+      expect(await s.verify(verifyHint)).toMatchObject({ kind: 'NOT_FOUND', conclusive: false });
+      expect(await s.verify({ ...verifyHint, commitSignal })).toMatchObject({
+        kind: 'VERIFIED', permalink: `${mock.baseUrl}/reel/${mock.posts[0].id}`,
+      });
+    });
+  });
+
   it('sends a comment and then replies to its verified permalink', async () => {
     const post = mock.addPost({ caption: 'Bài để thử bình luận' });
     const destination = new URL('/posts/' + post.id, mock.baseUrl);
     await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
       await expect(s.postComment!({ post: destination, text: 'Chưa được phép gửi' }, async () => { throw new Error('stopped'); })).rejects.toThrow('stopped');
       expect(mock.comments.filter(c => c.postId === post.id)).toHaveLength(0);
       const root = await s.postComment!({ post: destination, text: 'Bình luận gốc' }, async () => {});
       expect(root?.permalink).toContain('comment_id=' + root?.externalId);
       const reply = await s.postComment!({ post: new URL(root!.permalink), parentId: root!.externalId, text: 'Phản hồi đúng nhánh' }, async () => {});
       expect(reply?.permalink).toContain('comment_id=' + root?.externalId + '&reply_comment_id=');
+      const nested = await s.postComment!({ post: new URL(reply!.permalink), parentId: reply!.externalId, text: 'Phản hồi tiếp' }, async () => {});
+      expect(nested?.permalink).toContain('comment_id=' + root?.externalId + '&reply_comment_id=' + nested?.externalId);
       expect(mock.comments.filter(c => c.postId === post.id)).toMatchObject([
         { text: 'Bình luận gốc' }, { text: 'Phản hồi đúng nhánh', parentId: root?.externalId },
+        { text: 'Phản hồi tiếp', parentId: reply?.externalId },
+      ]);
+    });
+  });
+
+  it('replies under the right parent when replies render inside their parent card', async () => {
+    const post = mock.addPost({ caption: 'Bài có phản hồi lồng nhau' });
+    mock.nestedReplies = true;
+    const destination = new URL('/posts/' + post.id, mock.baseUrl);
+    await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const send = (parent: { externalId: string; permalink: string } | null, text: string) =>
+        s.postComment!(parent ? { post: new URL(parent.permalink), parentId: parent.externalId, text } : { post: destination, text }, async () => {});
+      const root = await send(null, 'Bình luận gốc');
+      const first = await send(root, 'Phản hồi thứ nhất');
+      // The root card now also holds the first reply's own Reply button.
+      const second = await send(root, 'Phản hồi thứ hai');
+      const nested = await send(first, 'Phản hồi cho phản hồi thứ nhất');
+      expect(second?.permalink).toContain(`comment_id=${root?.externalId}&reply_comment_id=${second?.externalId}`);
+      expect(nested?.permalink).toContain(`comment_id=${root?.externalId}&reply_comment_id=${nested?.externalId}`);
+      expect(mock.comments.filter(c => c.postId === post.id)).toMatchObject([
+        { text: 'Bình luận gốc' }, { text: 'Phản hồi thứ nhất', parentId: root?.externalId },
+        { text: 'Phản hồi thứ hai', parentId: root?.externalId }, { text: 'Phản hồi cho phản hồi thứ nhất', parentId: first?.externalId },
       ]);
     });
   });
@@ -197,10 +239,106 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
     mock.pfbidCommentLinks = true;
     const destination = new URL('/posts/' + post.id, mock.baseUrl);
     await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
       const root = await s.postComment!({ post: destination, text: 'Trích bình luận gốc của A · https://x.test/a\n\nNội dung gốc' }, async () => {});
       expect(root?.permalink).toBe(`${mock.baseUrl}/posts/${post.id}?comment_id=${root?.externalId}`);
       const reply = await s.postComment!({ post: new URL(root!.permalink), parentId: root!.externalId, text: 'Phản hồi pfbid' }, async () => {});
       expect(reply?.permalink).toBe(`${mock.baseUrl}/posts/${post.id}?comment_id=${root?.externalId}&reply_comment_id=${reply?.externalId}`);
+    });
+  });
+
+  it('confirms a comment with a plain profile link before the comment body', async () => {
+    const post = mock.addPost({ caption: 'Bài có tác giả bình luận dạng liên kết hồ sơ' });
+    mock.commentReceiptMode = 'profile-link';
+    const destination = new URL('/posts/' + post.id, mock.baseUrl);
+    await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const receipt = await s.postComment!({ post: destination, text: 'Nội dung đã duyệt' }, async () => {});
+      expect(receipt?.permalink).toBe(`${destination.href}?comment_id=${mock.comments[0].id}`);
+      expect(mock.comments).toHaveLength(1);
+    });
+  });
+
+  it.each([false, true])('confirms a photo comment only when the story links back to that photo (missing: %s)', async omitPhotoAttachment => {
+    mock.addPost({ id: '801', photoId: '901', caption: 'Ảnh có bình luận', omitPhotoAttachment, photoReceiptAfterReload: !omitPhotoAttachment });
+    const destination = new URL('/photo/?fbid=901', mock.baseUrl);
+    await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const receipt = await s.postComment!({ post: destination, text: 'Bình luận của bài ảnh' }, async () => {});
+      if (omitPhotoAttachment) expect(receipt).toBeNull();
+      else {
+        expect(receipt?.permalink).toBe(`${destination.href}&comment_id=${mock.comments[0].id}`);
+        const reply = await s.postComment!({ post: new URL(receipt!.permalink), parentId: receipt!.externalId, text: 'Phản hồi bài ảnh' }, async () => {});
+        expect(reply?.permalink).toBe(`${receipt!.permalink}&reply_comment_id=${mock.comments[1].id}`);
+        expect(mock.comments[1].parentId).toBe(receipt!.externalId);
+      }
+      expect(mock.comments).toHaveLength(omitPhotoAttachment ? 1 : 2);
+    });
+  });
+
+  it('keeps the line breaks of a multi-line comment and reply instead of sending at the first line', async () => {
+    const post = mock.addPost({ caption: 'Bài có bình luận nhiều dòng' });
+    const destination = new URL('/posts/' + post.id, mock.baseUrl);
+    await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const root = await s.postComment!({ post: destination, text: 'Dòng một\nDòng hai\n\nDòng bốn' }, async () => {});
+      expect(root).not.toBeNull();
+      const reply = await s.postComment!({ post: new URL(root!.permalink), parentId: root!.externalId, text: 'Trả lời\nhai dòng' }, async () => {});
+      expect(reply).not.toBeNull();
+      expect(mock.comments).toMatchObject([{ text: 'Dòng một\nDòng hai\n\nDòng bốn' }, { text: 'Trả lời\nhai dòng', parentId: root!.externalId }]);
+    });
+  });
+
+  it('confirms comments and replies whose pfbid link is not in the page data, through the encoded comment link', async () => {
+    const post = mock.addPost({ caption: 'Bài có pfbid đổi giữa các lần tải' });
+    mock.rotatingPfbid = true;
+    mock.nestedReplies = true;
+    const destination = new URL('/posts/' + post.id, mock.baseUrl);
+    await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const root = await s.postComment!({ post: destination, text: 'Bình luận pfbid đổi' }, async () => {});
+      expect(root?.permalink).toBe(`${destination.href}?comment_id=${mock.comments[0].id}`);
+      const reply = await s.postComment!({ post: new URL(root!.permalink), parentId: root!.externalId, text: 'Phản hồi pfbid đổi' }, async () => {});
+      expect(reply?.permalink).toBe(`${root!.permalink}&reply_comment_id=${mock.comments[1].id}`);
+      expect(mock.comments[1].parentId).toBe(root!.externalId);
+    });
+  });
+
+  it('comments and replies on a photo whose comment links use a pfbid story id', async () => {
+    mock.addPost({ id: '801', photoId: '901', caption: 'Ảnh có link pfbid' });
+    mock.pfbidPhotoStory = true;
+    mock.nestedReplies = true;
+    const destination = new URL('/photo/?fbid=901', mock.baseUrl);
+    await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const root = await s.postComment!({ post: destination, text: 'Bình luận ảnh pfbid' }, async () => {});
+      expect(root?.permalink).toBe(`${destination.href}&comment_id=${mock.comments[0].id}`);
+      const reply = await s.postComment!({ post: new URL(root!.permalink), parentId: root!.externalId, text: 'Phản hồi ảnh pfbid' }, async () => {});
+      expect(reply?.permalink).toBe(`${root!.permalink}&reply_comment_id=${mock.comments[1].id}`);
+      expect(mock.comments[1].parentId).toBe(root!.externalId);
+    });
+  });
+
+  it('verifies an album comment when Facebook uses the other story ID for the same photos', async () => {
+    mock.addPost({ id: '801', storyAlias: '802', albumPhotos: ['901','902'], caption: 'Album có hai ảnh' });
+    const destination = new URL(`/permalink.php?story_fbid=801&id=${mock.userId}`, mock.baseUrl);
+    await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const receipt = await s.postComment!({ post: destination, text: 'Bình luận album' }, async () => {});
+      expect(receipt?.permalink).toBe(`${destination.href}&comment_id=${mock.comments[0].id}`);
+      expect(mock.comments).toHaveLength(1);
+    });
+  });
+
+  it.each(['related-post', 'wrong-author', 'wrong-text'] as const)('rejects a %s comment receipt after submit', async mode => {
+    const post = mock.addPost({ caption: 'Bài có kết quả bình luận chưa xác minh' });
+    mock.commentReceiptMode = mode;
+    const destination = new URL('/posts/' + post.id, mock.baseUrl);
+    await withSession(async s => {
+      expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const receipt = await s.postComment!({ post: destination, text: 'Nội dung đã duyệt' }, async () => {});
+      expect(receipt).toBeNull();
+      expect(mock.comments).toHaveLength(1);
     });
   });
 
@@ -357,9 +495,18 @@ describe.skipIf(!BROWSER)('verify modes (caption = default, off)', () => {
     mock.posts = [];
   });
 
-  it('caption mode accepts the post even when its timestamp cannot be read (as on the real profile)', async () => {
+  it('keeps a caption match unresolved when Facebook does not expose a post link', async () => {
     mock.addPost({ caption: 'Bài mới vừa đăng', hiddenTime: true }); // timestamp link href="#", empty
-    expect(await verifyWith(mk('caption'), hint('Bài mới vừa đăng', 3))).toMatchObject({ kind: 'VERIFIED' });
+    expect(await verifyWith(mk('caption'), hint('Bài mới vừa đăng', 3))).toMatchObject({
+      kind: 'NOT_FOUND', conclusive: false, evidence: { missingPermalink: true },
+    });
+  });
+
+  it('does not verify a matching caption on a post older than the commit window', async () => {
+    mock.addPost({ caption: 'Bài cũ có cùng caption', at: Date.now() - 4 * 3600_000 });
+    expect(await verifyWith(mk('caption'), hint('Bài cũ có cùng caption'))).toMatchObject({
+      kind: 'NOT_FOUND', conclusive: false, evidence: { outsideWindow: true },
+    });
   });
 
   it('caption mode flags two copies of the same caption as a possible duplicate', async () => {
@@ -385,14 +532,22 @@ describe.skipIf(!BROWSER)('verify modes (caption = default, off)', () => {
   });
 
   it('hovers a timestamp whose link only appears on pointer-over to record the post permalink', async () => {
+    mock.addPost({ caption: 'Bài cũ nằm bên dưới', at: Date.now() - 4 * 3600_000 });
     const post = mock.addPost({ caption: 'Bài mới có link ẩn', lazyHref: true });
     const result = await verifyWith(mk('caption'), hint('Bài mới có link ẩn'));
     expect(result).toMatchObject({ kind: 'VERIFIED', permalink: expect.stringContaining(`/posts/${post.id}`) });
   });
 
+  it('keeps a post unresolved when only its neighbor has a permalink', async () => {
+    mock.addPost({ caption: 'Bài cũ có đường dẫn', at: Date.now() - 4 * 3600_000 });
+    mock.addPost({ caption: 'Bài mới chưa lộ đường dẫn', hiddenTime: true });
+    const result = await verifyWith(mk('caption'), hint('Bài mới chưa lộ đường dẫn'));
+    expect(result).toMatchObject({ kind: 'NOT_FOUND', conclusive: false, evidence: { missingPermalink: true } });
+  });
+
   it('off mode does not look at the page and records that nothing was checked', async () => {
     const r = await verifyWith(mk('off'), hint('Không kiểm tra'));
-    expect(r).toMatchObject({ kind: 'VERIFIED', evidence: { mode: 'off', checked: false } });
+    expect(r).toMatchObject({ kind: 'NOT_FOUND', conclusive: false, evidence: { mode: 'off', checked: false } });
   });
 });
 

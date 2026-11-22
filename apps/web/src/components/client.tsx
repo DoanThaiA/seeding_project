@@ -111,14 +111,14 @@ export function useSubmit() {
   const [pending, start] = useTransition();
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
-  const run = (fn: () => Promise<{ ok: true; data?: unknown } | { ok: false; error: string }>, okText = 'Đã lưu') => {
+  const run = <T,>(fn: () => Promise<{ ok: true; data?: T } | { ok: false; error: string }>, okText: string | ((data: T | undefined) => string) = 'Đã lưu') => {
     setError(null);
     setDone(null);
     start(async () => {
       const r = await fn();
       if (!r.ok) setError(r.error);
       else {
-        setDone(okText);
+        setDone(typeof okText === 'function' ? okText(r.data) : okText);
         router.refresh();
       }
     });

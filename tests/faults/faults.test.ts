@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Q } from '@seedingsys/contracts';
 import { setControl } from '@seedingsys/db';
-import { handlePublish } from '../../apps/worker-browser/src';
+import { handlePublish, handleReconcile } from '../../apps/worker-browser/src';
 import { dispatchDueSlots, ensureSlots } from '../../apps/worker-core/src';
 import { createHarness, cycle, MIN, pubsOf, type Harness } from '../helpers/harness';
 
@@ -119,6 +119,92 @@ describe('fault injection (spec §12, plan phase 6)', () => {
     await h.drain();
     expect((await pubsOf(h, 'B1'))[0].status).toBe('PUBLISHED_VERIFIED');
     expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+  });
+
+  it('recovers a lost reconcile lease without posting again', async () => {
+    await readyPostForB1();
+    h.platform.inject({ stage: 'verify', action: { kind: 'verifyNotFound' }, match: 'fb-B1' });
+    h.setTime(TEN);
+    await cycle(h);
+    const [p] = await pubsOf(h, 'B1');
+    expect(p.status).toBe('UNKNOWN');
+    let resume!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    h.platform.inject({ stage: 'verify', action: { kind: 'gate', wait: gate, onEnter: entered }, match: 'fb-B1' });
+    const running = handleReconcile(h.browser, { publicationId: p.id });
+    try {
+      await started;
+      await waitForStatus(p.id, ['RECONCILING']);
+      h.advance(4 * MIN);
+      expect((await h.tick()).leases.unknown).toBe(1);
+      await h.drain();
+    } finally {
+      resume();
+      expect(await running).toBe('FENCED');
+    }
+    const [settled] = await pubsOf(h, 'B1');
+    expect(settled.status).toBe('PUBLISHED_VERIFIED');
+    expect(settled.attempts.filter(attempt => attempt.outcome === 'RUNNING')).toHaveLength(0);
+    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+    expect(h.failures).toEqual([]);
+  });
+
+  it('hands over reconciliation when the saved profile has switched identity', async () => {
+    await readyPostForB1();
+    h.platform.inject({ stage: 'verify', action: { kind: 'verifyNotFound' }, match: 'fb-B1' });
+    h.setTime(TEN);
+    await cycle(h);
+    h.platform.setLoggedInAs('fb-B1', 'fb-someone-else');
+    h.advance(3 * MIN);
+    await h.drain();
+    const [p] = await pubsOf(h, 'B1');
+    expect(p.status).toBe('NEEDS_OPERATOR');
+    expect(p.lastReason).toBe('WRONG_IDENTITY');
+    expect(await h.db.operatorTask.count({ where: { kind: 'CONFIRM_RESULT', publicationId: p.id, status: 'OPEN' } })).toBe(1);
+    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+  });
+
+  it('keeps the slot open for a pre-commit retry', async () => {
+    await readyPostForB1();
+    h.platform.inject({ stage: 'preview', action: { kind: 'throw', errorKind: 'TRANSIENT' }, match: 'fb-B1' });
+    h.setTime(TEN);
+    await cycle(h);
+    expect((await pubsOf(h, 'B1'))[0].status).toBe('QUEUED');
+    const slot = { where: { targetId: h.ids.targets.B1 } };
+    expect((await h.db.publicationSlot.findFirstOrThrow(slot)).status).toBe('STARTED');
+    h.advance(MIN);
+    await cycle(h);
+    expect((await pubsOf(h, 'B1'))[0].status).toBe('PUBLISHED_VERIFIED');
+    expect((await h.db.publicationSlot.findFirstOrThrow(slot)).status).toBe('DONE');
+    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+  });
+
+  it.each([
+    ['a source kill switch enabled during preparation', 'KILL_SWITCH_SOURCE', async () => {
+      await setControl(h.db, 'SOURCE', h.ids.sources.A1, true, 'test', 'paused mid-draft');
+    }],
+    ['a certification removed during preparation', 'FORMAT_NOT_CERTIFIED', async () => {
+      await h.db.capabilityCheck.deleteMany({ where: { targetId: h.ids.targets.B1, contentType: 'TEXT' } });
+    }],
+  ])('stops before commit for %s', async (_label, reason, change) => {
+    await readyPostForB1();
+    let resume!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    h.platform.inject({ stage: 'prepare', action: { kind: 'gate', wait: gate, onEnter: entered }, match: 'fb-B1' });
+    const { running } = await startPublishInBackground();
+    try {
+      await preparing;
+      await change();
+    } finally {
+      resume();
+    }
+    expect(await running).toBe('CANCELLED');
+    expect((await pubsOf(h, 'B1'))[0].lastReason).toBe(reason);
+    expect(h.platform.timeline('fb-B1')).toHaveLength(0);
   });
 
   it('UI said "posted" but nothing exists → stays UNKNOWN until conclusive, then republished once', async () => {

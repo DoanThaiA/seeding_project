@@ -23,6 +23,10 @@
     "dev:web": "pnpm --filter @seedingsys/web dev",
     "build:web": "pnpm --filter @seedingsys/web build",
     "start:web": "pnpm --filter @seedingsys/web start",
+    "server:start": "node scripts/server.mjs start",
+    "server:stop": "node scripts/server.mjs stop",
+    "server:status": "node scripts/server.mjs status",
+    "move": "node scripts/move-machine.mjs",
     "fb:login": "tsx --env-file=.env scripts/fb-login.ts",
     "fb:capability": "tsx --env-file=.env scripts/fb-capability.ts",
     "check:storage": "tsx --env-file=.env scripts/check-storage.ts"

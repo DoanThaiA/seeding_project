@@ -12,6 +12,11 @@ export interface MockPost {
   caption: string;
   media: number;
   video: boolean;
+  photoId?: string;
+  omitPhotoAttachment?: boolean;
+  photoReceiptAfterReload?: boolean;
+  storyAlias?: string;
+  albumPhotos?: string[];
   reel?: boolean;
   audience: string;
   at: number;
@@ -36,8 +41,15 @@ export class MockFb {
   reelViaMenu = false;
   /** Real UI: comment links point at a pfbid form of the post id (and carry tracking params). */
   pfbidCommentLinks = false;
+  /** Real UI: a reply renders inside its parent's comment card, Reply button included. */
+  nestedReplies = false;
+  /** Real UI: comment links on a photo point at the photo's story by a pfbid id. */
+  pfbidPhotoStory = false;
+  /** Real UI: comment links use a pfbid absent from the page data; an encoded profile link names the numeric post. */
+  rotatingPfbid = false;
+  commentReceiptMode: 'normal' | 'profile-link' | 'related-post' | 'wrong-author' | 'wrong-text' = 'normal';
   posts: MockPost[] = [];
-  comments: Array<{ postId: string; id: string; parentId?: string; text: string }> = [];
+  comments: Array<{ postId: string; id: string; parentId?: string; rootId?: string; text: string }> = [];
   private n = 0;
   private server!: Server;
   baseUrl = '';
@@ -94,23 +106,40 @@ export class MockFb {
     }
     if (url.pathname === '/') return send(200, this.home());
     if (url.pathname === '/reels/create') return send(200, this.home(true));
-    const post = this.posts.find(p => url.pathname === (p.reel ? '/reel/' : '/posts/') + p.id);
+    const photoViewer = url.pathname === '/photo' || url.pathname === '/photo/';
+    const post = this.posts.find(p => url.pathname === (p.reel ? '/reel/' : '/posts/') + p.id ||
+      (photoViewer && p.photoId && url.searchParams.get('fbid') === p.photoId) ||
+      (url.pathname === '/permalink.php' && [p.id, p.storyAlias, 'pfbid0Story' + p.id].includes(url.searchParams.get('story_fbid') ?? '')));
     if (post && req.method === 'POST') {
       let raw = '';
       for await (const chunk of req) raw += chunk;
       const { text, parentId } = JSON.parse(raw);
-      const comment = { postId: post.id, id: 'c' + (this.comments.length + 1), text, parentId };
+      const parent = this.comments.find(comment => comment.postId === post.id && comment.id === parentId);
+      const comment = { postId: post.id, id: 'c' + (this.comments.length + 1), text, parentId, rootId: parent?.rootId ?? parent?.id };
       this.comments.push(comment);
       return send(200, JSON.stringify(comment), 'application/json');
     }
-    if (post) return send(200, this.postPage(post));
+    if (post) return send(200, this.postPage(post, photoViewer, !!post.storyAlias && url.searchParams.get('story_fbid') === post.storyAlias));
     return send(200, this.timeline()); // /profile.php?id=… and /<vanity>
   }
 
-  private postPage(post: MockPost) {
+  private postPage(post: MockPost, photoViewer: boolean, alternateStory: boolean) {
     const items = this.comments.filter(c => c.postId === post.id);
+    const alternatePath = `/tester/posts/pfbid0Zz${post.id}`;
+    const story = photoViewer && this.pfbidPhotoStory ? 'pfbid0Story' + post.id : post.storyAlias ?? post.id;
+    const commentPath = photoViewer || post.storyAlias ? JSON.stringify(`/permalink.php?story_fbid=${story}&id=${this.userId}`)
+      : this.commentReceiptMode === 'related-post' ? JSON.stringify('/other/posts/pfbidWRONG')
+      : this.rotatingPfbid ? JSON.stringify(`/permalink.php?story_fbid=pfbid0Rot${post.id}&id=${this.userId}`)
+      : this.pfbidCommentLinks ? JSON.stringify(alternatePath) : 'location.pathname';
+    const authorPath = this.commentReceiptMode === 'wrong-author' ? '/profile.php?id=999' : this.vanity ? `/${this.vanity}` : `/profile.php?id=${this.userId}`;
     return `<main><p>${esc(post.caption)}</p>${post.video ? '<video style="width:120px;height:160px"></video>' : ''}
+      ${!photoViewer && post.photoId && !post.omitPhotoAttachment ? `<a href="/photo/?fbid=${post.photoId}">Ảnh của bài viết</a>` : ''}
+      ${post.albumPhotos?.map(id => `<a href="/photo/?fbid=${id}&amp;set=pcb.${post.id}">Ảnh album</a>`).join('') ?? ''}
+      ${post.albumPhotos ? `<a href="/photo/?fbid=${alternateStory ? '991' : '992'}">Ảnh đề xuất</a>` : ''}
       <section id="comments"></section><textarea aria-label="Viết bình luận"></textarea>
+      ${this.pfbidCommentLinks ? `<script type="application/json">${JSON.stringify({ result: { data: { node_v2: {
+        id: post.id, permalink_url: alternatePath, comet_sections: { content: { story: {} } },
+      } } } })}</script>` : ''}
       <script>
         const comments = document.querySelector('#comments');
         const editor = document.querySelector('textarea');
@@ -118,22 +147,40 @@ export class MockFb {
         function add(comment) {
           const article = document.createElement('article');
           const text = document.createElement('div');
-          text.textContent = comment.text;
+          text.setAttribute('data-comment-text', '');
+          text.textContent = comment.text${this.commentReceiptMode === 'wrong-text' ? " + ' sai'" : ''};
+          const author = document.createElement('a');
+          author.href = ${JSON.stringify(authorPath)};
+          author.textContent = 'Tác giả';
+          ${this.commentReceiptMode === 'profile-link' ? "author.setAttribute('role', 'link');" : "author.setAttribute('data-comment-author', '');"}
           const link = document.createElement('a');
-          link.href = ${this.pfbidCommentLinks ? `'/tester/posts/pfbid0Zz${post.id}'` : 'location.pathname'} + '?comment_id=' + (comment.parentId || comment.id) + (comment.parentId ? '&reply_comment_id=' + comment.id : '')${this.pfbidCommentLinks ? " + '&__cft__[0]=z'" : ''};
+          ${this.rotatingPfbid ? `const encoded = document.createElement('a');
+          encoded.href = '/profile.php?id=${this.userId}&comment_id=' + encodeURIComponent(btoa('comment:${post.id}_' + comment.id));
+          article.append(encoded);` : ''}
+          link.href = ${commentPath} + '${photoViewer || post.storyAlias || this.rotatingPfbid ? '&' : '?'}comment_id=' + (comment.rootId || comment.id) + (comment.parentId ? '&reply_comment_id=' + comment.id : '')${this.pfbidCommentLinks ? " + '&__cft__[0]=z'" : ''};
           link.textContent = 'Vừa xong';
           const reply = document.createElement('button');
           reply.textContent = 'Phản hồi';
           reply.onclick = () => { parentId = comment.id; editor.setAttribute('aria-label', 'Viết phản hồi'); editor.focus(); };
-          article.append(text, link, reply);
-          comments.append(article);
+          article.append(author, text, link, reply);
+          ${photoViewer && post.photoReceiptAfterReload ? `
+          text.textContent = comment.text.slice(0, 8);
+          const more = document.createElement('button');
+          more.textContent = 'Xem thêm';
+          more.onclick = () => { text.textContent = comment.text; more.remove(); };
+          article.append(more);` : ''}
+          article.dataset.mockComment = comment.id;
+          const host = ${this.nestedReplies} && comment.parentId && document.querySelector('[data-mock-comment="' + comment.parentId + '"]');
+          (host || comments).append(article);
         }
-        ${JSON.stringify(items).replace(/</g, '\\u003c')}.forEach(add);
+        const saved = ${JSON.stringify(items).replace(/</g, '\\u003c')};
+        ${photoViewer && post.photoReceiptAfterReload ? 'setTimeout(() => saved.forEach(add), 550);' : 'saved.forEach(add);'}
         editor.onkeydown = async e => {
-          if (e.key !== 'Enter') return;
+          if (e.key !== 'Enter' || e.shiftKey) return;
           e.preventDefault();
-          const response = await fetch(location.pathname, { method: 'POST', body: JSON.stringify({ text: editor.value, parentId }) });
-          add(await response.json());
+          const response = await fetch(location.pathname + location.search, { method: 'POST', body: JSON.stringify({ text: editor.value, parentId }) });
+          const comment = await response.json();
+          ${photoViewer && post.photoReceiptAfterReload ? '' : 'add(comment);'}
           editor.value = '';
         };
       </script></main>`;

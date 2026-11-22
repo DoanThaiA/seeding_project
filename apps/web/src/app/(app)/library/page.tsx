@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { ApiError, apiGet, can, getSession } from '@/lib/api';
 import { ActionButton, AutoRefresh } from '@/components/client';
 import { Badge } from '@/components/ui';
-import { fmtTime } from '@/lib/format';
+import { fmtTime, reasonText } from '@/lib/format';
 import { PostWorkspace } from './PostWorkspace';
 import { ProfileSyncPanel } from './ProfileSyncPanel';
 import type { Listing, PostDetail, Profiles, ProfileSyncOption } from './types';
@@ -62,7 +62,11 @@ export default async function LibraryPage({ searchParams }: { searchParams: Prom
             <Link href={href({ profile: profile.code })} aria-current={!trash ? 'page' : undefined}>Bài trong kho</Link>
             <Link href={href({ profile: profile.code, trash: '1' })} aria-current={trash ? 'page' : undefined}>Thùng rác</Link>
           </div>}
-          {s && <p className="muted">{s.lastSuccessAt ? `Quét thành công ${fmtTime(s.lastSuccessAt)}` : 'Chưa có lượt quét thành công'}{s.lastError && <><br /><span className="err">{s.lastError}</span></>}</p>}
+          {s && <p className="muted">
+            {s.lastSuccessAt ? `Lưu kết quả quét ${fmtTime(s.lastSuccessAt)}` : 'Chưa có lượt quét thành công'}
+            {!!s.lastIncomplete?.length && <><br />{s.lastIncomplete.map(reasonText).join(' · ')}</>}
+            {s.lastError && <><br /><span className="err">{s.lastError}</span></>}
+          </p>}
           {listing.kind === 'target' && <p className="muted">Các bài do SeedingSys theo dõi cho {profile.code}.</p>}
           <form action="/library" className={styles.search}>
             <input type="hidden" name="profile" value={profile.code} />

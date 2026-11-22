@@ -10,8 +10,11 @@ async function main() {
   const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'] });
   app.setGlobalPrefix('api', { exclude: ['health'] });
   app.enableShutdownHooks();
-  await app.listen(cfg.API_PORT);
-  console.log(`api listening on :${cfg.API_PORT}`);
+  // API_HOST=127.0.0.1 keeps the API off the LAN on a single-machine install (scripts/server.mjs sets it).
+  const host = process.env.API_HOST;
+  if (host) await app.listen(cfg.API_PORT, host);
+  else await app.listen(cfg.API_PORT);
+  console.log(`api listening on ${host ?? ''}:${cfg.API_PORT}`);
 }
 
 main().catch((e) => {

@@ -6,7 +6,7 @@ export function fbTargetProfilePath(root: string, target: Pick<TargetRef, 'code'
   const name = basename((target.profileDir ?? target.code).replace(/\\/g, '/')).replace(/[^\w.-]/g, '_');
   return join(root, name || target.code);
 }
-import type { ContentType } from '@seedingsys/contracts';
+import { FB_WEB_PUBLISH_FORMATS, type ContentType } from '@seedingsys/contracts';
 
 export interface FbWebOptions {
   /** https://www.facebook.com in production; a local mock in tests. */
@@ -18,8 +18,7 @@ export interface FbWebOptions {
   channel?: string;
   executablePath?: string;
   /**
-   * Formats this deployment is allowed to publish. EMPTY BY DEFAULT (fail closed): a format is
-   * enabled only after its capability test has passed on the real UI.
+   * Formats this deployment is allowed to publish. An empty value disables all formats.
    */
   enabledFormats: ContentType[];
   /** Wait for any single UI element. */
@@ -40,8 +39,7 @@ export interface FbWebOptions {
   verifyMode?: 'caption' | 'strict' | 'off';
 }
 
-/** A flow still needs a passed capability check before it can receive live jobs. */
-export const IMPLEMENTED_FORMATS: ContentType[] = ['TEXT', 'QUOTE_IMAGE', 'SINGLE_PHOTO', 'MULTI_PHOTO', 'VIDEO', 'REEL'];
+export const IMPLEMENTED_FORMATS: ContentType[] = [...FB_WEB_PUBLISH_FORMATS];
 
 export function fbWebOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): FbWebOptions {
   const formats = (env.FB_ENABLED_FORMATS ?? '')

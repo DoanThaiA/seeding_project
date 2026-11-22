@@ -26,7 +26,7 @@ export interface MappingT {
 }
 
 export interface Capabilities {
-  checks: Array<{ id: string; contentType: string; connector: string; connectorVersion: string; passed: boolean; cases: number; failures: number; notes: string | null; checkedAt: string; target: { code: string } }>;
+  checks: Array<{ id: string; contentType: string; connector: string; connectorVersion: string; passed: boolean; qualified: boolean; cases: number; failures: number; notes: string | null; checkedAt: string; target: { code: string } }>;
   releases: Array<{ connector: string; version: string; active: boolean }>;
 }
 
@@ -162,8 +162,9 @@ export function TargetForm({ target, capabilities }: { target?: TargetT; capabil
   const [style, setStyle] = useState(savedStyle);
   const sub = useSubmit();
   const real = form.connector === 'fb-web';
-  const formats = target ? capabilities.checks.filter(check => check.target.code === target.code && check.passed
-    && check.connector === target.connector && capabilities.releases.some(r => r.active && r.connector === check.connector && r.version === check.connectorVersion)) : [];
+  const release = capabilities.releases.find(r => r.active && r.connector === target?.connector);
+  const formats = target && release ? capabilities.checks.filter(check => check.target.code === target.code && check.qualified
+    && check.connector === target.connector && release.version === check.connectorVersion) : [];
   const dirty = JSON.stringify(form) !== JSON.stringify(targetDraft(target)) || style !== savedStyle;
   return (
     <Panel title={target ? 'Đích ' + target.code : 'Thêm tài khoản đích'}
@@ -205,7 +206,7 @@ export function TargetForm({ target, capabilities }: { target?: TargetT; capabil
       </form>
       {target?.connector === 'fb-web' && <div className={styles.scanStatus}>
         <p>{target.profile ? 'Đã gắn hồ sơ trình duyệt.' : 'Cần gắn hồ sơ trình duyệt trên máy worker.'}</p>
-        <p>{formats.length ? formats.length + ' định dạng đã đạt chứng nhận với phiên bản hiện hành.' : 'Cần chứng nhận định dạng trước khi lên lịch đăng Facebook.'}</p>
+        <p>{formats.length ? formats.length + ' định dạng đã đạt kiểm thử với phiên bản hiện hành.' : 'Định dạng đăng theo cấu hình worker. Kiểm thử là tùy chọn.'}</p>
       </div>}
     </Panel>
   );

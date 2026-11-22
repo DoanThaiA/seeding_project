@@ -14,11 +14,34 @@ import {
 } from '@seedingsys/connectors-core';
 import type { PublishSnapshot } from '@seedingsys/contracts';
 import { facebookPostId } from '@seedingsys/domain';
+import { confirmedCommentPostIds } from './comments';
 import type { FbWebOptions } from './config';
 import { AUDIENCE_LABEL, CHECKPOINT_TEXT, PROCESSING_TEXT, URLS, sel } from './selectors';
 import { parseViTime } from './vi-time';
 
 const norm = (s: string) => s.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
+const normalizedComment = (text: string) => text.normalize('NFC').replace(/\s+/g, ' ').trim();
+const storyCard = 'article,[role="article"],[data-pagelet^="FeedUnit"],[data-post]';
+const commentCard = 'article,[role="article"],[data-comment-id],[data-commentid],[aria-label^="Bình luận dưới "],[aria-label^="Phản hồi bình luận "],[aria-label^="Comment by "],[aria-label^="Reply by "]';
+const commentAncestor = 'xpath=ancestor::*[self::article or @role="article" or @data-comment-id or @data-commentid or starts-with(@aria-label, "Bình luận dưới ") or starts-with(@aria-label, "Phản hồi bình luận ") or starts-with(@aria-label, "Comment by ") or starts-with(@aria-label, "Reply by ")][1]';
+
+function commentKey(value: string | null) {
+  if (!value || /^\d+$/.test(value)) return value;
+  return /^comment:\d+_(\d+)$/.exec(Buffer.from(value, 'base64url').toString('utf8'))?.[1] ?? value;
+}
+
+/** base64 "comment:<post>_<comment>" → its two ids; null for any other form. */
+function encodedComment(value: string | null) {
+  if (!value || /^\d+$/.test(value)) return null;
+  const match = /^comment:([A-Za-z0-9]+)_([A-Za-z0-9]+)$/.exec(Buffer.from(value, 'base64url').toString('utf8'));
+  return match ? { post: match[1], comment: match[2] } : null;
+}
+
+function profileIdentity(url: URL) {
+  const path = url.pathname.replace(/\/$/, '');
+  if (path === '/profile.php') return url.searchParams.get('id');
+  return path.match(/^\/people\/[^/]+\/(\d+)$/)?.[1] ?? path.match(/^\/([\w.]+)$/)?.[1];
+}
 /** Facebook truncates long captions on the timeline ("Xem thêm"): compare a prefix. */
 interface LinkInfo {
   href: string;
@@ -54,6 +77,7 @@ export class FbWebSession implements PublishSession {
   private shotN = 0;
   private verifyDumped = false;
   private lastCaption: string | null = null;
+  private checkedIdentity: string | null = null;
 
   constructor(
     private readonly ctx: BrowserContext,
@@ -172,35 +196,111 @@ export class FbWebSession implements PublishSession {
    * `expectedExternalId` may be the numeric id or the vanity name; we accept either form.
    */
   async checkIdentity(expectedExternalId: string) {
+    this.checkedIdentity = null;
     await this.step('open-me', () => this.go('/me'));
     const state = await this.classify();
     if (state !== 'OK') return { ok: false, observed: state.toLowerCase() };
-    const u = new URL(this.page.url());
-    const observed = u.pathname.startsWith('/profile.php') ? (u.searchParams.get('id') ?? '') : (u.pathname.split('/').filter(Boolean)[0] ?? '');
-    return { ok: observed !== '' && observed.toLowerCase() === expectedExternalId.toLowerCase(), observed };
+    const url = new URL(this.page.url());
+    const observed = profileIdentity(url) ?? '';
+    const ok = url.origin === new URL(this.opts.baseUrl).origin && observed !== '' && observed.toLowerCase() === expectedExternalId.toLowerCase();
+    if (ok) this.checkedIdentity = observed.toLowerCase();
+    return { ok, observed };
   }
 
   async postComment({ post, parentId, text }: { post: URL; parentId?: string; text: string }, beforeSubmit: () => Promise<void>) {
     const postId = facebookPostId(post);
     if (!postId || (parentId && !/^[A-Za-z0-9_:-]{1,150}$/.test(parentId))) throw new ConnectorError('PERMANENT', 'Liên kết bài hoặc bình luận cha không hợp lệ.');
+    if (!this.checkedIdentity) throw new ConnectorError('WRONG_IDENTITY', 'Cần xác nhận tài khoản Facebook trước khi gửi bình luận.');
     const page = this.page;
     await this.go(post.pathname + post.search);
     const current = new URL(page.url());
     if (current.origin !== new URL(this.opts.baseUrl).origin || facebookPostId(current) !== postId || await this.classify() !== 'OK') {
       throw new ConnectorError('UI_UNEXPECTED', 'Không mở được đúng bài đích bằng hồ sơ đã chọn.');
     }
-    const links = page.locator('a[href*="comment_id="]');
+    const postIds = new Set(await confirmedCommentPostIds(page, postId));
+    const rootId = commentKey(post.searchParams.get('comment_id'));
+    const parentKey = commentKey(parentId ?? null);
+    const belongsToPost = (url: URL) => url.origin === current.origin && postIds.has(facebookPostId(url) ?? '');
+    const isPhoto = /^\/photo(?:\.php)?\/?$/.test(post.pathname) && /^\d+$/.test(postId);
+    const photos = (tab: Page) => tab.locator('a[href*="/photo"][href*="fbid="]:visible').evaluateAll(nodes => nodes.flatMap(node => {
+        const link = new URL((node as HTMLAnchorElement).href);
+        const id = link.searchParams.get('fbid');
+        return link.origin === location.origin && /^\/photo(?:\.php)?\/?$/.test(link.pathname) && id && /^\d+$/.test(id)
+          ? [{ id, group: link.searchParams.get('set') }] : [];
+    }));
+    const photoIds = (items: Awaited<ReturnType<typeof photos>>, group?: string) =>
+      [...new Set(items.filter(image => !group || image.group === 'pcb.' + group).map(image => image.id))];
+    const albumImages = post.pathname === '/permalink.php' && /^\d+$/.test(post.searchParams.get('id') ?? '') ? await photos(page) : [];
+    const albumPhotos = photoIds(albumImages);
+    const sameAlbum = (expected: string[], observed: string[]) => expected.length >= 2 &&
+      expected.length === observed.length && expected.every(id => observed.includes(id));
+    // Comment links on a photo point at the photo's story, by numeric or pfbid id, under the post owner's id
+    // (not the commenter's). The story is only accepted after it is opened and shows the same photo(s).
+    const possiblePhotoStory = (url: URL) => (isPhoto || albumPhotos.length >= 2) && url.origin === current.origin && url.pathname === '/permalink.php' &&
+      /^\d+$/.test(url.searchParams.get('id') ?? '') && /^(?:\d+|pfbid[A-Za-z0-9]+)$/.test(url.searchParams.get('story_fbid') ?? '');
+    const confirmReceiptPost = async (url: URL) => {
+      if (belongsToPost(url)) return true;
+      if (!possiblePhotoStory(url)) return false;
+      const storyId = facebookPostId(url)!;
+      const story = new URL('/permalink.php', current.origin);
+      story.searchParams.set('story_fbid', storyId);
+      story.searchParams.set('id', url.searchParams.get('id')!);
+      const tab = await page.context().newPage();
+      try {
+        const response = await tab.goto(story.href, { waitUntil: 'domcontentloaded', timeout: Math.min(8000, this.opts.stepTimeoutMs) });
+        const opened = new URL(tab.url());
+        if (!response?.ok() || opened.origin !== current.origin || facebookPostId(opened) !== storyId) return false;
+        // A pfbid story opens as a dialog over the feed; its photo link renders a few seconds later.
+        const readyAt = Date.now() + Math.min(8000, this.opts.stepTimeoutMs);
+        let attached = false;
+        do {
+          const observed = await photos(tab);
+          attached = isPhoto ? photoIds(observed).includes(postId) : sameAlbum(albumPhotos, photoIds(observed)) ||
+            [postId, storyId].some(group => sameAlbum(photoIds(albumImages, group), photoIds(observed, group)));
+          if (!attached) await tab.waitForTimeout(250);
+        } while (!attached && Date.now() < readyAt);
+        if (attached) postIds.add(storyId);
+        return attached;
+      } catch {
+        return false;
+      } finally {
+        await tab.close();
+      }
+    };
+    const links = page.locator('a[href*="comment_id="]:visible');
+    /**
+     * Comment cards also carry a link whose comment_id is base64 "comment:<post>_<comment>". It names the numeric
+     * post id, which does not rotate the way pfbid ids do. When a card's pfbid link and its encoded link name the
+     * same comment and the encoded post is this post, that pfbid is another id of this post.
+     */
+    const learnAliases = async () => {
+      const cards = await page.locator(commentCard).evaluateAll((nodes, selector) => nodes.map(card =>
+        Array.from(card.querySelectorAll('a[href*="comment_id="]')).filter(a => a.closest(selector) === card)
+          .map(a => a.getAttribute('href')!)), commentCard);
+      for (const hrefs of cards) {
+        const urls = hrefs.flatMap(href => { try { return [new URL(href, current)]; } catch { return []; } });
+        const owners = new Map<string, string>();
+        for (const url of urls) {
+          const pair = encodedComment(url.searchParams.get('comment_id'));
+          if (pair) owners.set(pair.comment, pair.post);
+        }
+        for (const url of urls) {
+          const story = facebookPostId(url);
+          if (!story || url.origin !== current.origin || postIds.has(story)) continue;
+          const ids = [commentKey(url.searchParams.get('reply_comment_id')), commentKey(url.searchParams.get('comment_id'))];
+          if (ids.some(id => id && postIds.has(owners.get(id) ?? ''))) postIds.add(story);
+        }
+      }
+    };
     const findReceipts = async () => {
-      const found: Array<{ externalId: string; permalink: string; raw: string }> = [];
-      for (const href of await links.evaluateAll(nodes => nodes.map(el => (el as HTMLAnchorElement).href))) {
-        const url = new URL(href);
-        // We are on the target post's own page. Facebook writes its comment links with a pfbid post id
-        // (which also changes between reads), so a numeric post id cannot be compared with them.
-        const linkPost = facebookPostId(url);
-        if (url.origin !== current.origin || (linkPost !== postId && !linkPost?.startsWith('pfbid'))) continue;
-        const root = url.searchParams.get('comment_id');
-        const reply = url.searchParams.get('reply_comment_id');
-        const externalId = parentId ? (root === parentId ? reply : null) : (reply ? null : root);
+      await learnAliases();
+      const found: Array<{ externalId: string; permalink: string; href: string }> = [];
+      for (const href of await links.evaluateAll(nodes => nodes.map(el => el.getAttribute('href')!))) {
+        const url = new URL(href, current);
+        if (!belongsToPost(url) && !possiblePhotoStory(url)) continue;
+        const root = commentKey(url.searchParams.get('comment_id'));
+        const reply = commentKey(url.searchParams.get('reply_comment_id'));
+        const externalId = parentId ? (root === rootId ? reply : null) : (reply ? null : root);
         if (!externalId || !/^[A-Za-z0-9_:-]{1,150}$/.test(externalId)) continue;
         // Store the link on the destination post's own URL so later checks compare like with like.
         const permalink = new URL(post.href);
@@ -208,50 +308,115 @@ export class FbWebSession implements PublishSession {
         permalink.searchParams.delete('reply_comment_id');
         permalink.searchParams.set('comment_id', root!);
         if (reply) permalink.searchParams.set('reply_comment_id', reply);
-        found.push({ externalId, permalink: permalink.href, raw: url.href });
+        found.push({ externalId, permalink: permalink.href, href });
       }
       return found;
     };
     const commentBox = page.getByRole('textbox', { name: /viết (bình luận|phản hồi|câu trả lời)|write (a )?(comment|reply)|bình luận dưới tên/i }).filter({ visible: true });
-    let editor = commentBox;
+    const rootBox = page.getByRole('textbox', { name: /viết bình luận|write (a )?comment|bình luận dưới tên/i }).filter({ visible: true });
+    let editor = rootBox;
     if (parentId) {
-      const hrefs = await links.evaluateAll(nodes => nodes.map(el => el.getAttribute('href')!));
-      const href = hrefs.find(value => {
-        const url = new URL(value, current);
-        const linkPost = facebookPostId(url);
-        return url.origin === current.origin && (linkPost === postId || !!linkPost?.startsWith('pfbid')) &&
-          (url.searchParams.get('reply_comment_id') ?? url.searchParams.get('comment_id')) === parentId;
-      });
-      if (!href) throw new ConnectorError('UI_UNEXPECTED', 'Không tìm thấy đúng bình luận cha.');
-      const parentLink = page.locator(`a[href=${JSON.stringify(href)}]:visible`);
-      const parent = parentLink.locator('xpath=ancestor::*[self::article or @role="article" or @data-comment-id][1]');
-      await parent.getByRole('button', { name: /^(Phản hồi|Trả lời|Reply)$/i }).click();
+      let parent: Locator | undefined;
+      let parentHrefs: string[] = [];
+      const parentDeadline = Date.now() + Math.min(9000, this.opts.stepTimeoutMs);
+      do {
+        await learnAliases();
+        const hrefs = new Set(await links.evaluateAll(nodes => nodes.map(el => el.getAttribute('href')!)));
+        parentHrefs = [];
+        for (const href of hrefs) {
+          const url = new URL(href, current);
+          if (commentKey(url.searchParams.get('comment_id')) !== rootId ||
+            (commentKey(url.searchParams.get('reply_comment_id')) ?? rootId) !== parentKey || !await confirmReceiptPost(url)) continue;
+          const card = page.locator(`a[href=${JSON.stringify(href)}]:visible`).locator(commentAncestor);
+          parent = parent ? parent.or(card) : card;
+          parentHrefs.push(href);
+        }
+        if (parent && await parent.count() === 1) break;
+        parent = undefined;
+        await page.waitForTimeout(300);
+      } while (Date.now() < parentDeadline);
+      if (!parent) throw new ConnectorError('UI_UNEXPECTED', 'Không tìm thấy đúng bình luận cha.');
+      // Replies can render inside the parent's card, each with its own Reply button: take the parent's.
+      const replies = parent.getByRole('button', { name: /^(Phản hồi|Trả lời|Reply)$/i }).filter({ visible: true });
+      const owned = await replies.evaluateAll((buttons, { selector, hrefs }) => buttons.map(button => {
+        const card = button.closest(selector);
+        return !!card && Array.from(card.querySelectorAll('a[href]')).some(a => a.closest(selector) === card && hrefs.includes(a.getAttribute('href')!));
+      }), { selector: commentCard, hrefs: parentHrefs });
+      const own = owned.indexOf(true);
+      if (own < 0 || owned.lastIndexOf(true) !== own) throw new ConnectorError('UI_UNEXPECTED', 'Không tìm thấy nút phản hồi của bình luận cha.');
+      await replies.nth(own).click();
       editor = commentBox.and(page.locator(':focus'));
-    } else if (!await commentBox.first().waitFor({ state: 'visible', timeout: 10_000 }).then(() => true, () => false)) {
+    } else if (!await rootBox.first().waitFor({ state: 'visible', timeout: 10_000 }).then(() => true, () => false)) {
       // The comment box renders a moment after the page; only then fall back to the "Bình luận" button.
       // Reels label it with the count ("Bình luận, 1 bình luận") and also render the next reel's
       // button further down the page: the first one belongs to the reel that is open.
-      await page.getByRole('button', { name: /^(?:Bình luận|Comment)(?:, [\d.,]+[KkMTr]* (?:bình luận|comments?))?$/i }).first().click();
-      await commentBox.first().waitFor({ state: 'visible', timeout: 10_000 });
+      await page.getByRole('button', { name: /^(?:Bình luận|Comment)(?:, [\d.,]+[KkMTr]* (?:bình luận|comments?))?$/i }).filter({ visible: true }).click();
+      await rootBox.waitFor({ state: 'visible', timeout: 10_000 });
     }
     const existing = new Set((await findReceipts()).map(c => c.externalId));
-    await editor.fill(text);
-    const focused = commentBox.and(page.locator(':focus'));
+    if (text.includes('\n')) {
+      // Enter sends the comment: write line by line with Shift+Enter, as the post composer does.
+      // Select-all + Delete also clears the "@Tên" mention Facebook pre-fills in a reply box.
+      await editor.click();
+      await page.keyboard.press('ControlOrMeta+A');
+      await page.keyboard.press('Delete');
+      const lines = text.split('\n');
+      for (const [i, line] of lines.entries()) {
+        if (line) await page.keyboard.insertText(line);
+        if (i < lines.length - 1) await page.keyboard.press('Shift+Enter');
+      }
+    } else {
+      await editor.fill(text);
+    }
+    const focused = await editor.and(page.locator(':focus')).elementHandle();
     const written = await focused.evaluate(el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement ? el.value : (el as HTMLElement).innerText);
-    if (norm(written) !== norm(text)) throw new ConnectorError('UI_UNEXPECTED', 'Nội dung bình luận xem trước không khớp.');
+    const expectedText = normalizedComment(text);
+    if (normalizedComment(written) !== expectedText) throw new ConnectorError('UI_UNEXPECTED', 'Nội dung bình luận xem trước không khớp.');
+    const submitDeadline = Date.now() + 15_000;
     await beforeSubmit();
-    await focused.press('Enter');
-    const deadline = Date.now() + this.opts.stepTimeoutMs;
+    const submitTime = submitDeadline - Date.now();
+    if (submitTime <= 0) throw new ConnectorError('TRANSIENT', 'Lượt gửi bình luận đã hết hiệu lực.');
+    await focused.press('Enter', { timeout: submitTime });
+    const photoStory = isPhoto || albumPhotos.length >= 2;
+    // A photo receipt may need its story opened in another tab (up to 8 s) before it counts.
+    const deadline = Date.now() + this.opts.stepTimeoutMs + (photoStory ? 8000 : 0);
+    const readbackAt = photoStory ? Date.now() + Math.min(3500, this.opts.stepTimeoutMs / 2) : Infinity;
+    let refreshed = false;
     while (Date.now() < deadline) {
-      const added = new Map((await findReceipts()).filter(c => !existing.has(c.externalId)).map(c => [c.externalId, c]));
-      if (added.size > 1) return null;
-      for (const candidate of added.values()) {
-        const url = new URL(candidate.raw);
-        const receipt = page.locator(`a[href=${JSON.stringify(url.pathname + url.search)}],a[href=${JSON.stringify(candidate.raw)}]`)
-          .locator('xpath=ancestor::*[self::article or @role="article" or @data-comment-id][1]');
-        // Facebook may shorten the quoted source link, so the receipt is matched on the comment body.
-        const body = norm(text.split(/\n\s*\n/).pop() ?? text);
-        if (await receipt.count() === 1 && norm(await receipt.innerText()).includes(body)) return { externalId: candidate.externalId, permalink: candidate.permalink };
+      const matches = new Map<string, { externalId: string; permalink: string }>();
+      for (const candidate of (await findReceipts()).filter(c => !existing.has(c.externalId))) {
+        const receipt = page.locator(`a[href=${JSON.stringify(candidate.href)}]:visible`).locator(commentAncestor);
+        if (await receipt.count() !== 1) continue;
+        const expand = receipt.getByText(/^(?:Xem thêm|See more)$/i).filter({ visible: true });
+        if (await expand.count() === 1) await expand.first().click({ timeout: 1000 }).catch(() => undefined);
+        const details = await receipt.evaluate((card, selector) => {
+          const bodies = Array.from(card.querySelectorAll<HTMLElement>('[data-comment-text],[data-ad-preview="message"],[dir="auto"]'))
+            .filter(el => el.closest(selector) === card && el.getClientRects().length && !el.closest('a,button,[role="button"],h2,h3,h4,[role="heading"]'));
+          const text = bodies.filter(el => !bodies.some(other => other !== el && other.contains(el))).map(el => el.innerText.trim()).join('\n');
+          const namedAuthor = '[data-comment-author] a,a[data-comment-author],h2 a,h3 a,h4 a,[role="heading"] a';
+          const firstBody = bodies[0];
+          const authors = Array.from(card.querySelectorAll<HTMLAnchorElement>(`${namedAuthor},a[role="link"]`))
+            .filter(el => el.closest(selector) === card && el.getClientRects().length && (el.matches(namedAuthor) ||
+              (el.innerText.trim() && firstBody && (el.compareDocumentPosition(firstBody) & Node.DOCUMENT_POSITION_FOLLOWING))))
+            .map(el => el.href);
+          return { text, authors };
+        }, commentCard);
+        if (normalizedComment(details.text) !== expectedText || !details.authors.some(href => {
+          const url = new URL(href);
+          return url.origin === current.origin && profileIdentity(url)?.toLowerCase() === this.checkedIdentity;
+        })) continue;
+        if (await confirmReceiptPost(new URL(candidate.href, current))) {
+          matches.set(candidate.externalId, { externalId: candidate.externalId, permalink: candidate.permalink });
+        }
+      }
+      if (matches.size > 1) return null;
+      if (matches.size === 1) return matches.values().next().value ?? null;
+      if (!refreshed && Date.now() >= readbackAt && deadline - Date.now() > 2000) {
+        refreshed = true;
+        // A photo viewer can keep its optimistic comment card without the permanent story link.
+        const response = await page.reload({ waitUntil: 'domcontentloaded', timeout: deadline - Date.now() }).catch(() => null);
+        const opened = new URL(page.url());
+        if (!response?.ok() || opened.origin !== current.origin || facebookPostId(opened) !== postId) return null;
       }
       await page.waitForTimeout(500);
     }
@@ -492,6 +657,7 @@ export class FbWebSession implements PublishSession {
       const PREFIX = WANT.slice(0, 160);
       const probe = squash(PREFIX).slice(0, 10);
       const message = '[data-ad-preview="message"],[data-ad-comet-preview="message"],[data-ad-rendering-role="story_message"],[data-testid="post_message"]';
+      const story = ${JSON.stringify(storyCard)};
       const matches = (el) => {
         const text = norm(el.innerText);
         return text === WANT || (WANT.length > 160 && text.startsWith(PREFIX)
@@ -508,11 +674,13 @@ export class FbWebSession implements PublishSession {
           if (el.closest('[role=dialog],nav,[role=navigation],[role=banner],[contenteditable=true]')) continue;
           if (el.closest('[data-commentid],[data-comment-id],[role=article][aria-label^="Bình luận"],[role=article][aria-label^="Phản hồi"],[role=article][aria-label^="Comment by"],[role=article][aria-label^="Reply by"]')) continue;
           occ++;
+          const card = el.closest(story);
           let box = el;
           let timeA = null;
           for (let i = 0; i < 30 && box && box !== document.body; i++) {
             box = box.parentElement;
-            if (!box) break;
+            if (!box || box === document.body || (card && !card.contains(box))) break;
+            if (ownMessage && Array.from(box.querySelectorAll(message)).some(node => !ownMessage.contains(node) && !node.contains(ownMessage))) break;
             timeA = Array.from(box.querySelectorAll('a')).find((a) => isPost(a.getAttribute('href')) && short(a)
               && !a.closest(message) && !a.href.includes('comment_id=')) || null;
             if (timeA) break;
@@ -576,6 +744,7 @@ export class FbWebSession implements PublishSession {
       const PREFIX = WANT.slice(0, 160);
       const isPost = (h) => !!h && (h.indexOf('permalink.php') >= 0 || h.indexOf('/posts/') >= 0 || h.indexOf('/reel/') >= 0 || h.indexOf('story_fbid') >= 0 || h.indexOf('pfbid') >= 0);
       const message = '[data-ad-preview="message"],[data-ad-comet-preview="message"],[data-ad-rendering-role="story_message"],[data-testid="post_message"]';
+      const story = ${JSON.stringify(storyCard)};
       document.querySelectorAll('[data-sb-probe]').forEach((a) => a.removeAttribute('data-sb-probe'));
       const els = Array.from(document.querySelectorAll('div,span,p')).filter((el) => {
         const t = norm(el.innerText);
@@ -593,9 +762,12 @@ export class FbWebSession implements PublishSession {
         return (pending || (isPost(h) && t.length > 0)) && t.length <= 200 && !a.closest(message) && !(h || '').includes('comment_id=');
       };
       let box = shown[0];
+      const card = box.closest(story);
+      const ownMessage = box.closest(message);
       for (let i = 0; i < 30 && box && box !== document.body; i++) {
         box = box.parentElement;
-        if (!box) break;
+        if (!box || box === document.body || (card && !card.contains(box))) break;
+        if (ownMessage && Array.from(box.querySelectorAll(message)).some(node => !ownMessage.contains(node) && !node.contains(ownMessage))) break;
         const found = Array.from(box.querySelectorAll('a')).filter(candidate).slice(0, 6);
         if (found.length) {
           found.forEach((a, n) => a.setAttribute('data-sb-probe', String(n)));
@@ -630,17 +802,22 @@ export class FbWebSession implements PublishSession {
   async findPermalink(caption: string): Promise<string | null> {
     const scan = await this.scanProfile(caption, null, 12);
     if (scan.copies === 0) return null;
-    if (scan.hits.length === 1) return new URL(scan.hits[0].time.href, this.page.url()).href;
+    if (scan.hits.length === 1) return this.postPermalink(scan.hits[0].time.href)?.href ?? null;
     return scan.hits.length ? null : this.revealPermalink(caption);
   }
 
+  private postPermalink(value?: string): URL | null {
+    if (!value || !URL.canParse(value, this.opts.baseUrl)) return null;
+    const url = new URL(value, this.opts.baseUrl);
+    return url.origin === new URL(this.opts.baseUrl).origin && facebookPostId(url) ? url : null;
+  }
+
   async verify(hint: VerifyHint): Promise<VerifyResult> {
-    if (hint.contentType === 'REEL') return this.verifyReel(hint);
     const mode = this.opts.verifyMode ?? 'caption';
     if (mode === 'off') {
-      // Explicitly configured: no check. Recorded as unchecked in the attempt evidence.
-      return { kind: 'VERIFIED', permalink: hint.commitSignal?.permalink ?? `${this.opts.baseUrl}/me`, evidence: { mode: 'off', checked: false } };
+      return { kind: 'NOT_FOUND', conclusive: false, evidence: { mode, checked: false } };
     }
+    if (hint.contentType === 'REEL') return this.verifyReel(hint);
     if (!hint.caption) throw new ConnectorError('PERMANENT', 'fb-web verify needs the caption text');
     const from = hint.committedAt.getTime() - hint.windowMs;
     const to = hint.committedAt.getTime() + hint.windowMs;
@@ -657,14 +834,15 @@ export class FbWebSession implements PublishSession {
       }
       const processing = scan.hits.some((h) => PROCESSING_TEXT.test(h.text));
       if (processing) return { kind: 'PROCESSING', evidence };
-      let detected = scan.hits.length === 1 ? new URL(scan.hits[0].time.href, this.page.url()) : null;
-      if (!detected && !hint.commitSignal?.permalink) {
-        const revealed = await this.revealPermalink(hint.caption);
-        detected = revealed ? new URL(revealed) : null;
-        (evidence as Record<string, unknown>).revealed = !!revealed;
+      const hit = scan.hits[0];
+      const when = hit && this.dateOf(hit.time);
+      if (when && (+when.at + when.tolMs < from || +when.at - when.tolMs > to)) {
+        return { kind: 'NOT_FOUND', conclusive: false, evidence: { ...evidence, outsideWindow: true } };
       }
-      const permalink = detected?.origin === new URL(this.page.url()).origin ? detected.href : this.page.url();
-      return { kind: 'VERIFIED', permalink: hint.commitSignal?.permalink ?? permalink, evidence };
+      const permalink = this.postPermalink(hit?.time.href) ?? this.postPermalink(hint.commitSignal?.permalink)
+        ?? this.postPermalink(await this.revealPermalink(hint.caption) ?? undefined);
+      if (!permalink) return { kind: 'NOT_FOUND', conclusive: false, evidence: { ...evidence, missingPermalink: true } };
+      return { kind: 'VERIFIED', permalink: permalink.href, externalPostId: facebookPostId(permalink) ?? undefined, evidence };
     }
 
     const matches: Array<{ permalink: string; at: string; processing: boolean }> = [];
@@ -675,7 +853,8 @@ export class FbWebSession implements PublishSession {
       if (!inWindow) continue;
       const media = h.videos > 0 ? h.videos : h.imgs;
       if (media !== hint.mediaCount) continue;
-      matches.push({ permalink: new URL(h.time.href, this.opts.baseUrl).toString(), at: when.at.toISOString(), processing: PROCESSING_TEXT.test(h.text) });
+      const permalink = this.postPermalink(h.time.href);
+      if (permalink) matches.push({ permalink: permalink.href, at: when.at.toISOString(), processing: PROCESSING_TEXT.test(h.text) });
     }
 
     let unreadable = 0;
@@ -689,7 +868,7 @@ export class FbWebSession implements PublishSession {
     if (matches.length > 1) return { kind: 'AMBIGUOUS', matches: matches.length, evidence };
     if (matches.length === 1) {
       if (matches[0].processing) return { kind: 'PROCESSING', evidence };
-      return { kind: 'VERIFIED', permalink: matches[0].permalink, evidence };
+      return { kind: 'VERIFIED', permalink: matches[0].permalink, externalPostId: facebookPostId(new URL(matches[0].permalink)) ?? undefined, evidence };
     }
     // Absence is only conclusive if we scrolled past the commit time and could date every post link we saw.
     const conclusive = sawOlder && unreadable === 0 && scan.hits.length === 0;
@@ -709,8 +888,8 @@ export class FbWebSession implements PublishSession {
   }
 
   private reelId(value: string): string | undefined {
-    const url = new URL(value, this.opts.baseUrl);
-    if (url.origin === new URL(this.opts.baseUrl).origin) return /^\/reel\/([A-Za-z0-9_]+)\/?$/.exec(url.pathname)?.[1];
+    const url = this.postPermalink(value);
+    if (url) return /^\/reel\/([A-Za-z0-9_]+)\/?$/.exec(url.pathname)?.[1];
   }
 
   private async verifyReel(hint: VerifyHint): Promise<VerifyResult> {
@@ -720,6 +899,7 @@ export class FbWebSession implements PublishSession {
       const observed = await this.readReel(id, hint.caption);
       if (observed) return observed;
     }
+    if (!norm(hint.caption ?? '')) return { kind: 'NOT_FOUND', conclusive: false };
     const from = +hint.committedAt - hint.windowMs;
     const notices = await this.reelNotifications();
     const matches: VerifyResult[] = [];
@@ -730,8 +910,7 @@ export class FbWebSession implements PublishSession {
     }
     if (matches.length > 1) return { kind: 'AMBIGUOUS', matches: matches.length };
     if (matches.length === 1) return matches[0];
-    if (!hint.caption) return { kind: 'NOT_FOUND', conclusive: false };
-    const { hits } = await this.scanProfile(hint.caption, from);
+    const { hits } = await this.scanProfile(hint.caption ?? '', from);
     const timeline = hits.filter(hit => {
       const time = this.dateOf(hit.time);
       return this.reelId(hit.time.href) && time && +time.at + time.tolMs >= from && +time.at - time.tolMs <= +hint.committedAt + hint.windowMs;

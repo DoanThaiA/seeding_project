@@ -46,6 +46,7 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
         detailCaption: 'Video giới thiệu cửa hàng và quy trình cung cấp dịch vụ\n\nHẹn gặp lại các bạn vào cuối tuần.' },
       { id: 'pfbidPARTIAL', text: 'Facebook chỉ hiển thị một phần bộ ảnh công khai', photos: 1, more: 2 },
       { id: 'pfbidOTHER', text: 'Bài người khác đăng trên tường', author: 'Người khác' },
+      { id: 'pfbidSAMENAME', text: 'Bài của tài khoản khác có cùng tên hiển thị', author: mock.owner },
     ];
     await h.db.$transaction(t => ingestPost(t, {
       connector: 'fb-web', sourceId: h.ids.sources.A1, now: h.clock.now(), actor: 'fixture', baseline: true,
@@ -206,9 +207,21 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     expect(bytes.subarray(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
   }, 30_000);
 
+  it('reads a thread whose links use the post alias already verified in the archive', async () => {
+    mock.posts = [{ id: 'pfbidCURRENT', comments: true, commentPermalinkId: 'pfbidKNOWN', text: 'Bình luận trên bài đã đổi mã' }];
+    await cycle(h);
+    const post = await h.db.sourcePost.findFirstOrThrow({ where: { externalId: 'pfbidCURRENT' } });
+    await h.db.sourcePostAlias.create({ data: { sourceId: h.ids.sources.A1, sourcePostId: post.id, externalId: 'pfbidKNOWN' } });
+    const library = new LibraryController(h.db, h.clock);
+    await handleCommentScan(h.browser, await library.queueComments(post.id, { role: 'admin', actor: 'test-library' }));
+    const detail = await library.detail(post.id);
+    expect(detail.scan).toMatchObject({ status: 'COMPLETE', readCount: 2 });
+    expect(detail.comments.map(c => c.externalId)).toEqual(['101', '102']);
+  });
+
   it('shows posts by profile, archives a deduplicated comment tree, and requires a parent on the destination', async () => {
     mock.posts = [{
-      id: 'pfbidTHREAD', comments: true, structuredComments: true,
+      id: 'pfbidTHREAD', comments: true, structuredComments: true, commentDelayMs: 1800,
       text: 'Đây là caption gốc https://s.shopee.vn/an_redir?affiliate_id=17 https://example.org/tin',
     }];
     await cycle(h);
@@ -219,6 +232,11 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     expect(from.posts[0].snippet).toContain('https://example.org/tin');
     expect(from.posts[0].snippet).not.toContain('shopee');
     const post = from.posts[0].id;
+    // The link from the latest Facebook scan can use an alias of the original stored id.
+    await h.db.sourcePost.update({ where: { id: post }, data: { externalId: 'pfbidOLDTHREAD' } });
+    await h.db.sourcePostAlias.create({ data: {
+      sourceId: h.ids.sources.A1, sourcePostId: post, externalId: 'pfbidTHREAD',
+    } });
     const to = await library.posts('B1', '1', '');
     expect(to.posts.map(p => p.id)).toEqual([post]);
     const request = await library.queueComments(post, actor);

@@ -1,6 +1,6 @@
 # Triển khai SeedingSys
 
-> Connector đăng bài `fb-web` mặc định chỉ cho phép định dạng đã đạt capability test ở chế độ “Chỉ mình tôi”. Nguồn A có thể dùng `fb-public` để quét từ URL trang cá nhân hoặc fanpage xem được ở chế độ khách. [Hướng dẫn cấu hình Facebook](FB-WEB.md)
+> Connector đăng bài `fb-web` dùng các định dạng bật trong `FB_ENABLED_FORMATS`. Có thể chạy kiểm thử tùy chọn ở chế độ “Chỉ mình tôi”. Nguồn A có thể dùng `fb-public` để đọc trang cá nhân hoặc fanpage truy cập được ở chế độ khách. [Hướng dẫn cấu hình Facebook](FB-WEB.md)
 
 ## 1. Chọn cách chạy
 
@@ -36,6 +36,77 @@ node scripts/gen-secrets.mjs --print
 Dán các mã vừa in vào `API_TOKENS='{"<mã admin>":"admin","<mã duyệt>":"reviewer","<mã vận hành>":"operator"}'`, rồi chạy lại `pnpm dev:all`.
 
 Thêm bài thử: `pnpm fake post A1 "nội dung"`.
+
+### 2.1 Chạy thường trực trên máy Windows này (không Docker)
+
+`scripts/server.mjs` chạy Postgres local + api + 3 worker + web ở chế độ production. Tiến trình nào chết thì tự chạy lại (chờ 2 giây, tăng dần tới 60 giây). Log ghi theo ngày, giữ 14 ngày. Mỗi lần khởi động có một bản sao lưu DB. Máy có màn hình và IP mạng thường, nên `pnpm fb:login` và xử lý checkpoint vẫn làm tại chỗ như Cách A.
+
+Cài một lần:
+
+```powershell
+pnpm build:web                                                                  # build lại sau mỗi lần sửa code
+powershell -ExecutionPolicy Bypass -File scripts\windows\install-autostart.ps1  # tác vụ "SeedingSys" chạy ẩn mỗi lần đăng nhập Windows
+```
+
+Dùng hằng ngày:
+
+| Việc | Lệnh |
+|---|---|
+| Xem trạng thái | `pnpm server:status` |
+| Dừng | `pnpm server:stop` |
+| Chạy lại (ẩn) | `Start-ScheduledTask SeedingSys` |
+| Chạy có cửa sổ để xem log trực tiếp | `pnpm server:start` (Ctrl+C để dừng) |
+| Gỡ tự khởi động | `powershell -ExecutionPolicy Bypass -File scripts\windows\install-autostart.ps1 -Remove` |
+
+Không chạy `pnpm dev:all`/`pnpm db:local` cùng lúc với bản thường trực: hai bộ worker sẽ tranh cùng profile trình duyệt.
+
+- **Log:** `.data\logs\<dịch vụ>-YYYY-MM-DD.log` (`supervisor`, `api`, `worker-browser`, `web`, `postgres`, `migrate`...).
+- **Sao lưu DB:** mỗi lần khởi động, trước khi bật Postgres, thư mục `.data\pg` được chép nguyên vào `.data\pg-snapshots\` (giữ 7 bản). Nên đặt `SNAPSHOT_DIR` trong `.env` về ổ khác hoặc thư mục đồng bộ cloud. Khôi phục: `pnpm server:stop`, đổi tên `.data\pg`, chép một bản `pg-...` thành `.data\pg`, rồi `Start-ScheduledTask SeedingSys`.
+- **Cập nhật code:** `pnpm install` → `pnpm build:web` → `pnpm server:stop` → `Start-ScheduledTask SeedingSys` (migration tự chạy).
+- **Mạng:** web nghe ở cổng 3000 trên mọi card mạng. API chỉ nghe `127.0.0.1` (`API_HOST`), không lộ ra LAN. Cookie đăng nhập cho phép HTTP thường (`WEB_INSECURE_COOKIE=1`); nếu đặt HTTPS phía trước (ví dụ `tailscale serve`) thì đặt `WEB_INSECURE_COOKIE=0`.
+- Trên Windows, khi dừng hoặc chạy lại thì worker bị tắt ngay. Một lượt đăng đang dở có thể chuyển sang **Chờ đối chiếu**; xử lý như bình thường.
+
+Việc cần quyền admin hoặc cài đặt Windows (tự làm một lần):
+
+```powershell
+powercfg /change standby-timeout-ac 0      # không cho máy ngủ khi cắm điện
+powercfg /change hibernate-timeout-ac 0
+```
+
+- Cho máy khác trong LAN vào (PowerShell **Run as administrator**): `New-NetFirewallRule -DisplayName "SeedingSys web" -Direction Inbound -Protocol TCP -LocalPort 3000 -Profile Private -Action Allow`, rồi mở `http://<IP máy này>:3000`.
+- Truy cập từ ngoài: dùng Tailscale (cài trên máy này và máy người dùng) hoặc Cloudflare Tunnel. Không mở cổng trên router.
+- Settings → Windows Update → *Change active hours*: tránh để máy tự khởi động lại giữa giờ đăng. Sau khi khởi động lại, hệ thống chỉ chạy lên khi có người **đăng nhập** Windows.
+- Đổi mã đăng nhập mặc định trước khi cho người khác dùng (xem trên), rồi `pnpm server:stop` → `Start-ScheduledTask SeedingSys`.
+
+### 2.2 Chuyển sang máy Windows khác
+
+`scripts/move-machine.mjs` chuyển database (`.data\pg`) và `.env`, có checksum từng tệp. Ảnh và video ở R2 thì không cần chuyển. **Phiên Facebook không chuyển được:** Chrome mã hóa cookie theo tài khoản Windows, nên mọi tài khoản phải `pnpm fb:login` lại trên máy mới. Hai máy **không bao giờ** được chạy cùng lúc, nếu không sẽ đăng trùng bài.
+
+Chuẩn bị: commit và push code lên repo private. Máy mới clone đúng commit đó; script cảnh báo nếu còn tệp chưa commit.
+
+**Máy cũ** (chọn giờ ít lịch; slot quá hạn khi tắt máy sẽ bị bỏ, không chạy bù):
+
+```powershell
+# 1. Trang Công tắc dừng → bật "Toàn hệ thống". Xử lý các bài Chờ đối chiếu.
+pnpm move check                    # lặp lại tới khi báo "An toàn để dừng"
+pnpm server:stop
+pnpm move export E:\seedingsys-move
+```
+
+`export` chỉ chạy khi Postgres đã dừng. Sau khi đóng gói, nó đánh dấu máy cũ đã chuyển (`.data\MOVED.json`): `server:start` và `db:local` sẽ từ chối chạy, và tác vụ tự khởi động bị gỡ. Bỏ chuyển: `pnpm move reactivate`.
+
+**Máy mới** (Windows 64-bit, Node 20.19+, Chrome):
+
+```powershell
+git clone <repo> seeding_project; cd seeding_project
+corepack enable; pnpm install
+pnpm move import E:\seedingsys-move --worker-name may-khach-1
+pnpm build:web
+pnpm server:start                  # để mở cửa sổ; kiểm tra dashboard thấy đủ bài, lịch
+pnpm fb:login B1                   # lặp cho từng tài khoản fb-web, có chủ tài khoản bên cạnh để xử lý 2FA/checkpoint
+```
+
+Sau đó tắt dần công tắc dừng từng tài khoản. Ổn định thì Ctrl+C và cài tự khởi động (mục 2.1). `import` kiểm tra checksum, cùng nền tảng và cùng phiên bản `embedded-postgres` (thư mục Postgres chỉ chép được như vậy), và không ghi đè `.data\pg`/`.env` có sẵn trừ khi thêm `--force` (bản cũ được đổi tên, không xóa). Giữ thư mục `.data\pg` ở máy cũ vài tuần rồi mới xóa. Gói chứa `.env`, nên xóa gói sau khi máy mới chạy ổn.
 
 ## 3. Cách B — máy chủ thật
 
@@ -94,7 +165,7 @@ Mỗi người một mã riêng nếu có thể (thêm vào `API_TOKENS`). Mã �
 ## 6. Còn thiếu để đăng lên Facebook thật
 
 1. Giai đoạn 0 (người làm): quyền sử dụng nội dung, văn bản đồng ý của chủ B1–B5, cố định locale `vi-VN` và đối tượng xem, người phụ trách checkpoint.
-2. **Kiểm chứng selector trên giao diện thật và chạy capability test** (≥20 ca mỗi định dạng ở “Chỉ mình tôi”) — từng bước ở [FB-WEB.md](FB-WEB.md). Khi chưa có bản ghi đạt, bộ lập lịch **không giao việc** cho định dạng đó.
+2. **Kiểm tra phiên Facebook và bật định dạng cần đăng.** Có thể chạy capability test ở chế độ “Chỉ mình tôi” theo [hướng dẫn Facebook](FB-WEB.md).
 3. Build và kiểm tra image worker có Chromium trên máy worker thật.
 4. Chuyển mã video (FFmpeg), agent xử lý ngoại lệ UI, tiếp quản qua noVNC.
 5. Soak 7 ngày trước khi chuyển `APP_ENV=pilot-live` và đổi đối tượng xem sang thật.

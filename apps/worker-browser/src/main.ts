@@ -10,7 +10,7 @@ import { Q } from '@seedingsys/contracts';
 import { createDb } from '@seedingsys/db';
 import { RetryLaterError, systemClock } from '@seedingsys/domain';
 import { createLogger, initObservability } from '@seedingsys/observability';
-import { createBoss, work } from '@seedingsys/queue';
+import { createBoss, QUEUE_SETTINGS, work } from '@seedingsys/queue';
 import { createStore } from '@seedingsys/storage';
 import { DEFAULT_BROWSER_SETTINGS, handleAgentRecover, handlePublish, handleReconcile, handleSourcePoll, Semaphore, type BrowserCtx } from './index';
 import { handleCommentScan } from './handlers/comment-scan';
@@ -77,8 +77,10 @@ async function main() {
   await work(boss, Q.PublishStandard, cfg.PUBLISHER_CONCURRENCY, log, (p) => retryable(() => publishers.run(() => handlePublish(ctx, p))));
   await work(boss, Q.PublishAlbum, 1, log, (p) => retryable(() => publishers.run(() => handlePublish(ctx, p))));
   await work(boss, Q.PublishVideo, cfg.VIDEO_CONCURRENCY, log, (p) => retryable(() => video.run(() => publishers.run(() => handlePublish(ctx, p)))));
-  await work(boss, Q.PublishVerify, 1, log, (p) => retryable(() => publishers.run(() => handleReconcile(ctx, p))));
-  await work(boss, Q.PublishReconcile, 1, log, (p) => retryable(() => publishers.run(() => handleReconcile(ctx, p))));
+  for (const queue of [Q.PublishVerify, Q.PublishReconcile] as const) {
+    const retryLimit = QUEUE_SETTINGS[queue].retryLimit ?? 0;
+    await work(boss, queue, 1, log, (p, job) => retryable(() => publishers.run(() => handleReconcile(ctx, p, job.retryCount >= retryLimit))));
+  }
   await work(boss, Q.AgentRecover, 1, log, (p) => handleAgentRecover(ctx, p));
 
   const hb = setInterval(() => {

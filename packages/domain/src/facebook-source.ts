@@ -20,6 +20,27 @@ export function facebookPostId(url: URL) {
   return path.match(/\/(?:posts|videos|reel)\/([A-Za-z0-9_]+)$/)?.[1];
 }
 
+export function facebookPostLink(value: unknown) {
+  const url = facebookUrl(value);
+  if (!url || url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) return null;
+  const id = facebookPostId(url);
+  if (!id) return null;
+  for (const key of [...url.searchParams.keys()]) if (!['id', 'story_fbid', 'fbid', 'v'].includes(key)) url.searchParams.delete(key);
+  url.hash = '';
+  return { url, id };
+}
+
+/**
+ * Facebook writes a comment id either as digits or as base64 of "comment:<post>_<comment>"
+ * (links copied from notifications). Return the digits so ids from both forms compare equal.
+ */
+export function facebookCommentId(value: string | null | undefined): string | null {
+  if (!value || /^\d+$/.test(value)) return value || null;
+  try {
+    return /^comment:\d+_(\d+)$/.exec(atob(value.replace(/-/g, '+').replace(/_/g, '/')))?.[1] ?? value;
+  } catch { return value; }
+}
+
 /**
  * Text to post as a comment: only the comment itself. Drops the "của tác giả" / "Tác giả" badge line
  * that Facebook renders above the post author's own comments and the scanner picks up as text.
@@ -28,9 +49,12 @@ export function commentBody(text: string) {
   return text.replace(/^\s*(?:(?:bình luận )?của tác giả|tác giả|author)\s*(?:\r?\n|$)/i, '').trim();
 }
 
-export function commentQuotation(text: string, author?: string | null, source?: string | null) {
-  const credit = [author && `của ${author}`, source].filter(Boolean).join(' · ');
-  return `Trích bình luận gốc${credit ? ' ' + credit : ''}\n\n${text}`;
+/** Unwrap older generated copies when their body still matches the source comment. */
+export function commentReplayBody(text: string, sourceText: string) {
+  const body = commentBody(text);
+  const original = commentBody(sourceText);
+  const legacy = /^Trích bình luận gốc(?:(?: của | · )[^\r\n]+)?\r?\n[ \t]*\r?\n/.exec(body);
+  return legacy && commentBody(body.slice(legacy[0].length)) === original ? original : body;
 }
 
 /** Accept a personal profile or Page URL and discard tracking parameters. */
