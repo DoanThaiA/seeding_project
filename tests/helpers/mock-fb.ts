@@ -27,6 +27,8 @@ export interface MockPost {
   hiddenTime?: boolean;
   /** Like the real profile: obfuscated timestamp text, href="#" until the pointer reaches it. */
   lazyHref?: boolean;
+  /** Video post: the player is wrapped in a link to this path (e.g. /reel/123), like the real profile. */
+  videoHref?: string;
 }
 
 export class MockFb {
@@ -192,7 +194,8 @@ export class MockFb {
     const items = [...this.posts]
       .sort((a, b) => b.at - a.at)
       .map((p) => {
-        const media = p.video ? '<video src="data:video/mp4;base64,AAAA"></video>' : Array.from({ length: p.media }, (_, i) => `<a href="/photo?fbid=${p.id}_${i}"><img alt="" style="width:80px;height:80px" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></a>`).join('');
+        const player = '<video src="data:video/mp4;base64,AAAA"></video>';
+        const media = p.video ? (p.videoHref ? `<a href="${p.videoHref}?__cft__[0]=x">${player}</a>` : player) : Array.from({ length: p.media }, (_, i) => `<a href="/photo?fbid=${p.id}_${i}"><img alt="" style="width:80px;height:80px" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></a>`).join('');
         return `<div data-post="1"><h3>Tester</h3>${p.hiddenTime ? '<a href="#"></a>' : p.lazyHref ? `<a href="?__cft__[0]=x" onmouseover="this.setAttribute('href','/posts/${p.id}?__cft__[0]=x')">dSnoprteos</a>` : `<a href="/${p.reel ? 'reel' : 'posts'}/${p.id}">${this.rel(p)}</a>`}<div>${esc(p.caption)}</div>${p.processing ? '<div>Video đang được xử lý</div>' : ''}${media}</div>`;
       })
       .join('');

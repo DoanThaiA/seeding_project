@@ -460,7 +460,7 @@ describe.skipIf(!BROWSER)('verify modes (caption = default, off)', () => {
   let mock: MockFb;
   let dir: string;
   const target = { id: 't1', code: 'B1', externalId: '100012345', audience: 'ONLY_ME', uiLocale: 'vi-VN', profileDir: '/profiles/B1' };
-  const mk = (verifyMode: 'caption' | 'off') =>
+  const mk = (verifyMode: 'caption' | 'off', over: Partial<FbWebOptions> = {}) =>
     new FbWebPublishConnector({
       baseUrl: mock.baseUrl,
       profilesRoot: join(dir, 'profiles-' + verifyMode),
@@ -471,6 +471,7 @@ describe.skipIf(!BROWSER)('verify modes (caption = default, off)', () => {
       stepTimeoutMs: 6000,
       uploadTimeoutMs: 10_000,
       verifyMode,
+      ...over,
     });
   const hint = (caption: string, mediaCount = 0) => ({ captionFingerprint: captionFingerprint(caption), caption, mediaCount, committedAt: new Date(), windowMs: 30 * 60_000 });
   const verifyWith = async (c: FbWebPublishConnector, h: ReturnType<typeof hint>) => {
@@ -544,6 +545,38 @@ describe.skipIf(!BROWSER)('verify modes (caption = default, off)', () => {
     const result = await verifyWith(mk('caption'), hint('Bài mới chưa lộ đường dẫn'));
     expect(result).toMatchObject({ kind: 'NOT_FOUND', conclusive: false, evidence: { missingPermalink: true } });
   });
+
+  it('verifies a new video post through its player link when the timestamp never gets a link', async () => {
+    mock.addPost({ caption: 'Video cũ bên dưới', video: true, videoHref: '/reel/111', at: Date.now() - 4 * 3600_000 });
+    mock.addPost({ caption: 'Video mới đăng', video: true, hiddenTime: true, videoHref: '/reel/222' });
+    expect(await verifyWith(mk('caption'), hint('Video mới đăng', 1))).toMatchObject({
+      kind: 'VERIFIED', permalink: expect.stringMatching(/\/reel\/222$/), externalPostId: '222',
+    });
+  });
+
+  it('reports a new video post that Facebook is still processing, even without a timestamp link', async () => {
+    mock.addPost({ caption: 'Clip khai trương', video: true, hiddenTime: true, processing: true });
+    expect(await verifyWith(mk('caption'), hint('Clip khai trương', 1))).toMatchObject({ kind: 'PROCESSING' });
+  });
+
+  it('does not mistake words in the caption for a Facebook processing notice', async () => {
+    mock.addPost({ caption: 'Video đang hot: đơn hàng đang xử lý', video: true, hiddenTime: true, videoHref: '/reel/333' });
+    expect(await verifyWith(mk('caption'), hint('Video đang hot: đơn hàng đang xử lý', 1))).toMatchObject({ kind: 'VERIFIED', externalPostId: '333' });
+  });
+
+  it('stops waiting for video processing as soon as the new post shows without a processing notice', async () => {
+    mock.addPost({ caption: 'Video xử lý xong', video: true, hiddenTime: true });
+    const c = mk('caption', { uploadTimeoutMs: 60_000 });
+    const s = await c.openSession(target);
+    try {
+      (s as unknown as { lastCaption: string }).lastCaption = 'Video xử lý xong';
+      const started = Date.now();
+      await s.waitProcessing!({}, async () => undefined);
+      expect(Date.now() - started).toBeLessThan(20_000);
+    } finally {
+      await s.close();
+    }
+  }, 90_000);
 
   it('off mode does not look at the page and records that nothing was checked', async () => {
     const r = await verifyWith(mk('off'), hint('Không kiểm tra'));

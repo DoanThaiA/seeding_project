@@ -59,6 +59,8 @@ interface ScanResult {
   hits: Hit[];
   /** Copies of the caption visible outside the composer (independent of finding a timestamp). */
   occ: number;
+  /** Text of the post card around each copy (filled even when the timestamp link is not usable yet). */
+  cards: string[];
 }
 
 /**
@@ -612,10 +614,43 @@ export class FbWebSession implements PublishSession {
         await this.page.waitForTimeout(15_000);
         continue;
       }
+      // A new post's timestamp link has no usable href yet, so it yields copies but no hits: the caption
+      // being on the profile without a "processing" notice is enough to move on to verify().
       const scan = await this.scanProfile(this.lastCaption, null, 6);
-      if (scan.hits.length > 0 && !scan.hits.some((h) => PROCESSING_TEXT.test(h.text))) return;
+      if (scan.copies > 0 && !this.processingSeen(scan)) return;
       await this.page.waitForTimeout(15_000);
     }
+  }
+
+  /** First miss of a session: screenshot + what we read, so selectors can be fixed from the real UI. */
+  private async dumpMiss(tag: string, data: unknown) {
+    if (!this.opts.screenshotDir || this.verifyDumped) return;
+    this.verifyDumped = true;
+    const base = await this.shot(tag);
+    if (base) {
+      await writeFile(base.replace(/\.png$/, '.timeline.json'), JSON.stringify({ url: new URL(this.page.url()).pathname, ...(data as object) }, null, 2), 'utf8')
+        .catch(() => undefined);
+    }
+  }
+
+  /** Every link (href + short text) in the post card that shows this caption — diagnostics only. */
+  private async postLinksNear(caption: string): Promise<Array<{ href: string; text: string }>> {
+    const prefix = norm(caption).slice(0, 60);
+    const script = `(() => {
+      const WS = new RegExp('[' + String.fromCharCode(32, 9, 10, 13, 160) + ']+', 'g');
+      const norm = (s) => (s || '').normalize('NFC').replace(WS, ' ').trim().toLowerCase();
+      const PREFIX = ${JSON.stringify(prefix)};
+      const el = Array.from(document.querySelectorAll('div,span,p')).reverse().find((e) => norm(e.innerText).startsWith(PREFIX) && !e.closest('[role=dialog],[contenteditable=true]'));
+      if (!el) return [];
+      let box = el.closest(${JSON.stringify(storyCard)});
+      if (!box) { box = el; for (let i = 0; i < 12 && box.parentElement && box.parentElement !== document.body; i++) box = box.parentElement; }
+      return Array.from(box.querySelectorAll('a')).slice(0, 60).map((a) => ({ href: (a.getAttribute('href') || '').slice(0, 200), text: (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 60) }));
+    })()`;
+    return ((await this.page.evaluate(script).catch(() => null)) as Array<{ href: string; text: string }> | null) ?? [];
+  }
+
+  private processingSeen(scan: { hits: Hit[]; cards: string[] }) {
+    return scan.hits.some((h) => PROCESSING_TEXT.test(h.text)) || scan.cards.some((c) => PROCESSING_TEXT.test(c));
   }
 
   async discardDraft(draft: DraftHandle) {
@@ -651,6 +686,7 @@ export class FbWebSession implements PublishSession {
       const info = (a) => ({ href: a.getAttribute('href') || '', text: (a.innerText || '').trim().slice(0, 40), label: a.getAttribute('aria-label') });
       const dated = Array.from(document.querySelectorAll('a')).filter((a) => isPost(a.getAttribute('href')) && short(a) && !a.closest('[role=dialog]')).map(info);
       const hits = [];
+      const cards = [];
       let occ = 0;
       // Line breaks (<br>, paragraph divs) add no whitespace to textContent: compare with all whitespace removed.
       const squash = (s) => (s || '').normalize('NFC').replace(WS, '').toLowerCase();
@@ -675,6 +711,13 @@ export class FbWebSession implements PublishSession {
           if (el.closest('[data-commentid],[data-comment-id],[role=article][aria-label^="Bình luận"],[role=article][aria-label^="Phản hồi"],[role=article][aria-label^="Comment by"],[role=article][aria-label^="Reply by"]')) continue;
           occ++;
           const card = el.closest(story);
+          // Text around this copy even when it has no usable timestamp link yet (new posts: href="?__cft__…"),
+          // so "video is being processed" notices can still be seen.
+          let around = card;
+          if (!around) { around = el; for (let i = 0; i < 6 && around.parentElement && around.parentElement !== document.body; i++) around = around.parentElement; }
+          // Without the caption itself: a caption may say "video đang…" and is not a Facebook notice.
+          const withoutCaption = (node) => [WANT, norm(el.innerText)].reduce((t, c) => c ? t.split(c).join(' ') : t, norm(node.innerText));
+          cards.push(withoutCaption(around).slice(0, 1500));
           let box = el;
           let timeA = null;
           for (let i = 0; i < 30 && box && box !== document.body; i++) {
@@ -686,13 +729,13 @@ export class FbWebSession implements PublishSession {
             if (timeA) break;
           }
           if (!timeA || !box) continue;
-          hits.push({ time: info(timeA), imgs: Array.from(box.querySelectorAll('img')).filter(big).length, videos: Array.from(box.querySelectorAll('video')).filter(big).length, text: (box.innerText || '').slice(0, 300) });
+          hits.push({ time: info(timeA), imgs: Array.from(box.querySelectorAll('img')).filter(big).length, videos: Array.from(box.querySelectorAll('video')).filter(big).length, text: withoutCaption(box).slice(0, 300) });
         }
       }
-      return { dated, hits, occ };
+      return { dated, hits, occ, cards };
     })()`;
     const r = (await this.page.evaluate(script).catch(() => null)) as ScanResult | null;
-    return r ?? { dated: [], hits: [], occ: 0 };
+    return r ?? { dated: [], hits: [], occ: 0, cards: [] };
   }
 
   /** Parse a post-link timestamp from its text, falling back to its aria-label. */
@@ -711,11 +754,13 @@ export class FbWebSession implements PublishSession {
     const want = norm(caption);
     const hits = new Map<string, Hit>();
     const dated = new Map<string, LinkInfo>();
+    const cards = new Set<string>();
     let steps = 0;
     let copies = 0;
     for (; steps < maxSteps; steps++) {
       const r = await this.scanOnce(want);
       for (const h of r.hits) hits.set(h.time.href, h);
+      for (const c of r.cards) cards.add(c);
       copies = Math.max(copies, r.occ);
       for (const d of r.dated) dated.set(d.href, d);
       const passedWindow = olderThan !== null && [...dated.values()].some((d) => {
@@ -726,7 +771,7 @@ export class FbWebSession implements PublishSession {
       await this.page.mouse.wheel(0, 700);
       await this.page.waitForTimeout(900);
     }
-    return { hits: [...hits.values()], dated: [...dated.values()], steps, copies };
+    return { hits: [...hits.values()], dated: [...dated.values()], steps, copies, cards: [...cards] };
   }
 
   /**
@@ -753,7 +798,35 @@ export class FbWebSession implements PublishSession {
       });
       // Facebook may render the caption twice (collapsed + full); use the visible one.
       const shown = els.filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
-      if (!shown.length) return { marked: 0, pcb: null, photo: null };
+      if (!shown.length) return { marked: 0, pcb: null, photo: null, video: null };
+      // Video posts: the player links to /reel/<id>, /<user>/videos/<id> or /watch/?v=<id>. Take the
+      // nearest level (inside this post only) that links to exactly one video.
+      const videoOf = (h) => {
+        try {
+          const u = new URL(h, location.href);
+          if (u.origin !== location.origin) return null;
+          const m = u.pathname.match(/[/](?:reel|videos)[/]([0-9]+)[/]?$/);
+          if (m) return { id: m[1], href: u.origin + u.pathname };
+          const v = u.searchParams.get('v') || '';
+          return u.pathname.replace(/[/]$/, '') === '/watch' && /^[0-9]+$/.test(v) ? { id: v, href: u.origin + '/watch/?v=' + v } : null;
+        } catch (e) { return null; }
+      };
+      let video = null;
+      {
+        let v = shown[0];
+        const vCard = v.closest(story);
+        const vMessage = v.closest(message);
+        // Without a post container or message boundary we cannot tell where this post ends: do not guess.
+        for (let i = 0; (vCard || vMessage) && i < 30 && v && v !== document.body; i++) {
+          v = v.parentElement;
+          if (!v || v === document.body || (vCard && !vCard.contains(v))) break;
+          if (vMessage && Array.from(v.querySelectorAll(message)).some(node => !vMessage.contains(node) && !node.contains(vMessage))) break;
+          const links = Array.from(v.querySelectorAll('a[href]')).filter((a) => !(a.getAttribute('href') || '').includes('comment_id=')).map((a) => videoOf(a.getAttribute('href'))).filter(Boolean);
+          const ids = Array.from(new Set(links.map((l) => l.id)));
+          if (ids.length === 1) video = links[0].href;
+          if (ids.length) break; // nearest level only; two different videos = cannot tell
+        }
+      }
       const candidate = (a) => {
         const h = a.getAttribute('href');
         const t = (a.innerText || '').trim();
@@ -774,11 +847,11 @@ export class FbWebSession implements PublishSession {
           // Photos of a multi-photo post link to /photo/?fbid=…&set=pcb.<post id>.
           const pcb = Array.from(box.querySelectorAll('a[href*="set=pcb."]')).map((a) => (a.getAttribute('href').split('set=pcb.')[1] || '').split('&')[0]).filter((v) => /^[0-9]+$/.test(v));
           const photos = Array.from(new Set(Array.from(box.querySelectorAll('a[href*="/photo"]')).map((a) => { try { return new URL(a.getAttribute('href'), location.href).searchParams.get('fbid'); } catch (e) { return null; } }).filter((v) => v && /^[0-9]+$/.test(v))));
-          return { marked: found.length, pcb: pcb.length && pcb.every((v) => v === pcb[0]) ? pcb[0] : null, photo: photos.length === 1 ? photos[0] : null };
+          return { marked: found.length, pcb: pcb.length && pcb.every((v) => v === pcb[0]) ? pcb[0] : null, photo: photos.length === 1 ? photos[0] : null, video };
         }
       }
-      return { marked: 0, pcb: null, photo: null };
-    })()`).catch(() => null)) as { marked: number; pcb: string | null; photo: string | null } | null;
+      return { marked: 0, pcb: null, photo: null, video };
+    })()`).catch(() => null)) as { marked: number; pcb: string | null; photo: string | null; video: string | null } | null;
     const marked = found?.marked ?? 0;
     const origin = new URL(this.page.url()).origin;
     for (let i = 0; i < marked; i++) {
@@ -795,6 +868,8 @@ export class FbWebSession implements PublishSession {
     if (found?.pcb && owner) return `${origin}/permalink.php?story_fbid=${found.pcb}&id=${owner}`;
     // Single-photo post: the photo page carries the same comment thread as the post.
     if (found?.photo && !found.pcb) return `${origin}/photo/?fbid=${found.photo}`;
+    // Video post: the player link of this post (its timestamp link may never get a usable href).
+    if (found?.video && !found.pcb && !found.photo) return found.video;
     return null;
   }
 
@@ -809,7 +884,11 @@ export class FbWebSession implements PublishSession {
   private postPermalink(value?: string): URL | null {
     if (!value || !URL.canParse(value, this.opts.baseUrl)) return null;
     const url = new URL(value, this.opts.baseUrl);
-    return url.origin === new URL(this.opts.baseUrl).origin && facebookPostId(url) ? url : null;
+    if (url.origin !== new URL(this.opts.baseUrl).origin || !facebookPostId(url)) return null;
+    // Drop tracking (__cft__, __tn__, …): keep only what identifies the post.
+    for (const key of [...url.searchParams.keys()]) if (!['id', 'story_fbid', 'fbid', 'v', 'set'].includes(key)) url.searchParams.delete(key);
+    url.hash = '';
+    return url;
   }
 
   async verify(hint: VerifyHint): Promise<VerifyResult> {
@@ -832,8 +911,7 @@ export class FbWebSession implements PublishSession {
       if (scan.hits.length > 1 || (scan.copies > 1 && hint.mediaCount === 0)) {
         return { kind: 'AMBIGUOUS', matches: Math.max(scan.copies, scan.hits.length), evidence };
       }
-      const processing = scan.hits.some((h) => PROCESSING_TEXT.test(h.text));
-      if (processing) return { kind: 'PROCESSING', evidence };
+      if (this.processingSeen(scan)) return { kind: 'PROCESSING', evidence };
       const hit = scan.hits[0];
       const when = hit && this.dateOf(hit.time);
       if (when && (+when.at + when.tolMs < from || +when.at - when.tolMs > to)) {
@@ -841,7 +919,10 @@ export class FbWebSession implements PublishSession {
       }
       const permalink = this.postPermalink(hit?.time.href) ?? this.postPermalink(hint.commitSignal?.permalink)
         ?? this.postPermalink(await this.revealPermalink(hint.caption) ?? undefined);
-      if (!permalink) return { kind: 'NOT_FOUND', conclusive: false, evidence: { ...evidence, missingPermalink: true } };
+      if (!permalink) {
+        await this.dumpMiss('verify-nolink', { evidence, hits: scan.hits, cards: scan.cards.map((c) => c.slice(0, 400)), postLinks: await this.postLinksNear(hint.caption) });
+        return { kind: 'NOT_FOUND', conclusive: false, evidence: { ...evidence, missingPermalink: true } };
+      }
       return { kind: 'VERIFIED', permalink: permalink.href, externalPostId: facebookPostId(permalink) ?? undefined, evidence };
     }
 
