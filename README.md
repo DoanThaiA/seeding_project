@@ -104,3 +104,5 @@ tests/             e2e, faults, harness (Postgres nhúng + đồng hồ giả l�
 3. Extension MV3, takeover qua noVNC.
 4. media.prepare (FFprobe/FFmpeg), agent.recover với 7 công cụ giới hạn.
 5. Soak 7 ngày, load test 50/50.
+#   s e e d i n g _ p r o j e c t  
+ 
