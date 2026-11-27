@@ -26,6 +26,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   FORMAT_NOT_CERTIFIED: 'Định dạng này chưa được chứng nhận cho tài khoản đích.',
   FORMAT_UNSUPPORTED: 'Kết nối của tài khoản đích chưa hỗ trợ định dạng này.',
   RETRY_LIMIT_REACHED: 'Bài đã hết số lần thử đăng trong cấu hình luồng.',
+  SCHEDULE_RESERVED: 'Bài đã có lịch đăng riêng.',
   DUPLICATE_CONTENT: 'Tài khoản đích đã đăng hoặc đang chờ đăng nội dung này từ một bài nguồn khác.',
 };
 
@@ -90,16 +91,34 @@ export class OpsController {
   }
 
   @Get('slots')
-  async slots(@Query('hours') hours = '24') {
+  async slots(@Query('hours') hours = '24', @Query('scheduleId') scheduleId?: string) {
     const now = this.clock.now();
-    return out(
-      await this.db.publicationSlot.findMany({
-        where: { slotAt: { gte: new Date(now.getTime() - Number(hours) * 3600_000) } },
-        orderBy: [{ slotAt: 'desc' }, { target: { code: 'asc' } }],
-        take: 500,
-        include: { target: { select: { code: true } } },
-      }),
-    );
+    const period = parse(z.coerce.number().int().min(1).max(168), hours);
+    const slots = await this.db.publicationSlot.findMany({
+      where: scheduleId ? { scheduleId: parse(z.string().uuid(), scheduleId) }
+        : { slotAt: { gte: new Date(now.getTime() - period * 3600_000), lte: now } },
+      orderBy: [{ slotAt: scheduleId ? 'asc' : 'desc' }, { target: { code: 'asc' } }],
+      take: scheduleId ? 2500 : 500,
+      include: { target: { select: { code: true } } },
+    });
+    const [publications, variants, sources] = await Promise.all([
+      this.db.publication.findMany({ where: { id: { in: slots.flatMap(slot => slot.publicationId ?? []) } },
+        select: { id: true, slotId: true, status: true, variantId: true, permalink: true, lastReason: true,
+          post: { select: { source: { select: { code: true } } } } } }),
+      this.db.contentVariant.findMany({ where: { id: { in: slots.flatMap(slot => slot.scheduledVariantId ?? []) } },
+        select: { id: true, revision: { select: { post: { select: { source: { select: { code: true } } } } } } } }),
+      this.db.source.findMany({ where: { id: { in: [...new Set(slots.flatMap(slot => slot.scheduleSourceIds))] } }, select: { id: true, code: true } }),
+    ]);
+    const byPublication = new Map(publications.map(p => [p.id, p]));
+    const byVariant = new Map(variants.map(v => [v.id, v.revision.post.source.code]));
+    const bySource = new Map(sources.map(s => [s.id, s.code]));
+    return out(slots.map(slot => {
+      const linked = slot.publicationId ? byPublication.get(slot.publicationId) : null;
+      const publication = linked?.slotId === slot.id ? { id: linked.id, status: linked.status, variantId: linked.variantId,
+        permalink: facebookPostLink(linked.permalink)?.url.href ?? null, lastReason: linked.lastReason } : null;
+      const sourceCode = linked?.slotId === slot.id ? linked.post.source.code : slot.scheduledVariantId ? byVariant.get(slot.scheduledVariantId) : null;
+      return { ...slot, publication, sourceCode, sourceCodes: slot.scheduleSourceIds.flatMap(id => bySource.get(id) ?? []).sort() };
+    }));
   }
 
   /** Content waiting to be posted, per target (oldest first = the order it will go out). */
@@ -199,10 +218,12 @@ export class OpsController {
   // ───────────── review ─────────────
   @Get('review')
   async reviewQueue() {
+    const now = this.clock.now();
     return out(
       await this.db.contentVariant.findMany({
-        where: { status: 'NEEDS_REVIEW', revision: { post: { archivedAt: null } }, publications: { none: { status: { in: [...SUCCESS] } } } },
-        orderBy: { createdAt: 'asc' },
+        where: { status: 'NEEDS_REVIEW', revision: { post: { archivedAt: null } }, publications: { none: { status: { in: [...SUCCESS] } } },
+          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         include: {
           target: { select: { code: true } },
           revision: { select: { text: true, albumTitle: true, incomplete: true, mediaStatus: true, raw: true, post: { select: { permalink: true, contentType: true, isShared: true, identityConfidence: true, latestRevisionId: true, source: { select: { code: true, connector: true } } } }, assets: { orderBy: { position: 'asc' }, select: { position: true, asset: { select: { id: true, kind: true, status: true, mime: true } } } } } },
@@ -300,7 +321,9 @@ export class OpsController {
 
   @Get('publications/:id')
   async publication(@Param('id') id: string) {
-    const p = await this.db.publication.findUnique({ where: { id }, include: { attempts: { orderBy: { attemptNo: 'asc' } }, target: true, variant: true } });
+    const p = await this.db.publication.findUnique({ where: { id }, include: {
+      attempts: { orderBy: { attemptNo: 'asc' } }, target: { omit: { profileDetails: true } }, variant: true,
+    } });
     if (!p) throw new NotFoundException();
     const history = await this.db.auditEvent.findMany({ where: { entityType: 'publication', entityId: id }, orderBy: { id: 'asc' } });
     return out({ ...p, history });
@@ -419,15 +442,23 @@ export class OpsController {
 
   @Get('reports/summary')
   async report(@Query('days') days = '7') {
-    const since = new Date(this.clock.now().getTime() - Number(days) * 86_400_000);
-    const pubs = await this.db.publication.groupBy({ by: ['contentType', 'status'], where: { createdAt: { gte: since } }, _count: true });
-    const attempts = await this.db.publicationAttempt.groupBy({ by: ['outcome'], where: { startedAt: { gte: since } }, _count: true });
+    const period = parse(z.coerce.number().int().min(1).max(365), days);
+    const since = new Date(this.clock.now().getTime() - period * 86_400_000);
+    const publicationWhere = { createdAt: { gte: since } };
+    const [pubs, byTarget, targets, attempts, llm] = await Promise.all([
+      this.db.publication.groupBy({ by: ['contentType', 'status'], where: publicationWhere, _count: true }),
+      this.db.publication.groupBy({ by: ['targetId', 'status'], where: publicationWhere, _count: true }),
+      this.db.targetAccount.findMany({ select: { id: true, code: true, name: true }, orderBy: { code: 'asc' } }),
+      this.db.publicationAttempt.groupBy({ by: ['outcome'], where: { startedAt: { gte: since } }, _count: true }),
+      this.db.llmUsage.aggregate({ where: { at: { gte: since } }, _sum: { costMicroUsd: true } }),
+    ]);
     const operatorConfirmed = pubs.filter((p) => p.status === 'OPERATOR_CONFIRMED').reduce((s, p) => s + p._count, 0);
     const verified = pubs.filter((p) => SUCCESS.includes(p.status)).reduce((s, p) => s + p._count, 0);
-    const llm = await this.db.llmUsage.aggregate({ where: { at: { gte: since } }, _sum: { costMicroUsd: true } });
     return out({
       since,
       publications: pubs,
+      targets: targets.map(({ id, code, name }) => ({ code, name, outcomes: byTarget.filter(row => row.targetId === id)
+        .map(({ status, _count }) => ({ status, _count })) })).filter(target => target.outcomes.length),
       attempts,
       automatic: verified - operatorConfirmed,
       operatorConfirmed,

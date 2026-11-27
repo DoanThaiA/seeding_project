@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { ConnectorError, type MediaFile, type PublishSession } from '@seedingsys/connectors-core';
-import { FbWebPublishConnector, parseViTime, runCapability, type FbWebOptions } from '@seedingsys/connectors-fb-web';
+import { FbPublicReadConnector, FbWebPublishConnector, parseViTime, runCapability, type FbWebOptions } from '@seedingsys/connectors-fb-web';
 import type { ContentType, PublishSnapshot } from '@seedingsys/contracts';
 import { captionFingerprint } from '@seedingsys/domain';
 import { MockFb } from '../helpers/mock-fb';
@@ -60,8 +60,30 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
     await mock.stop();
     rmSync(dir, { recursive: true, force: true });
   });
+  it('reads only displayed profile details and verifies a bio after saving it through the visible editor', async () => {
+    mock.bio = 'Tiểu sử nguồn';
+    try {
+      const reader = new FbPublicReadConnector(opts);
+      const snapshot = await reader.readProfileDetails({ id: 'source', code: 'A1', externalRef: 'https://www.facebook.com/profile.php?id=' + target.externalId });
+      expect(snapshot).toMatchObject({ name: 'Hồ sơ thử nghiệm', facebookId: target.externalId, bio: 'Tiểu sử nguồn', intro: ['Sống tại Huế'] });
+      expect(snapshot.sections.find(section => section.key === 'overview')).toMatchObject({ status: 'VISIBLE',
+        categories: [{ label: 'Thông tin cá nhân', values: ['Thông tin hiển thị'] }] });
+      expect(snapshot.sections.find(section => section.key === 'work_and_education')).toMatchObject({ status: 'VISIBLE',
+        categories: [{ label: 'Công việc', values: ['Công việc hiển thị'] }] });
+      expect(snapshot.sections.find(section => section.key === 'places')?.status).toBe('UNAVAILABLE');
+      const session = await connector.openSession(target);
+      try {
+        let saves = 0;
+        const input = { externalId: target.externalId, bio: 'Tiểu sử đã chỉnh', beforeSave: async () => { saves++; } };
+        await session.replaceProfileBio!(input);
+        await session.replaceProfileBio!(input);
+        expect(saves).toBe(1);
+        expect(mock.bio).toBe('Tiểu sử đã chỉnh');
+      } finally { await session.close(); }
+    } finally { mock.bio = undefined; }
+  }, 45_000);
   beforeEach(() => {
-    Object.assign(mock, { session: 'OK', vanity: null, defaultAudience: 'Chỉ mình tôi', audienceLocked: false, mangleCaption: false, reelViaMenu: false, pfbidCommentLinks: false, nestedReplies: false, pfbidPhotoStory: false, rotatingPfbid: false, commentReceiptMode: 'normal', postMode: 'normal', toast: true, posts: [], comments: [] });
+    Object.assign(mock, { session: 'OK', vanity: null, defaultAudience: 'Chỉ mình tôi', audienceLocked: false, mangleCaption: false, reelViaMenu: false, pfbidCommentLinks: false, nestedReplies: false, directReplyLabel: 'Viết phản hồi', pfbidPhotoStory: false, rotatingPfbid: false, commentReceiptMode: 'normal', postMode: 'normal', toast: true, posts: [], comments: [] });
   });
 
   const withSession = async <T>(fn: (s: PublishSession) => Promise<T>): Promise<T> => {
@@ -90,6 +112,37 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
     expect(connector.capabilities(target)).toMatchObject({ TEXT: true, SINGLE_PHOTO: true, MULTI_PHOTO: true, VIDEO: false });
     expect(connector.capabilities(target)).not.toHaveProperty('NAMED_ALBUM');
   });
+
+  it('changes and verifies the avatar and cover only after authorization to save', async () => {
+    mock.artwork = { avatar: '101', cover: null };
+    mock.artworkSaves = [];
+    try {
+      await withSession(async session => {
+        const file = { name: 'avatar.png', mimeType: 'image/png', buffer: PNG };
+        await expect(session.replaceProfilePhoto!({
+          kind: 'avatar', externalId: target.externalId, file,
+          beforeSave: async () => { throw new Error('save authorization revoked'); },
+        })).rejects.toThrow('save authorization revoked');
+        expect(mock.artworkSaves).toHaveLength(0);
+        for (const [kind, old, next] of [['avatar', '101', '901'], ['cover', null, '902']] as const) {
+          expect(await session.replaceProfilePhoto!({
+            kind, externalId: target.externalId, file: { ...file, name: kind + '.png' },
+            beforeSave: async prior => {
+              expect(prior).toBe(old);
+              expect(mock.artwork![kind]).toBe(old);
+            },
+          })).toEqual({ photoId: next });
+        }
+      });
+      expect(mock.artworkSaves).toEqual([
+        { kind: 'avatar', name: 'avatar.png', size: PNG.length, share: false },
+        { kind: 'cover', name: 'cover.png', size: PNG.length, share: false },
+      ]);
+      expect(mock.posts).toHaveLength(0);
+    } finally {
+      mock.artwork = undefined;
+    }
+  }, 30_000);
 
   it('reports logged-out and checkpoint states without trying to get past them', async () => {
     expect(await withSession((s) => s.sessionState())).toBe('OK');
@@ -215,6 +268,7 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
   it('replies under the right parent when replies render inside their parent card', async () => {
     const post = mock.addPost({ caption: 'Bài có phản hồi lồng nhau' });
     mock.nestedReplies = true;
+    mock.directReplyLabel = 'Trả lời Tác giả…';
     const destination = new URL('/posts/' + post.id, mock.baseUrl);
     await withSession(async s => {
       expect(await s.checkIdentity(target.externalId)).toMatchObject({ ok: true });

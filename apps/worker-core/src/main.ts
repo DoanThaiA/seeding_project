@@ -6,6 +6,7 @@ import { createEditor, LlmGateway } from '@seedingsys/llm';
 import { createLogger, initObservability } from '@seedingsys/observability';
 import { createBoss, relayOutboxOnce, work } from '@seedingsys/queue';
 import { handleContentRewrite, handleContentValidate, schedulerTick, type CoreCtx } from './index';
+import { dispatchProfileSync } from './maintenance/profile-sync-publish';
 
 async function main() {
   const cfg = loadConfig();
@@ -14,7 +15,15 @@ async function main() {
   const db = createDb(cfg.DATABASE_URL);
   const clock = systemClock;
   const llm = new LlmGateway(db, createEditor(cfg), clock, { dailyBudgetUsd: cfg.LLM_DAILY_BUDGET_USD, maxConcurrency: cfg.LLM_MAX_CONCURRENCY });
-  const ctx: CoreCtx = { db, clock, log, actor: `worker-core:${cfg.WORKER_NAME}`, llm };
+  const scheduledPublishLimit = cfg.SCHEDULED_PUBLISH_LIMIT;
+  const scheduledPublishFrom = cfg.SCHEDULED_PUBLISH_FROM;
+  const ctx: CoreCtx = {
+    db, clock, log, actor: `worker-core:${cfg.WORKER_NAME}`, llm,
+    scheduledPublishIntervalMin: cfg.SCHEDULED_PUBLISH_INTERVAL_MIN,
+    scheduledPublishBatch: scheduledPublishLimit !== undefined && scheduledPublishFrom
+      ? { limit: scheduledPublishLimit, from: new Date(scheduledPublishFrom) }
+      : undefined,
+  };
 
   const boss = await createBoss(cfg.DATABASE_URL, log);
   await db.workerNode.upsert({
@@ -30,6 +39,7 @@ async function main() {
   });
   await work(boss, Q.ContentRewrite, cfg.LLM_MAX_CONCURRENCY, log, (p) => handleContentRewrite(ctx, p));
   await work(boss, Q.ContentValidate, 3, log, (p) => handleContentValidate(ctx, p));
+  await work(boss, Q.ProfileSyncPublish, 1, log, async ({ syncId }) => { await dispatchProfileSync(ctx, syncId); });
 
   // Outbox relay: tight loop, at-least-once into pg-boss.
   let stopping = false;
@@ -50,7 +60,8 @@ async function main() {
     void db.workerNode.update({ where: { name: `core:${cfg.WORKER_NAME}` }, data: { lastHeartbeatAt: clock.now() } }).catch(() => undefined);
   }, 30_000);
 
-  log.info({ env: cfg.APP_ENV, llm: cfg.LLM_MODE }, 'worker-core started');
+  log.info({ env: cfg.APP_ENV, llm: cfg.LLM_MODE, scheduledPublishBatch: ctx.scheduledPublishBatch,
+    scheduledPublishIntervalMin: ctx.scheduledPublishIntervalMin ?? 60 }, 'worker-core started');
   const shutdown = async () => {
     stopping = true;
     clearInterval(hb);

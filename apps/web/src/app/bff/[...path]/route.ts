@@ -29,7 +29,7 @@ async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }
     return NextResponse.json({ message: 'Không kết nối được API' }, { status: 502 });
   }
   const headers = new Headers();
-  for (const h of ['content-type', 'cache-control', 'accept-ranges', 'content-range']) {
+  for (const h of ['content-type', 'content-disposition', 'cache-control', 'accept-ranges', 'content-range']) {
     const v = upstream.headers.get(h);
     if (v) headers.set(h, v);
   }

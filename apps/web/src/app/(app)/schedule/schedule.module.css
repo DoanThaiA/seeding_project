@@ -1,0 +1,172 @@
+.tabs,
+.ranges,
+.summary,
+.selectionActions,
+.batchFields,
+.pagination {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tabs {
+  margin-bottom: 14px;
+}
+
+.tabs button {
+  font-weight: 600;
+}
+
+.tabs button[aria-pressed='true'],
+.ranges a[aria-current='true'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+.tabs span {
+  margin-inline-start: 4px;
+  font-weight: 400;
+}
+
+.filters {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.filter,
+.filters .search {
+  flex: 1 1 105px;
+  margin: 0;
+}
+
+.filters .search {
+  flex: 2 1 210px;
+}
+
+.filters select,
+.filters input {
+  display: block;
+  margin-top: 4px;
+}
+
+.selectionBar,
+.historyHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.summary span,
+.batchTitle span,
+.historyCount {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.summary span + span::before {
+  content: '·';
+  margin-inline-end: 8px;
+}
+
+.batch {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  margin-bottom: 12px;
+}
+
+.batchTitle {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.batchFields {
+  align-items: end;
+}
+
+.batchFields label {
+  margin: 0;
+}
+
+.batchFields input,
+.batchFields select {
+  display: block;
+  margin-top: 4px;
+}
+
+.batchFields input[type='number'] { width: 110px; }
+.batchFields input[type='datetime-local'] { width: auto; max-width: 100%; }
+.sourcePicker { margin: 0 0 14px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.sourcePicker legend { font-weight: 600; padding: 0 4px; }
+.sourceChoices { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.sourceChoice, .inlineCheck { display: inline-flex; align-items: center; gap: 5px; }
+.sourceChoice { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.sourceChoice:has(input:checked) { border-color: var(--accent); background: var(--info-bg); }
+.sourceChoice span { color: var(--muted); }
+.sourceChoice input, .inlineCheck input { width: auto; }
+.plansTable { min-width: 580px; }
+.planActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.checkbox {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  vertical-align: middle;
+}
+
+.backlogTable {
+  min-width: 770px;
+}
+
+.backlogTable tr[data-selected='true'] {
+  background: var(--info-bg);
+}
+
+.caption {
+  min-width: 220px;
+  overflow-wrap: anywhere;
+}
+
+.caption details {
+  margin-top: 4px;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.reason {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.historyHeader h2 {
+  margin: 0;
+}
+
+.ranges a {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.pagination {
+  justify-content: end;
+  padding-top: 10px;
+  color: var(--muted);
+  font-size: 13px;
+}

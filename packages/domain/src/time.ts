@@ -21,6 +21,15 @@ export class ManualClock implements Clock {
 export const MIN = 60_000;
 export const HOUR = 60 * MIN;
 
+/** An optional daily window in Vietnam local time, inclusive at start and exclusive at end. */
+export function sourceScheduleOpen(source: { runStartMinute: number | null; runEndMinute: number | null; runNowUntil?: Date | null }, at: Date): boolean {
+  if (source.runNowUntil && source.runNowUntil > at) return true;
+  const { runStartMinute: start, runEndMinute: end } = source;
+  if (start === null || end === null) return true;
+  const localMinute = (Math.floor(at.getTime() / MIN) + 7 * 60) % 1440;
+  return start < end ? localMinute >= start && localMinute < end : localMinute >= start || localMinute < end;
+}
+
 /** Vietnam has no DST (UTC+7), so the top of the hour is the same instant in UTC and VN time. */
 export function topOfHour(d: Date): Date {
   const t = new Date(d.getTime());

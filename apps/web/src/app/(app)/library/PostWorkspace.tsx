@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import { ActionButton, bff, useSubmit } from '@/components/client';
 import { Badge } from '@/components/ui';
 import { fmtTime, reasonText } from '@/lib/format';
+import { SUCCESS } from '@seedingsys/contracts';
 import type { Destination, PostDetail, Revision, SourceComment } from './types';
 import styles from './library.module.css';
 
@@ -11,7 +12,6 @@ const SCAN_LABEL = { QUEUED: 'Chờ quét', RUNNING: 'Đang quét bình luận',
 const REPLAY_LABEL = { DRAFT: 'Nháp bình luận', APPROVED: 'Đã duyệt', QUEUED: 'Chờ worker', SENDING: 'Đang gửi', FAILED: 'Gửi thất bại',
   UNKNOWN: 'Chờ đối chiếu', POSTED: 'Đã ghi nhận đăng', OMITTED: 'Đã bỏ qua' };
 const AUDIENCE: Record<string, string> = { ONLY_ME: 'Chỉ mình tôi', FRIENDS: 'Bạn bè', PUBLIC: 'Công khai' };
-const SUCCESS = ['PUBLISHED_VERIFIED', 'OPERATOR_CONFIRMED'];
 
 function PostPreview({ title, profile, caption, revision, link, type, footer }: {
   title: string; profile: string; caption: string; revision: Revision; link: string | null; type: string; footer?: string;
@@ -247,7 +247,8 @@ export function PostWorkspace({ detail, requestedTarget, canReview, canOperate, 
     <>
       <div className={styles.comparisonHeading}>
         <h2>Đối chiếu bài {source.code}{dest ? ` → ${dest.target.code}` : ''}</h2>
-        {canArchive && <ActionButton path={`library/posts/${post.id}/archive`} method="PATCH" body={{ archived: !post.archivedAt }}
+        {post.retiredByReset && <span className="muted">Bản lưu trước lần làm lại kho</span>}
+        {canArchive && !post.retiredByReset && <ActionButton path={`library/posts/${post.id}/archive`} method="PATCH" body={{ archived: !post.archivedAt }}
           className={post.archivedAt ? '' : 'danger'}
           confirm={post.archivedAt ? 'Khôi phục bài về kho nguồn? Các bản duyệt có thể tiếp tục theo lịch hiện tại.'
             : `Chuyển bài khỏi kho ${source.code} vào thùng rác và dừng các lượt đăng đang chờ?`}>

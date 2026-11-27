@@ -6,6 +6,8 @@ import { fbTargetProfilePath, type FbWebOptions } from './config';
 import { CHECKPOINT_TEXT, sel, URLS } from './selectors';
 import { parseViTime } from './vi-time';
 import { collectVisibleComments } from './comments';
+import { readArtworkHeader, readOwnedPhoto } from './profile-artwork';
+import { readProfileIntro, readProfileName, readProfileSections } from './profile-details';
 
 const MESSAGE = '[data-ad-preview="message"],[data-ad-comet-preview="message"],[data-ad-rendering-role="story_message"],[data-testid="post_message"]';
 const STAMP = 'a[aria-describedby],a[href^="#?"],a[href*="/posts/"],a[href*="story_fbid"],a[href*="/videos/"],a[href*="/reel/"],a[href*="/watch"]';
@@ -205,6 +207,8 @@ interface PostAttachment {
   urls: string[];
   caption?: string;
   ambiguous?: boolean;
+  exactStory?: boolean;
+  singlePhotoId?: string;
   album?: { set: string; photos: Array<{ id: string; uri?: string }> };
 }
 
@@ -266,6 +270,7 @@ const POST_ATTACHMENT = String.raw`(expected => {
   const originalLinks = new Set();
   const captions = new Set();
   const albums = new Map();
+  const singlePhotos = new Set();
   let shared = false;
   for (const root of exactRoots[0] ?? roots.values().next().value) {
     const stories = [root, root.comet_sections.content.story];
@@ -278,6 +283,11 @@ const POST_ATTACHMENT = String.raw`(expected => {
       const original = source.url ?? source.permalink_url ?? source.wwwURL;
       if (story.attached_story && typeof original === 'string') originalLinks.add(original);
       for (const attachment of source.attachments ?? []) {
+        const media = attachment.media ?? attachment.styles?.attachment?.media;
+        if (attachment.target?.__typename === 'Photo' && media?.__typename === 'Photo'
+          && /^\d+$/.test(String(media.id)) && String(attachment.target.id) === String(media.id)) {
+          singlePhotos.add(String(media.id));
+        }
         try {
           const set = attachment.target?.id && /^mediaset:(pcb\.\d+)$/.exec(atob(attachment.target.id));
           if (!set) continue;
@@ -320,6 +330,8 @@ const POST_ATTACHMENT = String.raw`(expected => {
     urls: Array.from(urls).filter(value => typeof value === 'string' && value),
     caption: captions.size === 1 ? captions.values().next().value : undefined,
     ambiguous: videos.size > 1,
+    exactStory: exactRoots.length === 1,
+    singlePhotoId: singlePhotos.size === 1 && albums.size === 0 ? singlePhotos.values().next().value : undefined,
     album: set && { set, photos: Array.from(photos, ([id, uri]) => ({ id, uri })) },
   };
 })`;
@@ -340,6 +352,17 @@ const DETAIL_ALBUM = String.raw`set => {
     }
   }
   return { images: [...photos.values()], overflow };
+}`;
+
+const DETAIL_SINGLE_PHOTO = String.raw`id => {
+  const images = [];
+  for (const link of document.querySelectorAll('a[href*="/photo"]')) {
+    const url = new URL(link.href);
+    if ((url.searchParams.get('fbid') || url.pathname.match(/\/(?:photo|photos)\/(\d+)\/?$/)?.[1]) !== id) continue;
+    const image = link.querySelector('img');
+    if (image) images.push({ key: link.href, url: image.currentSrc || image.src });
+  }
+  return { images, overflow: 0 };
 }`;
 
 function profileIdentity(url: URL): string {
@@ -416,13 +439,16 @@ export class FbPublicReadConnector implements ReadConnector {
       const page = await context.newPage();
       page.setDefaultTimeout(2500);
       const accountIdentity = account ? await this.verifyReadAccount(page, account) : null;
-      const limit = source.history ? 150 : Math.min(100, Math.max(account ? 30 : 10, overlap));
+      const maxPosts = source.history || source.exactPermalinks ? undefined : source.maxPosts;
+      const limit = source.history ? 150 : maxPosts ?? Math.min(100, Math.max(account ? 30 : 10, overlap));
       const aliases = new Set([profileIdentity(profile)]);
       const { posts: result, partial } = source.exactPermalinks ? { posts: [], partial: false }
         : await this.readTimeline(page, profile, accountIdentity, account?.code, aliases, limit, deadline, !!source.history);
+      const timelineIncomplete = partial && (maxPosts === undefined || result.length < maxPosts);
       const reread = source.exactPermalinks ?? source.retryPermalinks ?? [];
       const foundIds = new Set(result.map(item => item.post.externalId));
       for (const permalink of reread) {
+        if (maxPosts !== undefined && result.length >= maxPosts) break;
         const link = postLink(permalink, this.base);
         if (!link || foundIds.has(link.id) || deadline - Date.now() < 4500) continue;
         const exact = await this.readPermalink(page, link, aliases);
@@ -440,7 +466,7 @@ export class FbPublicReadConnector implements ReadConnector {
         }));
       }
       const newest = posts.reduce((max, p) => Math.max(max, p.postedAt?.getTime() ?? 0), typeof watermark?.newest === 'number' ? watermark.newest : 0);
-      return { posts, nextWatermark: { newest }, incomplete: partial || Date.now() >= deadline ? ['PAGINATION_INCOMPLETE'] : [],
+      return { posts, nextWatermark: { newest }, incomplete: timelineIncomplete || Date.now() >= deadline ? ['PAGINATION_INCOMPLETE'] : [],
         ...(source.history && { history: { complete: false, detail: 'Đã lấy các bài trình duyệt đọc được. Facebook không xác nhận đã hiển thị hết lịch sử profile.' } }),
       };
     } catch (error) {
@@ -497,6 +523,115 @@ export class FbPublicReadConnector implements ReadConnector {
       throw new ConnectorError('WRONG_IDENTITY', 'Hồ sơ trình duyệt đang đăng nhập tài khoản khác với ' + account.code + '.');
     }
     return expected;
+  }
+
+  async readProfileDetails(source: SourceRef) {
+    const profile = facebookSourceUrl(source.externalRef);
+    const account = this.key === 'fb-session' ? source.readAccount : undefined;
+    if (!profile || (this.key === 'fb-session' && !account)) {
+      throw new ConnectorError('SOURCE_UNREADABLE', 'Thiếu URL hồ sơ Facebook hoặc phiên đăng nhập để đọc.');
+    }
+    const launch = { headless: true, channel: this.opts.channel, executablePath: this.opts.executablePath, timeout: 15_000 };
+    const locale = { locale: 'vi-VN', timezoneId: 'Asia/Ho_Chi_Minh' };
+    const browser = account ? undefined : await chromium.launch(launch);
+    let context: BrowserContext | undefined;
+    try {
+      context = account
+        ? await chromium.launchPersistentContext(fbTargetProfilePath(this.opts.profilesRoot, account), { ...launch, ...locale })
+        : await browser!.newContext(locale);
+      const page = await context.newPage();
+      page.setDefaultTimeout(3000);
+      const identity = account ? await this.verifyReadAccount(page, account) : null;
+      const assertSession = async () => {
+        if (account) await this.assertReadSession(page, account.code);
+        else await this.dismissOptionalLogin(page);
+      };
+      const response = await page.goto(new URL(profile.pathname + profile.search, this.base).href,
+        { waitUntil: 'domcontentloaded', timeout: 15_000 });
+      await assertSession();
+      const observedUrl = new URL(page.url());
+      const observed = this.profileAt(observedUrl.href);
+      if (!response?.ok() || observedUrl.origin !== this.base.origin || !observed) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Không mở được đúng trang hồ sơ nguồn.');
+      }
+      const expected = profileIdentity(profile);
+      const observedId = profileIdentity(observed);
+      const header = await readArtworkHeader(page, expected, false);
+      if (expected !== observedId && (!header || ![expected, header.owner].includes(observedId))) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook chuyển hướng khỏi hồ sơ nguồn đã chọn.');
+      }
+      const aliases = new Set([expected, observedId, ...(header ? [header.owner] : [])]);
+      if (identity && aliases.has(identity) || await page.getByText(LOGIN_WALL).first().isVisible()) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Không xem được hồ sơ nguồn độc lập bằng phiên này.');
+      }
+      const name = await readProfileName(page, aliases);
+      if (!name) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Không xác nhận được tên hiển thị của hồ sơ nguồn.');
+      }
+      const { bio, intro } = await readProfileIntro(page);
+      const canonical = new URL(observed.pathname + observed.search, this.base);
+      const sections = await readProfileSections(page, canonical, aliases, assertSession);
+      return { name, url: observed.href, facebookId: [...aliases].find(id => /^\d+$/.test(id)),
+        bio: bio && bio.length <= 2000 ? bio : undefined, intro, sections, capturedAt: new Date().toISOString() };
+    } finally {
+      if (browser) await browser.close().catch(() => undefined);
+      else await context?.close().catch(() => undefined);
+    }
+  }
+
+  async readProfileArtwork(source: SourceRef) {
+    const profile = facebookSourceUrl(source.externalRef);
+    const account = this.key === 'fb-session' ? source.readAccount : undefined;
+    if (!profile || (this.key === 'fb-session' && !account)) {
+      throw new ConnectorError('SOURCE_UNREADABLE', 'Thiếu trang Facebook hoặc hồ sơ đọc nguồn.');
+    }
+    const launch = { headless: true, channel: this.opts.channel, executablePath: this.opts.executablePath, timeout: 15_000 };
+    const locale = { locale: 'vi-VN', timezoneId: 'Asia/Ho_Chi_Minh' };
+    const browser = account ? undefined : await chromium.launch(launch);
+    let context: BrowserContext | undefined;
+    try {
+      context = account
+        ? await chromium.launchPersistentContext(fbTargetProfilePath(this.opts.profilesRoot, account), { ...launch, ...locale })
+        : await browser!.newContext(locale);
+      const page = await context.newPage();
+      const expected = profileIdentity(profile);
+      const accountIdentity = account ? await this.verifyReadAccount(page, account) : null;
+      if (accountIdentity === expected) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn trùng với tài khoản đích.');
+      }
+      const response = await page.goto(new URL(profile.pathname + profile.search, this.base).href,
+        { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      if (account) await this.assertReadSession(page, account.code);
+      if (!response?.ok() || !this.profileAt(page.url())) throw new ConnectorError('SOURCE_UNREADABLE', 'Không mở được trang nguồn.');
+      await page.locator('h1').first().waitFor({ timeout: 5000 }).catch(() => undefined);
+      const header = await readArtworkHeader(page, expected);
+      if (!header?.avatar || !header.cover || accountIdentity === header.owner) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Không xác nhận được đúng ảnh đại diện và ảnh bìa từ đầu trang nguồn.');
+      }
+      const read = async (id: string) => {
+        const photo = await context!.newPage();
+        try {
+          const url = new URL('/photo/', this.base);
+          url.searchParams.set('fbid', id);
+          const response = await photo.goto(url.href, { waitUntil: 'domcontentloaded', timeout: 15_000 });
+          const observed = new URL(photo.url());
+          if (!response?.ok() || observed.origin !== this.base.origin || photoId(observed) !== id) {
+            throw new ConnectorError('SOURCE_UNREADABLE', 'Không mở được đúng ảnh đã xác định trên trang nguồn.');
+          }
+          const image = await readOwnedPhoto(photo, id, header.owner);
+          if (!image) throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook chưa xác nhận ảnh gốc thuộc đúng trang nguồn.');
+          const media = await this.fetchMedia({ ref: 'fb-public:' + id + ':image:profile', sourceUrl: image.url });
+          return { ...media, photoId: id, width: image.width, height: image.height };
+        } finally {
+          await photo.close().catch(() => undefined);
+        }
+      };
+      const [avatar, cover] = await Promise.all([read(header.avatar), read(header.cover)]);
+      return { avatar, cover };
+    } finally {
+      if (browser) await browser.close().catch(() => undefined);
+      else await context?.close().catch(() => undefined);
+    }
   }
 
   async readComments(source: SourceRef, post: { externalId: string; permalink?: string; aliases?: string[] },
@@ -564,6 +699,16 @@ export class FbPublicReadConnector implements ReadConnector {
         }
       }
       const attachment = await page.evaluate<PostAttachment | null>('(' + POST_ATTACHMENT + ')(' + JSON.stringify(link.id) + ')');
+      const recoveredPhotos = attachment && await this.recoverStoryPhotos(page, attachment, link.id);
+      if (recoveredPhotos) {
+        return { data: EMPTY_CARD, post: {
+          externalId: link.id, permalink: link.url, text: removeAdvertisingLinks(attachment.caption ?? ''),
+          contentType: recoveredPhotos.length === 1 ? 'SINGLE_PHOTO' : 'MULTI_PHOTO',
+          media: recoveredPhotos, incomplete: attachment.caption === undefined ? ['CAPTION_TRUNCATED'] : [],
+          identityConfidence: 'HIGH', isPinned: false, isShared: false,
+          raw: { reader: this.key, expectedPhotoCount: recoveredPhotos.length },
+        } };
+      }
       if (attachment?.videoId || attachment?.album) {
         const reel = new URL(link.url).pathname.includes('/reel/');
         const album = attachment.album;
@@ -610,6 +755,7 @@ export class FbPublicReadConnector implements ReadConnector {
   private async collect(page: Page, aliases: Set<string>, max: number, deadline: number, history = false) {
     const posts = new Map<string, { post: ReadPost; data: CardContent }>();
     const settled = new Set<string>();
+    const failedReads = new Map<string, number>();
     let idle = 0;
     let scroll = '';
     let blockedMidScan = false;
@@ -634,25 +780,34 @@ export class FbPublicReadConnector implements ReadConnector {
         if (!posts.size && NO_POSTS.test(body)) return { posts: [], partial: false };
       }
       const before = settled.size;
+      const anchor = await page.evaluate(() => document.scrollingElement?.scrollTop ?? 0);
       for (const card of cards) {
-        if (settled.has(card.id) || posts.size >= max || Date.now() >= scanUntil) continue;
+        if (settled.has(card.id) || (failedReads.get(card.id) ?? 0) >= 2 || posts.size >= max || Date.now() >= scanUntil) continue;
         const author = this.profileAt(card.authorUrl);
         if (!author || !aliases.has(profileIdentity(author))) continue;
         const found = await this.readCard(page, card.id, undefined, aliases);
-        if (!found) continue;
+        if (!found) {
+          failedReads.set(card.id, (failedReads.get(card.id) ?? 0) + 1);
+          continue;
+        }
         settled.add(card.id);
         const prior = posts.get(found.post.externalId);
         if (!prior || prior.post.incomplete.length > found.post.incomplete.length) posts.set(found.post.externalId, found);
       }
-      const progress = await page.evaluate(() => {
+      const position = await page.evaluate(top => {
         const el = document.scrollingElement;
-        return (el?.scrollTop ?? 0) + '/' + (el?.scrollHeight ?? 0);
-      });
-      idle = settled.size > before || progress !== scroll ? 0 : idle + 1;
-      scroll = progress;
+        if (!el) return { key: '', atEnd: true };
+        // Opening a caption or hovering a timestamp can scroll back to an earlier card.
+        if (el.scrollTop < top) el.scrollTop = top;
+        return { key: el.scrollTop + '/' + el.scrollHeight, atEnd: el.scrollHeight - el.scrollTop - el.clientHeight <= 2 };
+      }, anchor);
+      idle = position.atEnd && settled.size === before && position.key === scroll ? idle + 1 : 0;
+      scroll = position.key;
       if (posts.size < max && idle < 4) {
-        await page.mouse.move(620, 550);
-        await page.mouse.wheel(0, 1100);
+        await page.evaluate(() => {
+          const el = document.scrollingElement;
+          if (el) el.scrollTop += Math.max(440, el.clientHeight - 140);
+        });
         await page.waitForTimeout(550);
       }
     }
@@ -825,7 +980,8 @@ export class FbPublicReadConnector implements ReadConnector {
     const isVideo = card.video || post.contentType === 'REEL' || post.contentType === 'VIDEO';
     const needsPhotos = card.images.length > 0 && post.incomplete.includes('MEDIA_UNAVAILABLE') && !isVideo;
     const needsGallery = card.overflow > 0 || post.incomplete.includes('MEDIA_COUNT_UNKNOWN');
-    if ((!needsGallery && !needsPhotos && !isVideo && !post.isShared && !post.incomplete.includes('CAPTION_TRUNCATED')) || deadline - Date.now() < 1500) return post;
+    const unknownAttachment = post.contentType === 'UNSUPPORTED' && post.incomplete.includes('MEDIA_UNAVAILABLE');
+    if ((!needsGallery && !needsPhotos && !isVideo && !unknownAttachment && !post.isShared && !post.incomplete.includes('CAPTION_TRUNCATED')) || deadline - Date.now() < 1500) return post;
     const until = Math.min(deadline, Date.now() + (needsGallery ? 50_000 : 25_000));
     const detail = await feed.context().newPage().catch(() => null);
     if (!detail) return post;
@@ -855,6 +1011,16 @@ export class FbPublicReadConnector implements ReadConnector {
             if (!snippet || (prefix.length >= 4 && captionKey(clean).startsWith(prefix))) {
               post.text = text;
               post.incomplete = post.incomplete.filter(flag => flag !== 'CAPTION_TRUNCATED');
+            }
+          }
+          if (unknownAttachment && attachment && !post.isShared) {
+            const photos = await this.recoverStoryPhotos(detail, attachment, post.externalId);
+            if (photos) {
+              post.contentType = photos.length === 1 ? 'SINGLE_PHOTO' : 'MULTI_PHOTO';
+              post.media = photos;
+              post.raw = { ...post.raw, expectedPhotoCount: photos.length };
+              post.incomplete = post.incomplete.filter(flag => flag !== 'MEDIA_UNAVAILABLE' && flag !== 'MEDIA_COUNT_UNKNOWN');
+              return post;
             }
           }
           if ((isVideo || attachment?.videoId) && !attachment?.ambiguous && card.videoCount <= 1) {
@@ -903,6 +1069,25 @@ export class FbPublicReadConnector implements ReadConnector {
     } finally {
       await detail.close().catch(() => undefined);
     }
+  }
+
+  private async recoverStoryPhotos(page: Page, attachment: PostAttachment, postId: string): Promise<ReadMedia[] | null> {
+    if (!attachment.exactStory || attachment.shared || attachment.videoId || attachment.ambiguous) return null;
+    const album = attachment.album;
+    const ids = album ? album.photos.map(photo => photo.id) : attachment.singlePhotoId ? [attachment.singlePhotoId] : [];
+    if (ids.length === 0 || (album && ids.length < 2)) return null;
+    const detail = await page.evaluate<Pick<CardContent, 'images' | 'overflow'>>(
+      '(' + (album ? DETAIL_ALBUM : DETAIL_SINGLE_PHOTO) + ')(' + JSON.stringify(album?.set ?? ids[0]) + ')',
+    );
+    if (album) {
+      const observed = new Set(detail.images.map(image => photoId(new URL(image.key))));
+      for (const photo of album.photos) {
+        if (observed.has(photo.id) || !photo.uri) continue;
+        const key = new URL('/photo/?' + new URLSearchParams({ fbid: photo.id, set: album.set }), this.base);
+        detail.images.push({ key: key.href, url: photo.uri });
+      }
+    }
+    return this.confirmDetailPhotos({ ...EMPTY_CARD, ...detail }, ids, ids.length, postId);
   }
 
   private confirmDetailPhotos(card: CardContent | undefined, requiredIds: Array<string | null>, count: number, postId: string): ReadMedia[] | null {

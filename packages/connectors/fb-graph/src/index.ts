@@ -128,13 +128,17 @@ export class FbGraphReadConnector implements ReadConnector {
 
   async readSince(source: SourceRef, watermark: Record<string, unknown> | null, overlap: number): Promise<ReadResult> {
     const token = this.token(source.code);
-    const limit = source.history ? '50' : String(Math.min(100, Math.max(Math.floor(this.opts.pageSize || 25), overlap, 5)));
+    const maxPosts = source.history ? undefined : source.maxPosts;
+    const pageSize = source.history ? 50 : maxPosts ?? Math.min(100, Math.max(Math.floor(this.opts.pageSize || 25), overlap, 5));
     const path = `${encodeURIComponent(source.externalRef)}/posts`;
     const signal = AbortSignal.timeout(45_000);
-    const load = async (cursor?: string) => {
-      const page = await this.get<GraphPostsPage>(path, { fields: POST_FIELDS, limit, ...(cursor && { after: cursor }) }, token, signal);
+    const load = async (cursor?: string, limit = pageSize) => {
+      const page = await this.get<GraphPostsPage>(path, { fields: POST_FIELDS, limit: String(limit), ...(cursor && { after: cursor }) }, token, signal);
       if (!Array.isArray(page.data) || page.data.some(p => typeof p?.id !== 'string' || !p.id)) {
         throw new ConnectorError('TRANSIENT', 'Graph API trả dữ liệu bài viết không hợp lệ.');
+      }
+      if (maxPosts !== undefined && page.data.length > limit) {
+        throw new ConnectorError('TRANSIENT', 'Graph API trả quá số bài yêu cầu trong trang.');
       }
       return { posts: page.data.map(post => this.toPost(post, source.code)),
         more: !!page.paging?.next, next: page.paging?.next ? page.paging.cursors?.after : undefined };
@@ -156,14 +160,15 @@ export class FbGraphReadConnector implements ReadConnector {
     // Retain the previous watermark until a burst of posts is fully read across poll batches.
     for (let i = 0; i < 5; i++) {
       if (cursor) seen.add(cursor);
-      const page = await load(cursor).catch(error => {
+      const remaining = maxPosts === undefined ? pageSize : maxPosts - posts.size;
+      const page = await load(cursor, remaining).catch(error => {
         if (i || !cursor || !(error instanceof ConnectorError) || error.evidence?.graphCode !== 100) throw error;
         // Graph can invalidate a cursor between polls. Restart from the previous settled watermark.
         cursor = undefined;
         newest = previous;
         overlapRead = 0;
         seen.clear();
-        return load();
+        return load(undefined, remaining);
       });
       for (const post of page.posts) {
         const stamp = post.postedAt?.getTime();
@@ -180,6 +185,7 @@ export class FbGraphReadConnector implements ReadConnector {
         return { posts: [...posts.values()], nextWatermark: { newest: previous }, incomplete: ['PAGINATION_INCOMPLETE'] };
       }
       cursor = page.next;
+      if (maxPosts !== undefined && posts.size >= maxPosts) break;
     }
     return { posts: [...posts.values()],
       nextWatermark: { newest: previous, pendingNewest: newest, pendingOverlapRead: overlapRead, nextCursor: cursor },

@@ -13,11 +13,13 @@ import {
   type VerifyResult,
 } from '@seedingsys/connectors-core';
 import type { PublishSnapshot } from '@seedingsys/contracts';
-import { facebookPostId } from '@seedingsys/domain';
+import { facebookPostId, facebookScriptPost } from '@seedingsys/domain';
 import { confirmedCommentPostIds } from './comments';
 import type { FbWebOptions } from './config';
 import { AUDIENCE_LABEL, CHECKPOINT_TEXT, PROCESSING_TEXT, URLS, sel } from './selectors';
 import { parseViTime } from './vi-time';
+import { readArtworkHeader, readOwnedPhoto, uploadProfilePhoto } from './profile-artwork';
+import { prepareProfileBio, readProfileIntro } from './profile-details';
 
 const norm = (s: string) => s.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
 const normalizedComment = (text: string) => text.normalize('NFC').replace(/\s+/g, ' ').trim();
@@ -209,6 +211,91 @@ export class FbWebSession implements PublishSession {
     return { ok, observed };
   }
 
+  async replaceProfilePhoto({ kind, externalId, file, beforeSave }: Parameters<NonNullable<PublishSession['replaceProfilePhoto']>>[0]) {
+    const { ok } = await this.checkIdentity(externalId);
+    const identity = this.checkedIdentity;
+    if (!ok || !identity) throw new ConnectorError('WRONG_IDENTITY', 'Không xác nhận được đúng tài khoản Facebook đích.');
+    const before = await readArtworkHeader(this.page, identity, false);
+    if (!before) throw new ConnectorError('UI_UNEXPECTED', 'Không xác nhận được ảnh hiện tại của hồ sơ đích.');
+    const save = await this.step('prepare-profile-photo', () => uploadProfilePhoto(this.page, kind, file));
+    const location = new URL(this.page.url());
+    if (location.origin !== new URL(this.opts.baseUrl).origin || profileIdentity(location)?.toLowerCase() !== identity
+      || await this.classify() !== 'OK') {
+      throw new ConnectorError('WRONG_IDENTITY', 'Trang hoặc phiên Facebook thay đổi trước khi lưu ảnh.');
+    }
+    await beforeSave(before[kind]);
+    await save.click({ timeout: this.opts.stepTimeoutMs });
+
+    const verify = await this.ctx.newPage();
+    try {
+      const deadline = Date.now() + 45_000;
+      while (Date.now() < deadline) {
+        const response = await verify.goto(new URL('/me', this.opts.baseUrl).href, {
+          waitUntil: 'domcontentloaded', timeout: 10_000,
+        }).catch(() => null);
+        const current = new URL(verify.url());
+        if (response?.ok() && current.origin === location.origin && profileIdentity(current)?.toLowerCase() === identity) {
+          const after = await readArtworkHeader(verify, identity, false);
+          const id = after?.[kind];
+          if (after?.owner === before.owner && id && id !== before[kind]) {
+            const photo = new URL('/photo/', this.opts.baseUrl);
+            photo.searchParams.set('fbid', id);
+            const loaded = await verify.goto(photo.href, { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => null);
+            const url = new URL(verify.url());
+            if (loaded?.ok() && url.origin === location.origin && facebookPostId(url) === id && await readOwnedPhoto(verify, id, before.owner)) {
+              return { photoId: id };
+            }
+          }
+        }
+        await verify.waitForTimeout(1500);
+      }
+    } finally {
+      await verify.close().catch(() => undefined);
+    }
+    throw new ConnectorError('UI_UNEXPECTED', 'Đã bấm lưu nhưng chưa xác minh được ảnh mới trên Facebook.');
+  }
+
+  async replaceProfileBio({ externalId, bio, beforeSave }: Parameters<NonNullable<PublishSession['replaceProfileBio']>>[0]) {
+    if (!(await this.checkIdentity(externalId)).ok) throw new ConnectorError('WRONG_IDENTITY', 'Không xác nhận được hồ sơ Facebook B.');
+    const location = this.page.url();
+    const normalize = (value?: string) => value?.normalize('NFC').replace(/\r\n?/g, '\n').trim();
+    if (normalize((await readProfileIntro(this.page)).bio) === normalize(bio)) return;
+    const save = await prepareProfileBio(this.page, bio);
+    if (this.page.url() !== location || await this.classify() !== 'OK') {
+      throw new ConnectorError('WRONG_IDENTITY', 'Trang hoặc phiên Facebook đã thay đổi trước khi lưu.');
+    }
+    await beforeSave();
+    await save.click({ timeout: Math.min(12_000, this.opts.stepTimeoutMs) });
+    const verified = await this.ctx.newPage();
+    try {
+      const deadline = Date.now() + 30_000;
+      do {
+        const response = await verified.goto(new URL('/me', this.opts.baseUrl).href,
+          { waitUntil: 'domcontentloaded', timeout: 7000 }).catch(() => null);
+        const observed = new URL(verified.url());
+        if (response?.ok() && observed.origin === new URL(location).origin && profileIdentity(observed)?.toLowerCase() === this.checkedIdentity
+          && normalize((await readProfileIntro(verified)).bio) === normalize(bio)) return;
+        await verified.waitForTimeout(1000);
+      } while (Date.now() < deadline);
+    } finally {
+      await verified.close().catch(() => undefined);
+    }
+    throw new ConnectorError('UI_UNEXPECTED', 'Đã bấm lưu nhưng chưa đọc lại được đúng tiểu sử trên Facebook.');
+  }
+
+  async resolveCommentPost(share: URL) {
+    if (!this.checkedIdentity) throw new ConnectorError('WRONG_IDENTITY', 'Cần xác nhận phiên Facebook trước khi mở liên kết.');
+    const given = facebookScriptPost(share.href);
+    if (!given || given.id) throw new ConnectorError('PERMANENT', 'Liên kết chia sẻ bài Facebook không hợp lệ.');
+    await this.go(given.url.pathname);
+    const observed = new URL(this.page.url());
+    const post = observed.origin === new URL(this.opts.baseUrl).origin && facebookScriptPost(new URL(observed.pathname + observed.search, given.url.origin).href);
+    if (!post || !post.id || await this.classify() !== 'OK') {
+      throw new ConnectorError('UI_UNEXPECTED', 'Liên kết chưa mở ra đúng bài Facebook. Hãy dùng liên kết trực tiếp của bài.');
+    }
+    return post.url;
+  }
+
   async postComment({ post, parentId, text }: { post: URL; parentId?: string; text: string }, beforeSubmit: () => Promise<void>) {
     const postId = facebookPostId(post);
     if (!postId || (parentId && !/^[A-Za-z0-9_:-]{1,150}$/.test(parentId))) throw new ConnectorError('PERMANENT', 'Liên kết bài hoặc bình luận cha không hợp lệ.');
@@ -314,7 +401,7 @@ export class FbWebSession implements PublishSession {
       }
       return found;
     };
-    const commentBox = page.getByRole('textbox', { name: /viết (bình luận|phản hồi|câu trả lời)|write (a )?(comment|reply)|bình luận dưới tên/i }).filter({ visible: true });
+    const commentBox = page.getByRole('textbox', { name: /viết (?:bình luận|phản hồi|câu trả lời)|write (?:a )?(?:comment|reply)|bình luận dưới tên|^(?:trả lời|reply to)(?:\s|$)/i }).filter({ visible: true });
     const rootBox = page.getByRole('textbox', { name: /viết bình luận|write (a )?comment|bình luận dưới tên/i }).filter({ visible: true });
     let editor = rootBox;
     if (parentId) {
@@ -356,10 +443,11 @@ export class FbWebSession implements PublishSession {
       await rootBox.waitFor({ state: 'visible', timeout: 10_000 });
     }
     const existing = new Set((await findReceipts()).map(c => c.externalId));
-    if (text.includes('\n')) {
+    if (parentId || text.includes('\n')) {
       // Enter sends the comment: write line by line with Shift+Enter, as the post composer does.
       // Select-all + Delete also clears the "@Tên" mention Facebook pre-fills in a reply box.
-      await editor.click();
+      if (parentId) await editor.waitFor({ state: 'visible', timeout: Math.min(8000, this.opts.stepTimeoutMs) });
+      else await editor.click();
       await page.keyboard.press('ControlOrMeta+A');
       await page.keyboard.press('Delete');
       const lines = text.split('\n');
@@ -483,7 +571,9 @@ export class FbWebSession implements PublishSession {
       if (await home.isVisible()) {
         await home.click();
       } else {
-        await sel.createMenu(this.page).click();
+        const navigationMenu = sel.createMenu(this.page);
+        const menu = await navigationMenu.count() ? navigationMenu : sel.genericCreateMenu(this.page);
+        await menu.click();
         await sel.menuReel(this.page).click();
       }
       await root.waitFor({ state: 'visible' });

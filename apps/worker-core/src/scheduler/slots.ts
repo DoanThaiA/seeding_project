@@ -7,24 +7,33 @@ import {
   tx,
   type Tx,
 } from '@seedingsys/db';
-import { HOUR, isPastLaunchWindow, topOfHour } from '@seedingsys/domain';
+import { HOUR, MIN, isPastLaunchWindow, sourceScheduleOpen } from '@seedingsys/domain';
 import type { CoreCtx } from '../ctx';
 
 export { dispatchSlot, type SlotOutcome } from '@seedingsys/db';
 
-/** Create this hour's slot for every enabled target that has an enabled mapping (idempotent). */
+/** Legacy immediate source runs still use rolling slots. Calendar schedules already have their own rows. */
 export async function ensureSlots(ctx: CoreCtx): Promise<number> {
   const now = ctx.clock.now();
-  const slotAt = topOfHour(now);
   const targets = await ctx.db.targetAccount.findMany({
     where: { enabled: true, mappings: { some: { enabled: true, source: { enabled: true } } } },
-    select: { id: true, mappings: { where: { enabled: true }, select: { lateWindowMin: true } } },
+    select: { id: true, mappings: { where: { enabled: true },
+      select: { lateWindowMin: true, source: { select: { enabled: true, runStartMinute: true, runEndMinute: true,
+        runNowUntil: true, publishIntervalMin: true } } } } },
   });
-  // A slot whose launch window is already over when we first see it (e.g. the system starts at
-  // 09:50) is simply not created — there is nothing to run and nothing to report as missed.
-  const open = targets.filter((t) => !isPastLaunchWindow(slotAt, Math.min(...t.mappings.map((m) => m.lateWindowMin)), now));
+  // A slot whose launch window is already over when we first see it is not created.
+  const open = targets.flatMap(target => {
+    const available = target.mappings.filter(({ source }) => source.enabled && sourceScheduleOpen(source, now)
+      && (ctx.allowImplicitSlots || (source.runNowUntil && source.runNowUntil > now)));
+    if (!available.length) return [];
+    const custom = available.some(({ source }) => source.publishIntervalMin != null || (source.runNowUntil && source.runNowUntil > now));
+    const interval = (custom ? 1 : ctx.scheduledPublishIntervalMin ?? 60) * MIN;
+    const slotAt = new Date(Math.floor(+now / interval) * interval);
+    const lateWindow = Math.min(...target.mappings.map(m => m.lateWindowMin));
+    return isPastLaunchWindow(slotAt, lateWindow, now) ? [] : [{ targetId: target.id, slotAt }];
+  });
   const r = await ctx.db.publicationSlot.createMany({
-    data: open.map((t) => ({ targetId: t.id, slotAt })),
+    data: open,
     skipDuplicates: true, // ON CONFLICT DO NOTHING on UNIQUE(target_id, slot_at)
   });
   return r.count;
@@ -34,7 +43,11 @@ export async function ensureSlots(ctx: CoreCtx): Promise<number> {
 export async function dispatchDueSlots(ctx: CoreCtx): Promise<Record<string, number>> {
   const now = ctx.clock.now();
   const slots = await ctx.db.publicationSlot.findMany({
-    where: { manual: false, status: { in: ['PLANNED', 'DEFERRED'] }, slotAt: { lte: now, gte: new Date(now.getTime() - 2 * HOUR) } },
+    where: { manual: false, status: { in: ['PLANNED', 'DEFERRED'] }, slotAt: { lte: now, gte: new Date(now.getTime() - 2 * HOUR) },
+      ...(!ctx.allowImplicitSlots && { OR: [
+        { scheduleId: { not: null } },
+        { target: { mappings: { some: { enabled: true, source: { enabled: true, runNowUntil: { gt: now } } } } } },
+      ] }) },
     orderBy: { slotAt: 'asc' },
     select: { id: true },
   });

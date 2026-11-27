@@ -103,6 +103,51 @@ describe('one source post is collected once', () => {
 });
 
 describe('one content reaches a target once', () => {
+  it('reimports a reset source while preserving its previous receipts and current duplicate protection', async () => {
+    const sourceId = h.ids.sources.A1;
+    const archive = read({ externalId: 'pfbidOriginal', text: 'Nội dung đã thu thập của nguồn A1',
+      postedAt: new Date('2026-11-12T09:00:00Z'), raw: { postedAtExact: true } });
+    const alias = { ...archive, externalId: 'pfbidAlias' };
+    await ingest('A1', archive);
+    expect(await ingest('A1', alias)).toBe('UNCHANGED');
+    await h.drain();
+    const [original] = await variantsOf('B1');
+    const originalReceipt = await dispatchBacklogItem(h.core, original.id);
+    await h.drain();
+    expect((await h.db.publication.findUniqueOrThrow({ where: { id: originalReceipt } })).status).toBe('PUBLISHED_VERIFIED');
+
+    h.advance(h.browser.verifyWindowMs + MIN);
+    await h.workerHeartbeat();
+    await tx(h.db, async t => {
+      await t.source.update({ where: { id: sourceId }, data: { resetGeneration: 1 } });
+      await t.sourcePost.update({ where: { id: original.sourcePostId }, data: { archivedAt: h.clock.now(), archivedBy: 'reset-test' } });
+    });
+    expect(await ingest('A1', archive)).toBe('NEW_POST');
+    expect(await ingest('A1', alias)).toBe('UNCHANGED');
+    const current = await h.db.sourcePost.findUniqueOrThrow({ where: { sourceId_resetGeneration_externalId: {
+      sourceId, resetGeneration: 1, externalId: archive.externalId,
+    } } });
+    expect(current.id).not.toBe(original.sourcePostId);
+    const aliases = await h.db.sourcePostAlias.findMany({ where: { sourceId }, orderBy: { resetGeneration: 'asc' } });
+    expect(aliases.map(a => [a.resetGeneration, a.externalId, a.sourcePostId])).toEqual([
+      [0, alias.externalId, original.sourcePostId], [1, alias.externalId, current.id],
+    ]);
+    await h.drain();
+    const variant = await h.db.contentVariant.findFirstOrThrow({ where: { sourcePostId: current.id, targetId: original.targetId } });
+    expect(variant.status).toBe('READY');
+    const newReceipt = await dispatchBacklogItem(h.core, variant.id);
+    await h.drain();
+    expect((await pubsOf(h, 'B1')).map(p => [p.id, p.status])).toEqual([
+      [originalReceipt, 'PUBLISHED_VERIFIED'], [newReceipt, 'PUBLISHED_VERIFIED'],
+    ]);
+
+    const copy = { ...archive, externalId: 'pfbidAnotherPost', postedAt: new Date('2026-11-18T09:00:00Z') };
+    expect(await ingest('A1', copy)).toBe('NEW_POST');
+    const copies = await variantsOf('B1');
+    expect(copies.at(-1)).toMatchObject({ status: 'DUPLICATE', reviewReasons: ['DUPLICATE_CONTENT'] });
+    expect(h.platform.timeline('fb-B1')).toHaveLength(2);
+  });
+
   it('a second source with the same caption and photo is marked DUPLICATE for the shared target and published once', async () => {
     await h.db.sourceTargetMapping.create({ data: { sourceId: h.ids.sources.A2, targetId: h.ids.targets.B1 } });
     await cycle(h); // 09:50 first sync of the fake sources (empty)

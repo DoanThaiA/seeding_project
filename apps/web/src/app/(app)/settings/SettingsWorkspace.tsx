@@ -28,7 +28,9 @@ function Readiness({ capabilities }: { capabilities: Capabilities }) {
   </details>;
 }
 
-export function SettingsWorkspace({ sources, targets, mappings, capabilities }: { sources: SourceT[]; targets: TargetT[]; mappings: MappingT[]; capabilities: Capabilities }) {
+export function SettingsWorkspace({ sources, targets, mappings, capabilities }: {
+  sources: SourceT[]; targets: TargetT[]; mappings: MappingT[]; capabilities: Capabilities;
+}) {
   const [view, setView] = useState<View>('flows');
   const bySource = new Map(sources.map(s => [s.id, s]));
   const byTarget = new Map(targets.map(t => [t.id, t]));
@@ -49,18 +51,13 @@ export function SettingsWorkspace({ sources, targets, mappings, capabilities }: 
         <h1>Quản trị luồng đăng</h1>
         <p>Thiết lập nguồn Facebook, tài khoản đích và cách duyệt bài.</p>
       </div>
-      <Link className={styles.secondaryAction} href="/schedule">Mở lịch &amp; backlog <span aria-hidden>↗</span></Link>
+      <Link className={styles.secondaryAction} href="/schedule">Mở lịch đăng</Link>
     </header>
     <nav className={styles.tabs} aria-label="Mục quản trị">
       {(Object.entries(views) as Array<[View, string]>).map(([key, title]) =>
         <button key={key} type="button" aria-pressed={view === key} onClick={() => setView(key)}>{title}</button>)}
     </nav>
     {view === 'flows' && <>
-      <ol className={styles.stages} aria-label="Các bước xử lý bài">
-        <li><span aria-hidden>1</span><div><strong>Quét nguồn</strong><small>Đọc bài mới theo chu kỳ</small></div></li>
-        <li><span aria-hidden>2</span><div><strong>Lưu &amp; duyệt</strong><small>Lưu bài và media · Duyệt nếu cần</small></div></li>
-        <li><span aria-hidden>3</span><div><strong>Đăng &amp; xác minh</strong><small>Theo lịch hoặc từ Backlog</small></div></li>
-      </ol>
       <div className={styles.workArea}>
         <aside className={styles.flowList} aria-label="Danh sách luồng">
           <div className={styles.listHeading}><h2>Luồng đang cấu hình</h2><span>{viewsOfFlow.length}</span></div>
@@ -80,7 +77,8 @@ export function SettingsWorkspace({ sources, targets, mappings, capabilities }: 
           {activeFlow ? <>
             <div className={styles.flowTitle}>
               <div><h2>{activeFlow.name}</h2><p>{activeFlow.source.name} <span aria-hidden>→</span> {activeFlow.target.name}</p></div>
-              <Link href="/review">Mở hàng duyệt ↗</Link>
+              {activeFlow.mapping.enabled && <Link href={{ pathname: '/profile-sync', query: { source: activeFlow.source.code,
+                target: activeFlow.target.code } }}>Đồng bộ hồ sơ</Link>}
             </div>
             <div className={styles.cards}>
               <SourceForm key={activeFlow.source.id} source={activeFlow.source} />

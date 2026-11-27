@@ -1,3 +1,5 @@
+import type { PublicationStatus } from '@seedingsys/contracts';
+
 export interface Profile {
   id: string;
   code: string;
@@ -31,7 +33,7 @@ export interface Revision {
 
 export interface Destination {
   target: Profile & { audience: string };
-  publication: { id: string; status: string; permalink: string | null; directLink: boolean; verifiedAt: string | null; lastReason: string | null } | null;
+  publication: { id: string; status: PublicationStatus; permalink: string | null; directLink: boolean; verifiedAt: string | null; lastReason: string | null } | null;
   variant: { id: string; caption: string | null; contentType: string; status: string; expiresAt: string | null; reviewReasons: string[];
     audience: string; snapshotHash: string | null; revision: Revision } | null;
 }
@@ -58,7 +60,8 @@ export interface SourceComment {
 }
 
 export interface PostDetail {
-  post: { id: string; permalink: string | null; contentType: string; postedAt: string | null; firstSeenAt: string; archivedAt: string | null };
+  post: { id: string; permalink: string | null; contentType: string; postedAt: string | null; firstSeenAt: string;
+    archivedAt: string | null; retiredByReset: boolean };
   source: Profile & { connector: string };
   revision: Revision;
   scan: { status: 'QUEUED' | 'RUNNING' | 'COMPLETE' | 'PARTIAL' | 'FAILED'; readCount: number; expectedCount: number | null; detail: string | null } | null;
@@ -75,10 +78,12 @@ export interface ProfileSyncOption {
     phase: 'DISCOVERING' | 'PREPARING' | 'PREPARED' | 'FAILED';
     history: boolean;
     historyDone: boolean;
+    publish: boolean;
     detail: string | null;
     updatedAt: string;
     stats: {
       posts: number; toReview: number; approved: number; posted: number; changed: number; missingMedia: number;
+      waiting: number; working: number; needsCheck: number; duplicates: number; blocked: number;
       comments: number; commentsDrafted: number; commentsPosted: number; scansPending: number; scansPartial: number; scansComplete: number; scansUnrequested: number;
     } | null;
   } | null;

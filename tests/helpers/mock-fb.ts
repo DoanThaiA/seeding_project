@@ -45,12 +45,16 @@ export class MockFb {
   pfbidCommentLinks = false;
   /** Real UI: a reply renders inside its parent's comment card, Reply button included. */
   nestedReplies = false;
+  directReplyLabel = 'Viết phản hồi';
   /** Real UI: comment links on a photo point at the photo's story by a pfbid id. */
   pfbidPhotoStory = false;
   /** Real UI: comment links use a pfbid absent from the page data; an encoded profile link names the numeric post. */
   rotatingPfbid = false;
   commentReceiptMode: 'normal' | 'profile-link' | 'related-post' | 'wrong-author' | 'wrong-text' = 'normal';
   posts: MockPost[] = [];
+  artwork?: { avatar: string; cover: string | null };
+  artworkSaves: Array<{ kind: 'avatar' | 'cover'; name: string; size: number; share: boolean }> = [];
+  bio?: string;
   comments: Array<{ postId: string; id: string; parentId?: string; rootId?: string; text: string }> = [];
   private n = 0;
   private server!: Server;
@@ -102,6 +106,44 @@ export class MockFb {
     if (this.session === 'LOGGED_OUT') return send(302, '', 'text/plain', { location: '/login/' });
     if (this.session === 'CHECKPOINT') return send(302, '', 'text/plain', { location: '/checkpoint/' });
     if (url.pathname === '/me') return send(302, '', 'text/plain', { location: this.vanity ? `/${this.vanity}` : `/profile.php?id=${this.userId}` });
+    if (this.bio !== undefined && url.pathname === '/__bio' && req.method === 'POST') {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      this.bio = JSON.parse(raw).bio;
+      return send(200, '{}', 'application/json');
+    }
+    if (this.bio !== undefined && url.pathname === '/profile.php' && url.searchParams.get('id') === this.userId) {
+      const section = url.searchParams.get('sk');
+      if (section === 'about') return send(200, '<main><section><h2>Thông tin cá nhân</h2><div>Thông tin hiển thị</div></section></main>');
+      if (section === 'about_work_and_education') return send(200, '<main><h1>Hồ sơ thử nghiệm</h1><section><h2>Công việc</h2><div>Công việc hiển thị</div><div hidden>Công việc ẩn</div></section></main>');
+      if (section) return send(200, '<main><h1>Hồ sơ thử nghiệm</h1><section><h2>Mục khác</h2></section></main>');
+      return send(200, `<main><h2><a href="/profile.php?id=${esc(this.userId)}">Hồ sơ thử nghiệm</a></h2><section><h2>Giới thiệu</h2>
+        ${this.bio ? `<div dir="auto"><span dir="auto">${esc(this.bio)}</span></div>` : ''}
+        <button id="edit">${this.bio ? 'Chỉnh sửa tiểu sử' : 'Thêm tiểu sử'}</button>
+        <ul><li>Sống tại Huế</li><li hidden>Mục không hiển thị</li></ul>
+        <div role="dialog" hidden><textarea aria-label="Tiểu sử"></textarea><button id="save">Lưu</button></div>
+        <script>
+          document.querySelector('#edit').onclick = () => { document.querySelector('[role="dialog"]').hidden = false; };
+          document.querySelector('#save').onclick = async () => {
+            await fetch('/__bio', { method: 'POST', body: JSON.stringify({ bio: document.querySelector('textarea').value }) });
+            location.reload();
+          };
+        </script></section><article>Bài trên bảng tin</article></main>`);
+    }
+    if (this.artwork && url.pathname === '/__artwork' && req.method === 'POST') {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const saved = JSON.parse(raw) as typeof this.artworkSaves[number];
+      this.artworkSaves.push(saved);
+      this.artwork[saved.kind] = String(900 + this.artworkSaves.length);
+      return send(200, '{}', 'application/json');
+    }
+    if (this.artwork && url.pathname === '/profile.php' && url.searchParams.get('id') === this.userId) return send(200, this.artworkPage());
+    if (this.artwork && url.pathname === '/photo/' && Object.values(this.artwork).includes(url.searchParams.get('fbid') ?? '')) {
+      const id = url.searchParams.get('fbid');
+      const photo = { id, owner: { id: this.userId }, image: { uri: this.baseUrl + '/fixture.png', width: 50, height: 100 } };
+      return send(200, `<script type="application/json">${JSON.stringify(photo)}</script>`);
+    }
     if (url.pathname === '/notifications') {
       return send(200, `<!doctype html><html><body>${this.posts.filter(p => p.reel).map(p =>
         `<a href="/reel/${p.id}">Chưa đọc Bạn có thể xem thước phim rồi. Hãy chia sẻ với bạn bè nhé. ${this.rel(p)}</a>`).join('')}</body></html>`);
@@ -123,6 +165,46 @@ export class MockFb {
     }
     if (post) return send(200, this.postPage(post, photoViewer, !!post.storyAlias && url.searchParams.get('story_fbid') === post.storyAlias));
     return send(200, this.timeline()); // /profile.php?id=… and /<vanity>
+  }
+
+  private artworkPage() {
+    const header = { id: this.userId, profilePhoto: { id: this.artwork!.avatar },
+      cover_photo: this.artwork!.cover ? { photo: { id: this.artwork!.cover } } : null };
+    return `<main><h1>Hồ sơ thử nghiệm</h1>
+      <button id="avatar-actions">Hành động với ảnh đại diện</button>
+      <button id="choose" hidden>Chọn ảnh đại diện</button>
+      <button id="cover-actions">Chỉnh sửa ảnh bìa</button>
+      <div id="menu" role="menu" hidden><button id="cover-upload" role="menuitem">Tải ảnh lên</button></div>
+      <div id="dialog" role="dialog" aria-label="Chọn ảnh đại diện" hidden>
+        <button id="avatar-upload">Tải ảnh lên</button>
+        <label id="share-label" hidden><input id="share" type="checkbox" checked>Chia sẻ bản cập nhật của bạn lên Bảng feed</label>
+        <button id="save-avatar" hidden>Lưu</button>
+      </div>
+      <button id="save-cover" hidden>Lưu thay đổi</button>
+      <input id="file" type="file" hidden>
+      <script type="application/json">${JSON.stringify(header)}</script>
+      <script>
+        const el = id => document.getElementById(id);
+        let kind = '';
+        el('avatar-actions').onclick = () => el('choose').hidden = false;
+        el('choose').onclick = () => { el('choose').hidden = true; el('dialog').hidden = false; };
+        el('cover-actions').onclick = () => el('menu').hidden = false;
+        el('avatar-upload').onclick = () => { kind = 'avatar'; el('file').click(); };
+        el('cover-upload').onclick = () => { kind = 'cover'; el('menu').hidden = true; el('file').click(); };
+        el('file').onchange = () => {
+          el('save-' + kind).hidden = false;
+          if (kind === 'avatar') el('share-label').hidden = false;
+        };
+        const save = async () => {
+          const file = el('file').files[0];
+          await fetch('/__artwork', { method: 'POST', body: JSON.stringify({
+            kind, name: file.name, size: file.size, share: kind === 'avatar' && el('share').checked,
+          }) });
+          location.reload();
+        };
+        el('save-avatar').onclick = save;
+        el('save-cover').onclick = save;
+      </script></main>`;
   }
 
   private postPage(post: MockPost, photoViewer: boolean, alternateStory: boolean) {
@@ -163,7 +245,7 @@ export class MockFb {
           link.textContent = 'Vừa xong';
           const reply = document.createElement('button');
           reply.textContent = 'Phản hồi';
-          reply.onclick = () => { parentId = comment.id; editor.setAttribute('aria-label', 'Viết phản hồi'); editor.focus(); };
+          reply.onclick = () => { parentId = comment.id; editor.setAttribute('aria-label', ${JSON.stringify(this.directReplyLabel)}); editor.focus(); };
           article.append(author, text, link, reply);
           ${photoViewer && post.photoReceiptAfterReload ? `
           text.textContent = comment.text.slice(0, 8);
@@ -210,7 +292,7 @@ export class MockFb {
 <div role="button" tabindex="0" id="open">Tester ơi, bạn đang nghĩ gì thế?</div>
 <a href="/reel/">Thước phim</a>
 ${this.reelViaMenu
-  ? '<button id="createMenu">Menu trên Facebook</button><button id="menuReel" hidden>Thước phim</button>'
+  ? '<button id="createMenu">Menu trên Facebook</button><button id="menuReel" hidden>Thước phim</button><article><button>Menu</button></article>'
   : '<a href="/reels/create">Tạo thước phim</a>'}
 <div role="dialog" aria-label="${title}" id="dlg" ${reel ? '' : 'hidden'}>
   <h2 id="composerTitle">${title}</h2>

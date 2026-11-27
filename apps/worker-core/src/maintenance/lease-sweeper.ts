@@ -71,9 +71,24 @@ export async function sweepExpiredLeases(ctx: CoreCtx): Promise<{ requeued: numb
 /** Content past its validity is never published late. */
 export async function expireContent(ctx: CoreCtx): Promise<number> {
   const now = ctx.clock.now();
-  const r = await ctx.db.contentVariant.updateMany({
-    where: { status: { in: ['READY', 'NEEDS_REVIEW', 'REWRITING', 'VALIDATING', 'FETCHING_MEDIA'] }, expiresAt: { lt: now } },
-    data: { status: 'EXPIRED' },
+  return tx(ctx.db, async t => {
+    const expired = await t.contentVariant.updateMany({
+      where: { status: { in: ['READY', 'NEEDS_REVIEW', 'REWRITING', 'VALIDATING', 'FETCHING_MEDIA'] }, expiresAt: { lte: now } },
+      data: { status: 'EXPIRED' },
+    });
+    await t.$executeRaw`
+      WITH expired_reviews AS (
+        SELECT v.id FROM content_variants v
+        WHERE v.status='EXPIRED' AND EXISTS (
+          SELECT 1 FROM operator_tasks task WHERE task.variant_id=v.id
+            AND task.kind='REVIEW_CONTENT' AND task.status IN ('OPEN','CLAIMED')
+        )
+        FOR SHARE OF v SKIP LOCKED
+      )
+      UPDATE operator_tasks task
+        SET status='DONE', resolved_by=${ctx.actor}, closed_at=${now}, resolution='{"reason":"content_expired"}'::jsonb
+        FROM expired_reviews v
+        WHERE task.variant_id=v.id AND task.kind='REVIEW_CONTENT' AND task.status IN ('OPEN','CLAIMED')`;
+    return expired.count;
   });
-  return r.count;
 }

@@ -6,6 +6,7 @@ import { fmtTime, label, pct } from '@/lib/format';
 interface Report {
   since: string;
   publications: Array<{ contentType: string; status: string; _count: number }>;
+  targets: Array<{ code: string; name: string; outcomes: Array<{ status: string; _count: number }> }>;
   attempts: Array<{ outcome: string; _count: number }>;
   automatic: number;
   operatorConfirmed: number;
@@ -27,17 +28,29 @@ export default async function Reports({ searchParams }: { searchParams: Promise<
   const success = r.automatic + r.operatorConfirmed;
   return (
     <>
-      <Head title="Báo cáo" sub={`Từ ${fmtTime(r.since)} đến nay. Tỷ lệ thành công tính riêng từng định dạng; “chưa rõ” không tính là thành công.`} />
+      <Head title="Báo cáo" sub={`Từ ${fmtTime(r.since)} đến nay`} />
       <div className="filters">
         {[['1', '24 giờ'], ['7', '7 ngày'], ['30', '30 ngày']].map(([k, l]) => <Link key={k} href={`/reports?days=${k}`} aria-current={d === k}>{l}</Link>)}
       </div>
       <div className="grid">
         <Kpi value={total} label="Lượt đăng" />
-        <Kpi value={r.automatic} label="Thành công tự động" kind="ok" />
-        <Kpi value={r.operatorConfirmed} label="Người xác nhận" />
-        <Kpi value={r.llmUsd ? `$${r.llmUsd.toFixed(2)}` : '$0'} label="Chi phí LLM" />
-        <Kpi value={r.llmUsdPerSuccess === null ? '—' : `$${r.llmUsdPerSuccess.toFixed(3)}`} label="Chi phí LLM mỗi bài thành công" />
+        <Kpi value={success} label="Đã đăng" kind="ok" />
+        <Kpi value={r.publications.filter(row => UNRESOLVED.includes(row.status)).reduce((sum, row) => sum + row._count, 0)} label="Cần đối chiếu" />
       </div>
+
+      <section className="card">
+        <h2>Theo tài khoản đích</h2>
+        {r.targets.length ? <div className="tw"><table>
+          <thead><tr><th>Hồ sơ</th><th className="num">Đã đăng</th><th className="num">Đang chạy</th><th className="num">Cần đối chiếu</th><th className="num">Thất bại</th><th className="num">Đã hủy</th></tr></thead>
+          <tbody>{r.targets.map(target => {
+            const count = (statuses: string[]) => target.outcomes.reduce((sum, row) => sum + (statuses.includes(row.status) ? row._count : 0), 0);
+            return <tr key={target.code}>
+              <td><Link href={{ pathname: '/library', query: { profile: target.code } }}>{target.code} · {target.name}</Link></td>
+              {[OK, INFLIGHT, UNRESOLVED, ['FAILED_CONFIRMED'], ['CANCELLED']].map(statuses => <td className="num" key={statuses[0]}>{count(statuses)}</td>)}
+            </tr>;
+          })}</tbody>
+        </table></div> : <Empty>Chưa có lượt đăng trong khoảng này.</Empty>}
+      </section>
 
       <section className="card">
         <h2>Theo định dạng</h2>
@@ -64,18 +77,18 @@ export default async function Reports({ searchParams }: { searchParams: Promise<
                 })}
               </tbody>
             </table>
-            <p className="muted" style={{ marginBottom: 0 }}>Mục tiêu pilot: ≥95% bài thường, ≥90% nhiều ảnh/video. Cần ≥20 mẫu mỗi định dạng mới kết luận được.</p>
           </div>
         )}
       </section>
 
-      <section className="card">
-        <h2>Các lần thực hiện (attempt)</h2>
+      <details className="card">
+        <summary>Lần thử và chi phí</summary>
         {r.attempts.length === 0 ? <Empty>Chưa có.</Empty> : (
           <div className="chips">{r.attempts.map((a) => <span key={a.outcome} className="badge muted">{a.outcome}: {a._count}</span>)}</div>
         )}
-        {success > 0 && <p className="muted" style={{ marginBottom: 0 }}>Tự động hoàn tất {pct(r.automatic, success)} số bài thành công.</p>}
-      </section>
+        <p className="muted">{r.automatic} bài tự xác minh · {r.operatorConfirmed} bài người dùng xác nhận · ${r.llmUsd.toFixed(2)} chi phí LLM</p>
+        {r.llmUsdPerSuccess !== null && <p className="muted">${r.llmUsdPerSuccess.toFixed(3)} cho mỗi bài đăng thành công</p>}
+      </details>
     </>
   );
 }

@@ -41,6 +41,8 @@ export interface SourceRef {
   retryPermalinks?: string[];
   exactPermalinks?: string[];
   history?: { cursor?: string };
+  /** Maximum posts returned by a regular poll, including any re-reads. */
+  maxPosts?: number;
   readAccount?: Pick<TargetRef, 'code' | 'externalId' | 'profileDir'>;
 }
 
@@ -94,6 +96,14 @@ export interface ReadCommentsResult {
   detail?: string;
 }
 
+export interface ProfileImage {
+  photoId: string;
+  width: number;
+  height: number;
+  bytes: Buffer;
+  mime: string;
+}
+
 export interface ReadConnector {
   readonly key: string;
   readonly version: string;
@@ -101,6 +111,8 @@ export interface ReadConnector {
   readSince(source: SourceRef, watermark: Record<string, unknown> | null, overlap: number): Promise<ReadResult>;
   readComments?(source: SourceRef, post: { externalId: string; permalink?: string; aliases?: string[] },
     onProgress: (readCount: number, expectedCount?: number) => Promise<void>): Promise<ReadCommentsResult>;
+  readProfileArtwork?(source: SourceRef): Promise<{ avatar: ProfileImage; cover: ProfileImage }>;
+  readProfileDetails?(source: SourceRef): Promise<import('@seedingsys/contracts').ProfileDetailsSnapshot>;
   /** Fetch media bytes the organisation is permitted to store. */
   fetchMedia(media: { ref: string; sourceUrl?: string | null }): Promise<{ bytes: Buffer; mime: string }>;
 }
@@ -165,9 +177,17 @@ export type VerifyResult =
   | { kind: 'PROCESSING'; evidence?: Record<string, unknown> };
 
 export interface PublishSession {
+  replaceProfilePhoto?(args: {
+    kind: 'avatar' | 'cover';
+    externalId: string;
+    file: { name: string; mimeType: string; buffer: Buffer };
+    beforeSave: (priorPhotoId: string | null) => Promise<void>;
+  }): Promise<{ photoId: string }>;
   sessionState(): Promise<'OK' | 'LOGGED_OUT' | 'CHECKPOINT'>;
   checkIdentity(expectedExternalId: string): Promise<{ ok: boolean; observed?: string }>;
   postComment?(input: { post: URL; parentId?: string; text: string }, beforeSubmit: () => Promise<void>): Promise<{ externalId: string; permalink: string } | null>;
+  resolveCommentPost?(share: URL): Promise<URL>;
+  replaceProfileBio?(input: { externalId: string; bio: string; beforeSave: () => Promise<void> }): Promise<void>;
   /** Build the draft. MUST NOT publish anything. */
   prepare(snapshot: PublishSnapshot, media: MediaFile[]): Promise<DraftHandle>;
   previewCheck(draft: DraftHandle, expected: PreviewExpectation): Promise<{ ok: boolean; problems: string[]; audienceOk: boolean }>;

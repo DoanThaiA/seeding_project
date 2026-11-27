@@ -58,7 +58,7 @@ export async function createHarness(opts: { codes?: number[]; start?: string } =
   const editor = new FakeEditor();
   const llm = new LlmGateway(db, editor, clock, { dailyBudgetUsd: 5, maxConcurrency: 2 });
 
-  const core: CoreCtx = { db, clock, log, actor: 'test-core', llm };
+  const core: CoreCtx = { db, clock, log, actor: 'test-core', llm, allowImplicitSlots: true };
   const browser: BrowserCtx = {
     db,
     clock,
@@ -100,6 +100,7 @@ export async function createHarness(opts: { codes?: number[]; start?: string } =
   const retries = new Map<string, number>();
 
   const handlers: Record<string, (p: any) => Promise<unknown>> = {
+    [Q.SchedulerTick]: () => schedulerTick(core),
     [Q.SourcePoll]: (p) => handleSourcePoll(browser, p),
     [Q.CommentScan]: (p) => handleCommentScan(browser, p),
     [Q.AssetFetch]: (p) => handleAssetFetch(media, p),

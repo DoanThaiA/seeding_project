@@ -1,6 +1,6 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
 import { z } from 'zod';
-import { Q } from '@seedingsys/contracts';
+import { MAX_POLL_POSTS, Q } from '@seedingsys/contracts';
 import { activeKillSwitch, activeLease, audit, enqueue, Prisma, sourceResource, tx, type Db } from '@seedingsys/db';
 import { facebookSourceUrl, isFacebookTimelineReader, type Clock } from '@seedingsys/domain';
 import { Roles, type Principal } from './auth';
@@ -14,9 +14,21 @@ const SourceIn = z.object({
   connector: z.enum(['fake', 'manual', 'fb-graph', 'fb-web', 'fb-public', 'fb-session']),
   enabled: z.boolean().optional(),
   pollIntervalSec: z.number().int().min(60).optional(),
+  pollPostLimit: z.number().int().min(1).max(MAX_POLL_POSTS).nullable().optional(),
   overlapCount: z.number().int().min(0).max(50).optional(),
   collectComments: z.boolean().optional(),
+  publishComments: z.boolean().optional(),
+  publishIntervalMin: z.number().int().min(1).max(1440).nullable().optional(),
+  runStartMinute: z.number().int().min(0).max(1439).nullable().optional(),
+  runEndMinute: z.number().int().min(0).max(1439).nullable().optional(),
 });
+
+function hasValidRunWindow({ runStartMinute: start, runEndMinute: end }: Pick<z.infer<typeof SourceIn>, 'runStartMinute' | 'runEndMinute'>) {
+  return (start === undefined && end === undefined) || (start === null && end === null)
+    || (typeof start === 'number' && typeof end === 'number' && start !== end);
+}
+
+const RUN_WINDOW_ERROR = 'Nhập đủ giờ bắt đầu và giờ kết thúc khác nhau, hoặc chọn Cả ngày.';
 
 function publicSourceRef(ref: string): string {
   const url = facebookSourceUrl(ref);
@@ -58,7 +70,7 @@ export class ConfigController {
   @Post('sources')
   @Roles('admin')
   async createSource(@Body() body: unknown, @Actor() a: Principal) {
-    const data = parse(SourceIn, body);
+    const data = parse(SourceIn.refine(hasValidRunWindow, RUN_WINDOW_ERROR), body);
     if (isFacebookTimelineReader(data.connector)) data.externalRef = publicSourceRef(data.externalRef);
     const s = await this.db.source.create({ data });
     await audit(this.db, { entityType: 'source', entityId: s.id, action: 'created', actor: a.actor, at: this.clock.now() });
@@ -67,7 +79,7 @@ export class ConfigController {
   @Patch('sources/:id')
   @Roles('admin')
   async updateSource(@Param('id') id: string, @Body() body: unknown, @Actor() a: Principal) {
-    const data = parse(SourceIn.partial(), body);
+    const data = parse(SourceIn.partial().refine(hasValidRunWindow, RUN_WINDOW_ERROR), body);
     const s = await tx(this.db, async (t) => {
       const current = await t.source.findUniqueOrThrow({ where: { id } });
       const connector = data.connector ?? current.connector;
@@ -78,6 +90,7 @@ export class ConfigController {
         where: { id, connector: current.connector, externalRef: current.externalRef },
         data: {
           ...data,
+          ...(data.enabled === false && { runNowFrom: null, runNowUntil: null, runNowLimit: null, runNowVariantIds: [] }),
           ...(reset && {
             watermark: Prisma.DbNull, baselineDone: false, lastPollAt: null, lastSuccessAt: null,
             lastError: null, lastErrorAt: null, lastIncomplete: Prisma.DbNull,
@@ -89,6 +102,63 @@ export class ConfigController {
       return t.source.findUniqueOrThrow({ where: { id } });
     });
     return out(s);
+  }
+
+  @Post('source-runs')
+  @Roles('admin')
+  async startSourceRun(@Body() body: unknown, @Actor() actor: Principal) {
+    const input = parse(z.object({
+      sourceIds: z.array(z.string().uuid()).max(50).default([]),
+      variantIds: z.array(z.string().uuid()).max(200).default([]),
+      durationMinutes: z.number().int().min(5).max(1440),
+      limit: z.number().int().min(1).max(10),
+    }).refine(value => !!value.sourceIds.length !== !!value.variantIds.length, 'Chọn nguồn hoặc chọn bài cần chạy.'), body);
+    const now = this.clock.now();
+    const from = new Date(Math.floor(+now / 60_000) * 60_000);
+    const until = new Date(+now + input.durationMinutes * 60_000);
+    return tx(this.db, async t => {
+      const variantIds = [...new Set(input.variantIds)];
+      const variants = variantIds.length ? await t.contentVariant.findMany({
+        where: { id: { in: variantIds }, status: 'READY', OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+          revision: { post: { archivedAt: null } } }, select: {
+          id: true, targetId: true, revision: { select: { post: { select: { sourceId: true } } } },
+        },
+      }) : [];
+      if (variants.length !== variantIds.length) throw new ConflictException('Có bài vừa đổi trạng thái hoặc đã hết hạn.');
+      const perTarget = new Map<string, number>();
+      for (const variant of variants) {
+        const count = (perTarget.get(variant.targetId) ?? 0) + 1;
+        if (count > input.limit) throw new ConflictException('Số bài đã chọn cho một đích vượt giới hạn lượt của đợt.');
+        perTarget.set(variant.targetId, count);
+      }
+      const sourceIds = [...new Set([...input.sourceIds, ...variants.map(v => v.revision.post.sourceId)])];
+      await t.$queryRaw`SELECT id FROM sources WHERE id=ANY(${sourceIds}::uuid[]) ORDER BY id FOR UPDATE`;
+      const sources = await t.source.findMany({ where: { id: { in: sourceIds }, mappings: { some: { enabled: true, target: { enabled: true } } } } });
+      if (sources.length !== sourceIds.length) throw new ConflictException('Mỗi nguồn phải có luồng và đích đang bật.');
+      for (const source of sources) {
+        const continuing = source.runNowUntil && source.runNowUntil > now;
+        const canScan = source.connector !== 'manual' && !await activeLease(t, sourceResource(source.id), now);
+        await t.source.update({ where: { id: source.id }, data: {
+          enabled: true, runNowFrom: continuing ? source.runNowFrom : from, runNowUntil: until, runNowLimit: input.limit,
+          runNowVariantIds: variants.filter(v => v.revision.post.sourceId === source.id).map(v => v.id),
+          lastPollAt: canScan ? null : undefined,
+        } });
+        await audit(t, { entityType: 'source', entityId: source.id, action: 'run_started', actor: actor.actor, at: now,
+          data: { until: until.toISOString(), limit: input.limit } });
+      }
+      return { started: sources.length, until };
+    });
+  }
+
+  @Post('sources/:id/stop-run')
+  @Roles('admin')
+  async stopSourceRun(@Param('id', ParseUUIDPipe) id: string, @Actor() actor: Principal) {
+    const now = this.clock.now();
+    await tx(this.db, async t => {
+      await t.source.update({ where: { id }, data: { runNowFrom: null, runNowUntil: null, runNowLimit: null, runNowVariantIds: [] } });
+      await audit(t, { entityType: 'source', entityId: id, action: 'run_stopped', actor: actor.actor, at: now });
+    });
+    return { ok: true };
   }
 
   @Post('sources/:id/poll')
@@ -117,7 +187,7 @@ export class ConfigController {
 
   @Get('targets')
   async targets() {
-    return out(await this.db.targetAccount.findMany({ orderBy: { code: 'asc' }, include: { profile: true } }));
+    return out(await this.db.targetAccount.findMany({ orderBy: { code: 'asc' }, include: { profile: true }, omit: { profileDetails: true } }));
   }
   @Post('targets')
   @Roles('admin')

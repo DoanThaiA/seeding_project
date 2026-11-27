@@ -30,6 +30,21 @@ export function facebookPostLink(value: unknown) {
   return { url, id };
 }
 
+/** Accept a direct post link or a Facebook share link that must be resolved in a checked session. */
+export function facebookScriptPost(value: string) {
+  const direct = facebookPostLink(value);
+  if (direct && /^[A-Za-z0-9_]{1,160}$/.test(direct.id)) {
+    const set = /^\/photo(?:\.php)?\/?$/.test(direct.url.pathname) && new URL(value).searchParams.get('set');
+    if (set && /^(?:a|pcb)\.\d{1,30}$/.test(set)) direct.url.searchParams.set('set', set);
+    return { url: direct.url, id: direct.id };
+  }
+  const shared = facebookUrl(value);
+  if (!shared || !/^\/share\/(?:[prv]\/)?[A-Za-z0-9_-]{1,160}\/?$/.test(shared.pathname)) return null;
+  shared.search = '';
+  shared.hash = '';
+  return { url: shared, id: null };
+}
+
 /**
  * Facebook writes a comment id either as digits or as base64 of "comment:<post>_<comment>"
  * (links copied from notifications). Return the digits so ids from both forms compare equal.
@@ -39,6 +54,23 @@ export function facebookCommentId(value: string | null | undefined): string | nu
   try {
     return /^comment:\d+_(\d+)$/.exec(atob(value.replace(/-/g, '+').replace(/_/g, '/')))?.[1] ?? value;
   } catch { return value; }
+}
+
+export function facebookScriptComment(value: string | null | undefined) {
+  const url = facebookUrl(value);
+  if (!url) return null;
+  const root = facebookCommentId(url.searchParams.get('comment_id'));
+  const reply = facebookCommentId(url.searchParams.get('reply_comment_id'));
+  const valid = (id: string) => /^[A-Za-z0-9_:-]{1,150}$/.test(id);
+  if (!root || !valid(root) || (url.searchParams.has('reply_comment_id') && (!reply || !valid(reply) || reply === root))) return null;
+  url.searchParams.delete('comment_id');
+  url.searchParams.delete('reply_comment_id');
+  const post = facebookScriptPost(url.href);
+  if (!post?.id) return null;
+  const comment = new URL(post.url);
+  comment.searchParams.set('comment_id', root);
+  if (reply) comment.searchParams.set('reply_comment_id', reply);
+  return { url: comment, postId: post.id, root, reply, id: reply ?? root };
 }
 
 /**

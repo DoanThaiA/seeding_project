@@ -28,8 +28,10 @@ export interface ProfilePost {
   gallery?: boolean;
   galleryWrapCount?: number;
   galleryPayload?: boolean;
+  detailPhotoIds?: string[];
   playbackVideoId?: string;
   timeText?: string;
+  missingPermalink?: boolean;
 }
 
 const CRC = (() => {
@@ -76,6 +78,8 @@ export class MockProfile {
   baseUrl = '';
   imageHits = 0;
   guestMode = false;
+  latePostsStart?: number;
+  profileArtwork?: { avatar: string; cover: string; avatarOwner?: string };
   signedInAs?: string;
   timelineRequests: Array<{ path: string; cookie?: string }> = [];
   private server!: Server;
@@ -107,6 +111,19 @@ export class MockProfile {
       if (url.pathname === '/me') {
         res.writeHead(302, { location: `/profile.php?id=${this.signedInAs ?? this.userId}` });
         return res.end();
+      }
+      if (this.profileArtwork && url.pathname === '/profile.php') {
+        const header = { id: this.userId, profilePhoto: { id: this.profileArtwork.avatar },
+          cover_photo: { photo: { id: this.profileArtwork.cover } } };
+        return html(`<h1>${esc(this.owner)}</h1><script type="application/json">${JSON.stringify(header)}</script>`);
+      }
+      if (this.profileArtwork && url.pathname === '/photo/') {
+        const id = url.searchParams.get('fbid');
+        if (id === this.profileArtwork.avatar || id === this.profileArtwork.cover) {
+          const owner = id === this.profileArtwork.avatar ? this.profileArtwork.avatarOwner ?? this.userId : this.userId;
+          const image = { uri: `${this.baseUrl}/img/${id}.png`, width: 4, height: 4 };
+          return html(`<script type="application/json">${JSON.stringify({ id, owner: { id: owner }, image })}</script>`);
+        }
       }
       if (this.guestMode && url.pathname === '/video.mp4') {
         res.writeHead(200, { 'content-type': 'video/mp4' });
@@ -143,6 +160,18 @@ export class MockProfile {
       }
       if (this.guestMode && url.pathname.includes('/posts/')) {
         const p = this.posts.find(post => url.pathname.endsWith('/' + post.id));
+        if (p?.detailPhotoIds?.length) {
+          const ids = p.detailPhotoIds;
+          const set = 'pcb.112233';
+          const media = (id: string) => ({ id, __typename: 'Photo' });
+          const attachment = ids.length === 1
+            ? { target: media(ids[0]), media: media(ids[0]) }
+            : { target: { id: Buffer.from('mediaset:' + set).toString('base64') }, all_subattachments: { nodes: ids.map(id => ({ media: media(id) })) } };
+          const story = { message: { text: p.text }, attachments: [attachment] };
+          const node_v2 = { id: p.id, permalink_url: this.baseUrl + url.pathname, comet_sections: { content: { story } } };
+          return html('<main>' + ['999', ...ids].map(id => `<a href="/photo/?fbid=${id}${ids.includes(id) && ids.length > 1 ? '&amp;set=' + set : ''}"><img src="/img/${id}.png"></a>`).join('') +
+            `<script type="application/json">${JSON.stringify({ result: { data: { node_v2 } } })}</script></main>`);
+        }
         if (p?.emptyComments) {
           const thread = { comments: { total_count: 0, edges: [], page_info: { has_next_page: false } } };
           const story = { feedback_context: { feedback_target_with_context: {
@@ -235,7 +264,7 @@ export class MockProfile {
     const video = p.video ? '<video style="width:400px;height:220px"></video>' : '';
     return `<div class="post" ${this.guestMode && !this.signedInAs ? 'role="article"' : ''} style="margin:20px 0">
       <h3><a href="${this.guestMode && p.author ? '/other.profile' : '/profile.php?id=' + this.userId}">${esc(p.author ?? this.owner)}</a></h3>
-      <span><a href="#" aria-describedby="t${n}" data-real="${p.playbackVideoId ? '/reel/' + p.playbackVideoId : '/' + this.userId + '/posts/' + p.id}" onmouseover="this.href=this.dataset.real">${esc(p.timeText ?? 'Vừa xong')}</a></span>
+      <span><a href="#" aria-describedby="t${n}" data-real="${p.playbackVideoId ? '/reel/' + p.playbackVideoId : '/' + this.userId + '/posts/' + p.id}" ${p.missingPermalink ? '' : 'onmouseover="this.href=this.dataset.real"'}>${esc(p.timeText ?? 'Vừa xong')}</a></span>
       <div ${p.messageRoleOnly ? 'data-ad-rendering-role="story_message"' : 'data-ad-preview="message"'} data-full="${esc(p.text)}">
         ${p.quoteBackground ? `<div style="width:400px;height:220px;background-image:url('/img/${n * 10}.png');background-size:cover">${shown}</div>` : shown}
       </div>
@@ -245,13 +274,20 @@ export class MockProfile {
   }
 
   private page(): string {
-    const posts = this.posts.map((p, i) => this.post(p, i + 1)).join('') || (this.guestMode ? '<p>Chưa có bài viết nào</p>' : '');
+    const cards = this.posts.map((p, i) => this.post(p, i + 1));
+    const posts = cards.slice(0, this.latePostsStart ?? cards.length).join('') || (this.guestMode ? '<p>Chưa có bài viết nào</p>' : '');
+    const late = this.latePostsStart === undefined ? '' : cards.slice(this.latePostsStart).join('');
     return `<!doctype html><html lang="vi"><body>
       <h1>${esc(this.owner)}</h1>
       ${this.guestMode && !this.signedInAs ? '<form><input type="password" name="pass"></form>' : ''}
       <div style="height:1500px">Giới thiệu · Bạn bè · Ảnh</div>
       <div id="posts"></div><div style="height:2500px"></div>
       <script>const html=${JSON.stringify(posts)};let done=false;const f=()=>{if(!done&&window.scrollY>300){done=true;document.getElementById('posts').innerHTML=html;}};addEventListener('scroll',f);f();</script>
+      ${late ? `<script>const more=${JSON.stringify(late)}; let loaded=false; addEventListener('scroll',()=>{
+        if(!loaded && window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2) {
+          loaded=true;document.getElementById('posts').insertAdjacentHTML('beforeend', more);
+        }
+      })</script>` : ''}
     </body></html>`;
   }
 }

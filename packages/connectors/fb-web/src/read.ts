@@ -137,7 +137,7 @@ export class FbWebReadConnector implements ReadConnector {
       await page.goto(`${this.opts.baseUrl}/me`, { waitUntil: 'domcontentloaded', timeout: this.opts.stepTimeoutMs * 2 });
       await page.waitForLoadState('load').catch(() => undefined);
       await this.assertOwnProfile(page, source);
-      const posts = await this.collect(page, source.code, Math.max(this.maxPosts, overlap));
+      const posts = await this.collect(page, source.code, source.maxPosts ?? Math.max(this.maxPosts, overlap));
       const newest = posts.reduce((m, p) => Math.max(m, p.postedAt?.getTime() ?? 0), Number((watermark as { newest?: number } | null)?.newest ?? 0));
       return { posts, nextWatermark: { newest }, incomplete: [] };
     } finally {

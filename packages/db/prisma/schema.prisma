@@ -167,9 +167,19 @@ model Source {
   externalRef     String    @map("external_ref") // URL or ID of the source
   connector       String // read connector key: "fake" | "manual" | "fb-graph" | "fb-web" | "fb-public"
   enabled         Boolean   @default(true)
+  runStartMinute  Int?      @map("run_start_minute")
+  runEndMinute    Int?      @map("run_end_minute")
+  publishIntervalMin Int?   @map("publish_interval_min")
+  runNowFrom      DateTime? @map("run_now_from") @db.Timestamptz(3)
+  runNowUntil     DateTime? @map("run_now_until") @db.Timestamptz(3)
+  runNowLimit     Int?      @map("run_now_limit")
+  runNowVariantIds String[] @default([]) @map("run_now_variant_ids") @db.Uuid
   pollIntervalSec Int       @default(300) @map("poll_interval_sec")
+  pollPostLimit   Int?      @map("poll_post_limit")
   overlapCount    Int       @default(5) @map("overlap_count")
-  collectComments Boolean   @default(false) @map("collect_comments")
+  collectComments Boolean   @default(true) @map("collect_comments")
+  publishComments Boolean   @default(true) @map("publish_comments")
+  resetGeneration Int       @default(0) @map("reset_generation")
   watermark       Json? // connector-defined cursor, only advanced after results are stored
   baselineDone    Boolean   @default(false) @map("baseline_done")
   lastPollAt      DateTime? @map("last_poll_at") @db.Timestamptz(3)
@@ -183,6 +193,7 @@ model Source {
   posts    SourcePost[]
   mappings SourceTargetMapping[]
   postAliases SourcePostAlias[]
+  groups ProfileGroup[] @relation("ProfileGroupSources")
 
   @@map("sources")
 }
@@ -197,6 +208,7 @@ model TargetAccount {
   uiLocale     String   @default("vi-VN") @map("ui_locale")
   enabled      Boolean  @default(true)
   styleProfile Json     @default("{}") @map("style_profile") // caption style config for the LLM
+  profileDetails Json?  @map("profile_details")
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
@@ -208,6 +220,8 @@ model TargetAccount {
   capabilities CapabilityCheck[]
   commentAuthors      PublicationComment[] @relation("CommentAuthor")
   commentDestinations PublicationComment[] @relation("CommentDestination")
+  groups ProfileGroup[] @relation("ProfileGroupTargets")
+  scriptSteps CommentScriptStep[]
 
   @@map("target_accounts")
 }
@@ -228,9 +242,109 @@ model SourceTargetMapping {
   source Source        @relation(fields: [sourceId], references: [id])
   target TargetAccount @relation(fields: [targetId], references: [id])
   profileSyncs ProfileSync[]
+  artwork     ProfileArtwork?
+  details     ProfileDetailsScan?
 
   @@unique([sourceId, targetId])
   @@map("source_target_mappings")
+}
+
+model ProfileDetailsScan {
+  mappingId        String   @id @map("mapping_id") @db.Uuid
+  requestId        String   @map("request_id") @db.Uuid
+  sourceRef        String   @map("source_ref")
+  sourceConnector  String   @map("source_connector")
+  targetExternalId String   @map("target_external_id")
+  status           String
+  snapshot         Json?
+  error            String?
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  bioJobId         String?  @map("bio_job_id") @db.Uuid
+  bioStatus        String   @default("IDLE") @map("bio_status")
+  bioUpdatedAt     DateTime? @map("bio_updated_at") @db.Timestamptz(3)
+  bioError         String?  @map("bio_error")
+  mapping SourceTargetMapping @relation(fields: [mappingId], references: [id], onDelete: Cascade)
+
+  @@map("profile_details_scans")
+}
+
+model ProfileGroup {
+  id          String @id @default(uuid()) @db.Uuid
+  name        String @unique
+  description String @default("")
+  sources     Source[] @relation("ProfileGroupSources")
+  targets     TargetAccount[] @relation("ProfileGroupTargets")
+
+  @@map("profile_groups")
+}
+
+model CommentScript {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String
+  postUrl     String    @map("post_url")
+  resolvedUrl String?   @map("resolved_url")
+  version     Int       @default(1)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  startedAt   DateTime? @map("started_at") @db.Timestamptz(3)
+  steps CommentScriptStep[]
+
+  @@index([createdAt])
+  @@map("comment_scripts")
+}
+
+enum CommentScriptStepStatus {
+  DRAFT
+  QUEUED
+  SENDING
+  FAILED
+  UNKNOWN
+  POSTED
+}
+
+model CommentScriptStep {
+  id          String @id @default(uuid()) @db.Uuid
+  scriptId    String @map("script_id") @db.Uuid
+  targetId    String @map("target_id") @db.Uuid
+  position    Int
+  replyTo     Int?   @map("reply_to")
+  replyUrl    String? @map("reply_url")
+  text        String
+  status      CommentScriptStepStatus @default(DRAFT)
+  sendVersion Int @default(0) @map("send_version")
+  detail      String?
+  externalId  String? @map("external_id")
+  permalink   String?
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  script CommentScript @relation(fields: [scriptId], references: [id], onDelete: Cascade)
+  target TargetAccount @relation(fields: [targetId], references: [id])
+
+  @@unique([scriptId, position])
+  @@unique([scriptId, externalId])
+  @@index([status, updatedAt])
+  @@map("comment_script_steps")
+}
+
+model ProfileArtwork {
+  mappingId       String   @id @map("mapping_id") @db.Uuid
+  requestId       String   @map("request_id") @db.Uuid
+  sourceRef       String   @map("source_ref")
+  sourceConnector String   @map("source_connector")
+  targetExternalId String  @map("target_external_id")
+  status          String
+  images          Json     @default("{}")
+  error           String?
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  applyId         String?  @map("apply_id") @db.Uuid
+  applyStatus     String   @default("IDLE") @map("apply_status")
+  applyUpdatedAt  DateTime? @map("apply_updated_at") @db.Timestamptz(3)
+  applyError      String?  @map("apply_error")
+  applyKind       String?  @map("apply_kind")
+  priorPhotoId    String?  @map("prior_photo_id")
+  appliedAvatarId String?  @map("applied_avatar_id")
+  appliedCoverId  String?  @map("applied_cover_id")
+  mapping         SourceTargetMapping @relation(fields: [mappingId], references: [id], onDelete: Cascade)
+
+  @@map("profile_artwork")
 }
 
 // ─────────────────────────── Infrastructure ───────────────────────────
@@ -296,6 +410,7 @@ model CapabilityCheck {
 model SourcePost {
   id                 String             @id @default(uuid()) @db.Uuid
   sourceId           String             @map("source_id") @db.Uuid
+  resetGeneration    Int                @default(0) @map("reset_generation")
   externalId         String             @map("external_id")
   identityConfidence IdentityConfidence @map("identity_confidence")
   permalink          String?
@@ -318,7 +433,8 @@ model SourcePost {
   syncItems ProfileSyncItem[]
   aliases   SourcePostAlias[]
 
-  @@unique([sourceId, externalId])
+  @@unique([sourceId, resetGeneration, externalId])
+  @@index([sourceId, resetGeneration, firstSeenAt, id], map: "source_posts_reset_generation_idx")
   @@index([sourceId, firstSeenAt, id])
   @@index([sourceId, id])
   @@index([sourceId, postedAt])
@@ -326,9 +442,10 @@ model SourcePost {
 }
 
 // Another platform id under which a stored post was read again (Facebook rotates a post's
-// pfbid between sessions). (source, id) is never used twice: by a post or by an alias.
+// pfbid between sessions). An id identifies one post or alias within a source generation.
 model SourcePostAlias {
   sourceId     String   @map("source_id") @db.Uuid
+  resetGeneration Int  @default(0) @map("reset_generation")
   externalId   String   @map("external_id")
   sourcePostId String   @map("source_post_id") @db.Uuid
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -336,7 +453,7 @@ model SourcePostAlias {
   source Source     @relation(fields: [sourceId], references: [id])
   post   SourcePost @relation(fields: [sourcePostId], references: [id])
 
-  @@id([sourceId, externalId])
+  @@id([sourceId, resetGeneration, externalId])
   @@index([sourcePostId])
   @@map("source_post_aliases")
 }
@@ -347,6 +464,7 @@ model ProfileSync {
   phase        ProfileSyncPhase
   step         Int              @default(0)
   history      Boolean
+  publish      Boolean          @default(false)
   historyDone  Boolean          @default(false) @map("history_done")
   historyCursor String?         @map("history_cursor")
   archiveCursor String?         @map("archive_cursor") @db.Uuid
@@ -367,6 +485,8 @@ model ProfileSyncItem {
   sourcePostId    String  @map("source_post_id") @db.Uuid
   preparedVariantId String? @map("prepared_variant_id") @db.Uuid
   commentScanId   String? @map("comment_scan_id") @db.Uuid
+  publishStatus   String? @map("publish_status")
+  publishDetail   String? @map("publish_detail")
 
   sync ProfileSync @relation(fields: [syncId], references: [id])
   post SourcePost @relation(fields: [sourcePostId], references: [id])
@@ -374,6 +494,7 @@ model ProfileSyncItem {
   commentScan CommentScan? @relation(fields: [commentScanId], references: [id])
   @@id([syncId, sourcePostId])
   @@index([commentScanId])
+  @@index([syncId, publishStatus])
   @@map("profile_sync_items")
 }
 
@@ -525,25 +646,48 @@ model ContentCheck {
 
 // ─────────────────────────── Scheduling & publishing ───────────────────────────
 
+model PublicationSchedule {
+  id              String   @id @default(uuid()) @db.Uuid
+  startsAt        DateTime @map("starts_at") @db.Timestamptz(3)
+  intervalMinutes Int      @map("interval_minutes")
+  limit           Int
+  sourceIds       String[] @map("source_ids") @db.Uuid
+  createdBy       String   @map("created_by")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  stoppedAt       DateTime? @map("stopped_at") @db.Timestamptz(3)
+
+  slots PublicationSlot[]
+
+  @@index([createdAt])
+  @@map("publication_schedules")
+}
+
 model PublicationSlot {
   id            String     @id @default(uuid()) @db.Uuid
   targetId      String     @map("target_id") @db.Uuid
-  slotAt        DateTime   @map("slot_at") @db.Timestamptz(3) // Scheduled slots start on the hour.
+  slotAt        DateTime   @map("slot_at") @db.Timestamptz(3)
   manual        Boolean    @default(false)
   status        SlotStatus @default(PLANNED)
   reason        String?
   publicationId String?    @map("publication_id") @db.Uuid
+  scheduleId    String?    @map("schedule_id") @db.Uuid
+  scheduledVariantId String? @map("scheduled_variant_id") @db.Uuid
+  scheduleSourceIds String[] @default([]) @map("schedule_source_ids") @db.Uuid
   createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   target TargetAccount @relation(fields: [targetId], references: [id])
+  schedule PublicationSchedule? @relation(fields: [scheduleId], references: [id], onDelete: Restrict)
 
   @@unique([targetId, slotAt])
   @@index([status, slotAt])
+  @@index([scheduleId, slotAt])
+  @@index([scheduledVariantId, status])
   @@map("publication_slots")
 }
 
 model Publication {
+  autoReplayComments Boolean @default(false) @map("auto_replay_comments")
   id             String            @id @default(uuid()) @db.Uuid
   targetId       String            @map("target_id") @db.Uuid
   sourcePostId   String            @map("source_post_id") @db.Uuid
@@ -580,6 +724,7 @@ model PublicationComment {
   destinationId   String              @map("destination_id") @db.Uuid
   sourceCommentId String              @map("source_comment_id") @db.Uuid
   authorTargetId  String?             @map("author_target_id") @db.Uuid
+  autoAuthor      Boolean             @default(false) @map("auto_author")
   text            String
   status          CommentReplayStatus @default(DRAFT)
   sendVersion     Int                 @default(0) @map("send_version")

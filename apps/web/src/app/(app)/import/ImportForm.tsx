@@ -112,7 +112,7 @@ export function ImportForm({ sources }: { sources: Array<{ id: string; label: st
           return setMsg({ kind: 'err', text: Array.isArray(m) ? m.join('; ') : (m ?? `Lỗi ${res.status}`) });
         }
         const kind: Record<string, string> = { TEXT: 'bài chữ', SINGLE_PHOTO: 'bài 1 ảnh', MULTI_PHOTO: `bài ${data.files} ảnh`, VIDEO: 'bài video' };
-        setMsg({ kind: 'ok', text: `Đã nhập ${kind[data.contentType ?? ''] ?? data.contentType}. Bài sẽ xuất hiện ở Duyệt bài hoặc Lịch & backlog sau ít phút, và được đăng ở đầu giờ kế tiếp.` });
+        setMsg({ kind: 'ok', text: `Đã nhập ${kind[data.contentType ?? ''] ?? data.contentType}. Khi bài xử lý xong, mở Duyệt bài hoặc Lịch & bài chờ để tiếp tục.` });
         setText('');
         setAlbumTitle('');
         clearAll();

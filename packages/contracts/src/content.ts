@@ -14,6 +14,7 @@ export const COMMENT_READERS: readonly string[] = ['fb-public', 'fb-session', 'f
 export const COMMENT_STALL_MS = 5 * 60_000;
 /** How long a queued comment may wait (behind its parent and other comments) before the send has to be repeated. */
 export const COMMENT_QUEUE_MS = 20 * 60_000;
+export const MAX_POLL_POSTS = 100;
 /** Retries, 30 s apart, while a queued comment waits for its parent or a busy profile: under COMMENT_QUEUE_MS. */
 export const COMMENT_PUBLISH_RETRIES = 30;
 export const FB_CAPABILITY_MIN_CASES = 20;

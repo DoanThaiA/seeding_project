@@ -3,10 +3,13 @@ import { ApiError, apiGet, can, getSession } from '@/lib/api';
 import { ActionButton, AutoRefresh } from '@/components/client';
 import { Badge } from '@/components/ui';
 import { fmtTime, reasonText } from '@/lib/format';
+import { SUCCESS } from '@seedingsys/contracts';
 import { PostWorkspace } from './PostWorkspace';
-import { ProfileSyncPanel } from './ProfileSyncPanel';
-import type { Listing, PostDetail, Profiles, ProfileSyncOption } from './types';
+import { ProfilePicker } from './ProfilePicker';
+import type { Listing, PostDetail, Profiles } from './types';
 import styles from './library.module.css';
+
+const UUID = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i;
 
 function href(query: Record<string, string | undefined>) {
   const search = new URLSearchParams();
@@ -20,52 +23,60 @@ export default async function LibraryPage({ searchParams }: { searchParams: Prom
   const read = (key: string) => typeof input[key] === 'string' ? input[key] : undefined;
   const profiles = await apiGet<Profiles>('/library/profiles', session.token);
   const choices = [...profiles.sources, ...profiles.targets];
-  const profile = choices.find(p => p.code === read('profile')) ?? choices[0];
-  if (!profile) return <><h1>Kho bài viết</h1><p>Thêm profile nguồn hoặc đích trong Quản trị luồng đăng để xem bài tại đây.</p></>;
+  const profile = choices.find(p => p.code === read('profile')?.toUpperCase()) ?? choices[0];
+  if (!profile) return <><h1>Hồ sơ A và B</h1><p>Chưa có hồ sơ nguồn hoặc đích.</p>
+    {can.admin(session.role) && <Link href="/settings">Mở Quản trị luồng đăng</Link>}</>;
   const q = (read('q') ?? '').slice(0, 120);
   const trash = read('trash') === '1' ? '1' : undefined;
   const page = Math.max(1, Math.min(2000, Number.parseInt(read('page') ?? '1', 10) || 1));
-  const postId = read('post');
+  const postId = read('post')?.toLowerCase();
   const query = new URLSearchParams({ page: String(page), q, ...(trash && { trash }) });
-  const [listing, syncs] = await Promise.all([
+  const [listing, candidate] = await Promise.all([
     apiGet<Listing>(`/library/profiles/${encodeURIComponent(profile.code)}?` + query, session.token),
-    profiles.sources.some(s => s.id === profile.id) ? apiGet<ProfileSyncOption[]>(`/library/profiles/${encodeURIComponent(profile.code)}/syncs`, session.token) : [],
+    postId && UUID.test(postId) ? apiGet<PostDetail>('/library/posts/' + postId, session.token).catch(error => {
+      if (!(error instanceof ApiError) || error.status !== 404) throw error;
+      return null;
+    }) : null,
   ]);
-  const chosen = listing.posts.find(p => p.id === postId);
-  const detail = chosen ? await apiGet<PostDetail>('/library/posts/' + chosen.id, session.token).catch(error => {
-    if (!(error instanceof ApiError) || error.status !== 404) throw error;
-    return null;
-  }) : null;
-  const s = profiles.sources.find(item => item.code === profile.code);
+  const source = profiles.sources.find(item => item.id === profile.id);
+  const target = profiles.targets.find(item => item.id === profile.id);
+  const belongsToProfile = candidate && (source
+    ? candidate.source.id === profile.id && !!candidate.post.archivedAt === !!trash
+    : candidate.destinations.some(destination => destination.target.id === profile.id && (destination.variant || destination.publication)
+      && (!candidate.post.archivedAt || (!!destination.publication && SUCCESS.includes(destination.publication.status)))));
+  const detail = belongsToProfile ? candidate : null;
+  const requestedTarget = listing.kind === 'target' ? profile.code : read('to');
   const canReview = can.review(session.role);
   const canOperate = can.operate(session.role);
 
   return (
     <div className={styles.workspace}>
       <header className={styles.heading}>
-        <div><h1>Kho bài viết</h1><p className="muted">Xem bài đã thu thập, bản chờ đăng và bài đã đăng theo profile.</p></div>
-        {s?.enabled && can.admin(session.role) && <ActionButton path={`sources/${s.id}/poll`}>Quét bài của {s.code}</ActionButton>}
+        <h1>Hồ sơ A và B</h1>
+        <ProfilePicker profiles={profiles} selected={profile.code} />
       </header>
-      <nav className={styles.profileBar} aria-label="Profile bài viết">
-        <div><span>Nguồn</span>{profiles.sources.map(p => <Link key={p.id} href={href({ profile: p.code })}
-          aria-current={p.id === profile.id ? 'page' : undefined} title={p.name}><strong>{p.code}</strong><small>{p._count.posts}</small></Link>)}</div>
-        <div><span>Đích</span>{profiles.targets.map(p => <Link key={p.id} href={href({ profile: p.code })}
-          aria-current={p.id === profile.id ? 'page' : undefined} title={p.name}><strong>{p.code}</strong><small>{p._count.publications} đã đăng</small></Link>)}</div>
-      </nav>
-      {s && !trash && <ProfileSyncPanel key={s.id} code={s.code} connector={s.connector} enabled={s.enabled} options={syncs} canOperate={canOperate} canReview={canReview} />}
-      {(syncs.some(o => o.latest && ['DISCOVERING','PREPARING'].includes(o.latest.phase)) ||
-        syncs.some(o => (o.latest?.stats?.scansPending ?? 0) > 0)) && <AutoRefresh seconds={5} />}
+      <section className={styles.profileBar} aria-label="Thông tin hồ sơ">
+        <div>
+          <Badge s={profile.enabled ? 'OK' : 'PAUSED'} text={profile.enabled ? 'Đang bật' : 'Đã tắt'} />
+          <strong>{profile.code} · {profile.name}</strong>
+          <span className="muted">{source ? `${source._count.posts} bài đã lưu` : `${target?._count.publications ?? 0} bài đã đăng`}</span>
+        </div>
+        <div className="actions">
+          {source?.enabled && can.admin(session.role) && <ActionButton path={`sources/${source.id}/poll`}>Quét bài của {source.code}</ActionButton>}
+          <Link className="btn" href={{ pathname: '/profile-sync', query: source ? { source: profile.code } : { target: profile.code } }}>Đồng bộ hồ sơ</Link>
+        </div>
+      </section>
       <div className={styles.body}>
         <aside className={styles.list}>
-          <div className={styles.listHeading}><strong>{profile.code} · {profile.name}</strong> <Badge s={profile.enabled ? 'OK' : 'PAUSED'} /></div>
-          {s && <div className={styles.trashNav}>
+          <div className={styles.listHeading}><strong>{source ? 'Bài nguồn' : 'Bài của tài khoản đích'}</strong></div>
+          {source && <div className={styles.trashNav}>
             <Link href={href({ profile: profile.code })} aria-current={!trash ? 'page' : undefined}>Bài trong kho</Link>
             <Link href={href({ profile: profile.code, trash: '1' })} aria-current={trash ? 'page' : undefined}>Thùng rác</Link>
           </div>}
-          {s && <p className="muted">
-            {s.lastSuccessAt ? `Lưu kết quả quét ${fmtTime(s.lastSuccessAt)}` : 'Chưa có lượt quét thành công'}
-            {!!s.lastIncomplete?.length && <><br />{s.lastIncomplete.map(reasonText).join(' · ')}</>}
-            {s.lastError && <><br /><span className="err">{s.lastError}</span></>}
+          {source && <p className="muted">
+            {source.lastSuccessAt ? `Quét lần cuối ${fmtTime(source.lastSuccessAt)}` : 'Chưa có lượt quét thành công'}
+            {!!source.lastIncomplete?.length && <><br />{source.lastIncomplete.map(reasonText).join(' · ')}</>}
+            {source.lastError && <><br /><span className="err">{source.lastError}</span></>}
           </p>}
           {listing.kind === 'target' && <p className="muted">Các bài do SeedingSys theo dõi cho {profile.code}.</p>}
           <form action="/library" className={styles.search}>
@@ -77,7 +88,7 @@ export default async function LibraryPage({ searchParams }: { searchParams: Prom
           {!listing.posts.length && <p className="muted">{q ? 'Không tìm thấy bài phù hợp.' : trash ? 'Thùng rác trống.' : 'Profile này chưa có bài trong kho.'}</p>}
           {listing.posts.map(p => (
             <Link className={styles.listItem} key={p.id} href={href({ profile: profile.code, q, page: String(page), post: p.id, trash })}
-              aria-current={chosen?.id === p.id ? 'page' : undefined}>
+              aria-current={detail?.post.id === p.id ? 'page' : undefined}>
               <div><Badge s={p.contentType} /> {p.archivedAt ? <Badge s="CANCELLED" text="Trong thùng rác" /> : <Badge s={p.status} />}</div>
               <strong>{p.snippet || 'Bài không có caption'}</strong>
               <span>{p.sourceCode} · {fmtTime(p.date)} · {p.commentCount} bình luận đã lưu</span>
@@ -94,10 +105,10 @@ export default async function LibraryPage({ searchParams }: { searchParams: Prom
         <section className={styles.detail} aria-label="Xem trước bài viết">
           {detail ? <>
             <AutoRefresh seconds={detail.scan?.status === 'RUNNING' || detail.scan?.status === 'QUEUED' ? 4 : 20} />
-            <PostWorkspace key={detail.post.id + ':' + profile.code} detail={detail} requestedTarget={listing.kind === 'target' ? profile.code : read('to')}
+            <PostWorkspace key={`${detail.post.id}:${profile.code}:${requestedTarget ?? ''}`} detail={detail} requestedTarget={requestedTarget}
               canReview={canReview && !detail.post.archivedAt} canOperate={canOperate && !detail.post.archivedAt}
-              canArchive={!!s && canReview} />
-          </> : <div className={styles.empty}><h2>Chọn một bài để xem trước</h2><p>Caption, ảnh, video và cây bình luận của bài sẽ hiện ở đây.</p></div>}
+              canArchive={!!source && canReview} />
+          </> : <div className={styles.empty}><h2>{postId ? 'Không tìm thấy bài trong hồ sơ này' : 'Chọn một bài để xem chi tiết'}</h2></div>}
         </section>
       </div>
     </div>

@@ -15,7 +15,11 @@ import { createStore } from '@seedingsys/storage';
 import { DEFAULT_BROWSER_SETTINGS, handleAgentRecover, handlePublish, handleReconcile, handleSourcePoll, Semaphore, type BrowserCtx } from './index';
 import { handleCommentScan } from './handlers/comment-scan';
 import { handleCommentPublish } from './handlers/comment-publish';
+import { handleCommentScriptStep } from './handlers/comment-script';
 import { handleProfileSync } from './handlers/profile-sync';
+import { handleProfileArtwork } from './handlers/profile-artwork';
+import { handleApplyProfileArtwork } from './handlers/apply-profile-artwork';
+import { handleApplyProfileBio, handleProfileDetails } from './handlers/profile-details';
 
 async function main() {
   const cfg = loadConfig();
@@ -73,7 +77,12 @@ async function main() {
   await work(boss, Q.SourcePoll, cfg.COLLECTOR_CONCURRENCY, log, (p) => retryable(() => collectors.run(() => handleSourcePoll(ctx, p))));
   await work(boss, Q.CommentScan, 1, log, (p, job) => retryable(() => collectors.run(() => handleCommentScan(ctx, p, job.retryCount))));
   await work(boss, Q.CommentPublish, 1, log, (p, job) => retryable(() => publishers.run(() => handleCommentPublish(ctx, p, job.retryCount))));
+  await work(boss, Q.CommentScriptStep, 1, log, (p, job) => retryable(() => publishers.run(() => handleCommentScriptStep(ctx, p, job.retryCount))));
   await work(boss, Q.ProfileSync, 1, log, (p, job) => retryable(() => collectors.run(() => handleProfileSync(ctx, p, job.retryCount))));
+  await work(boss, Q.ProfileArtwork, 1, log, (p, job) => retryable(() => collectors.run(() => handleProfileArtwork(ctx, p, job.retryCount))));
+  await work(boss, Q.ApplyProfileArtwork, 1, log, (p, job) => retryable(() => publishers.run(() => handleApplyProfileArtwork(ctx, p, job.retryCount))));
+  await work(boss, Q.ProfileDetails, 1, log, (p, job) => retryable(() => collectors.run(() => handleProfileDetails(ctx, p, job.retryCount))));
+  await work(boss, Q.ApplyProfileBio, 1, log, (p, job) => retryable(() => publishers.run(() => handleApplyProfileBio(ctx, p, job.retryCount))));
   await work(boss, Q.PublishStandard, cfg.PUBLISHER_CONCURRENCY, log, (p) => retryable(() => publishers.run(() => handlePublish(ctx, p))));
   await work(boss, Q.PublishAlbum, 1, log, (p) => retryable(() => publishers.run(() => handlePublish(ctx, p))));
   await work(boss, Q.PublishVideo, cfg.VIDEO_CONCURRENCY, log, (p) => retryable(() => video.run(() => publishers.run(() => handlePublish(ctx, p)))));
