@@ -3,6 +3,7 @@ import { ingestPost, tx, type IngestPost } from '@seedingsys/db';
 import { LibraryController } from '../../apps/api/src/library.controller';
 import { OpsController } from '../../apps/api/src/ops.controller';
 import { handleProfileSync } from '../../apps/worker-browser/src/handlers/profile-sync';
+import { expireContent } from '../../apps/worker-core/src/maintenance/lease-sweeper';
 import { createHarness, MIN, type Harness } from '../helpers/harness';
 
 const actor = { actor: 'test-reviewer', role: 'reviewer' } as const;
@@ -64,5 +65,30 @@ describe('review approval', () => {
     }));
     await expect(ops.approve(variant.id, {}, actor)).rejects.toThrow('đã thay đổi');
     expect(await h.db.contentVariant.findUnique({ where: { id: variant.id } })).toMatchObject({ snapshot: null });
+  });
+
+  it('closes review tasks for newly expired and previously expired content', async () => {
+    await stage(
+      { externalId: 'just-expired', text: 'Bài vừa đến hạn', contentType: 'TEXT', media: [] },
+      { externalId: 'stale-review', text: 'Bài và việc duyệt hết hạn từ trước', contentType: 'TEXT', media: [] },
+      { externalId: 'still-open', text: 'Bài vẫn còn hiệu lực', contentType: 'TEXT', media: [] },
+    );
+    const variantFor = (externalId: string) => h.db.contentVariant.findFirstOrThrow({ where: { revision: { post: { externalId } } } });
+    const [expired, stale, active] = await Promise.all(['just-expired', 'stale-review', 'still-open'].map(variantFor));
+    const now = h.clock.now();
+    await h.db.contentVariant.update({ where: { id: expired.id }, data: { expiresAt: now } });
+    await h.db.contentVariant.update({ where: { id: stale.id }, data: { status: 'EXPIRED' } });
+    await h.db.operatorTask.updateMany({ where: { variantId: stale.id }, data: { status: 'CLAIMED', claimedBy: actor.actor } });
+    const queue = await ops.reviewQueue();
+    expect(queue).toEqual([expect.objectContaining({ id: active.id })]);
+
+    expect(await expireContent(h.core)).toBe(1);
+    expect(await expireContent(h.core)).toBe(0);
+    expect(await h.db.contentVariant.findUnique({ where: { id: expired.id } })).toMatchObject({ status: 'EXPIRED' });
+    for (const variantId of [expired.id, stale.id]) {
+      const task = await h.db.operatorTask.findFirstOrThrow({ where: { variantId } });
+      expect(task).toMatchObject({ status: 'DONE', closedAt: now, resolution: { reason: 'content_expired' } });
+    }
+    expect(await h.db.operatorTask.findFirstOrThrow({ where: { variantId: active.id } })).toMatchObject({ status: 'OPEN' });
   });
 });

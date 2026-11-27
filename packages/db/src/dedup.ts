@@ -13,10 +13,11 @@ type Q = Prisma.TransactionClient;
 export const hasUnstablePostIds = (connector: string) => isFacebookTimelineReader(connector) || connector === 'fb-web';
 
 /** The stored post for a platform id: its own id or an alias recorded when it was read again under another id. */
-export async function findSourcePost(t: Q, sourceId: string, externalId: string): Promise<SourcePost | null> {
-  const direct = await t.sourcePost.findUnique({ where: { sourceId_externalId: { sourceId, externalId } } });
+export async function findSourcePost(t: Q, sourceId: string, resetGeneration: number, externalId: string): Promise<SourcePost | null> {
+  const key = { sourceId, resetGeneration, externalId };
+  const direct = await t.sourcePost.findUnique({ where: { sourceId_resetGeneration_externalId: key } });
   if (direct) return direct;
-  const alias = await t.sourcePostAlias.findUnique({ where: { sourceId_externalId: { sourceId, externalId } }, include: { post: true } });
+  const alias = await t.sourcePostAlias.findUnique({ where: { sourceId_resetGeneration_externalId: key }, include: { post: true } });
   return alias?.post ?? null;
 }
 
@@ -37,16 +38,18 @@ const DATE_WINDOW_MS = 2 * 24 * 3_600_000;
  * The stored post of this source that a read with an unknown id actually is (oldest match wins), or null.
  * Trashed posts are included on purpose: a rotated id must not bring a trashed post back.
  */
-export async function findSamePost(t: Q, sourceId: string, read: ReadFacts): Promise<SourcePost | null> {
+export async function findSamePost(t: Q, sourceId: string, resetGeneration: number, read: ReadFacts): Promise<SourcePost | null> {
   const from = read.postedAt ? new Date(read.postedAt.getTime() - DATE_WINDOW_MS) : null;
   const to = read.postedAt ? new Date(read.postedAt.getTime() + DATE_WINDOW_MS) : null;
   const rows = await t.$queryRaw<Array<{ id: string; posted_at: Date | null; content_type: string; text: string; incomplete: unknown; raw: unknown; refs: Array<string | null> }>>`
     WITH candidates AS (
-      (SELECT id FROM source_posts WHERE source_id = ${sourceId}::uuid ORDER BY first_seen_at DESC, id DESC LIMIT ${RECENT_CANDIDATES})
+      (SELECT id FROM source_posts WHERE source_id = ${sourceId}::uuid AND reset_generation = ${resetGeneration}
+        ORDER BY first_seen_at DESC, id DESC LIMIT ${RECENT_CANDIDATES})
       UNION
-      (SELECT id FROM source_posts WHERE source_id = ${sourceId}::uuid AND posted_at BETWEEN ${from}::timestamptz AND ${to}::timestamptz)
+      (SELECT id FROM source_posts WHERE source_id = ${sourceId}::uuid AND reset_generation = ${resetGeneration}
+        AND posted_at BETWEEN ${from}::timestamptz AND ${to}::timestamptz)
       UNION
-      (SELECT id FROM source_posts WHERE source_id = ${sourceId}::uuid AND is_pinned)
+      (SELECT id FROM source_posts WHERE source_id = ${sourceId}::uuid AND reset_generation = ${resetGeneration} AND is_pinned)
     )
     SELECT sp.id, sp.posted_at, sp.content_type::text AS content_type, r.text, r.incomplete, r.raw,
       COALESCE((SELECT array_agg(a.source_ref ORDER BY pa.position) FROM post_assets pa JOIN assets a ON a.id = pa.asset_id
@@ -73,7 +76,8 @@ function facts(p: { text: string; contentType: string; flags: unknown; refs: str
 
 /** Remember that `externalId` is another id of `post`. */
 export async function recordAlias(t: Q, args: { sourceId: string; externalId: string; post: SourcePost; actor: string; now: Date }): Promise<void> {
-  await t.sourcePostAlias.createMany({ data: [{ sourceId: args.sourceId, externalId: args.externalId, sourcePostId: args.post.id, createdAt: args.now }], skipDuplicates: true });
+  await t.sourcePostAlias.createMany({ data: [{ sourceId: args.sourceId, resetGeneration: args.post.resetGeneration,
+    externalId: args.externalId, sourcePostId: args.post.id, createdAt: args.now }], skipDuplicates: true });
   await audit(t, { entityType: 'source_post', entityId: args.post.id, action: 'alias_recorded', actor: args.actor, data: { externalId: args.externalId }, at: args.now });
 }
 
@@ -123,14 +127,18 @@ const WAITING: VariantStatus[] = ['REWRITING', 'VALIDATING', 'READY', 'NEEDS_REV
  * Who already holds a content for a target: another source post that has a publication there
  * (queued, running, unresolved or done), or that was collected earlier and is still waiting for it.
  */
-function holderSql(target: Prisma.Sql, post: Prisma.Sql, key: Prisma.Sql, now: Date): Prisma.Sql {
+function holderSql(target: Prisma.Sql, post: Prisma.Sql, key: Prisma.Sql, now: Date, publicationsOnly = false): Prisma.Sql {
   return Prisma.sql`
     SELECT p.source_post_id AS id FROM publications p
     JOIN content_variants pv ON pv.id = p.variant_id
     JOIN source_post_revisions pr ON pr.id = pv.revision_id
+    JOIN source_posts prior_post ON prior_post.id = p.source_post_id
+    JOIN sources prior_source ON prior_source.id = prior_post.source_id
+    JOIN source_posts me ON me.id = ${post}
     WHERE p.target_id = ${target} AND p.source_post_id <> ${post} AND pr.content_key = ${key}
       AND p.status NOT IN ('FAILED_CONFIRMED', 'CANCELLED')
-    UNION ALL
+      AND (me.reset_generation = 0 OR prior_post.reset_generation >= prior_source.reset_generation)
+    ${publicationsOnly ? Prisma.empty : Prisma.sql`UNION ALL
     SELECT o.source_post_id FROM content_variants o
     JOIN source_post_revisions orv ON orv.id = o.revision_id
     JOIN source_posts osp ON osp.id = o.source_post_id AND osp.archived_at IS NULL AND osp.latest_revision_id = o.revision_id
@@ -138,15 +146,15 @@ function holderSql(target: Prisma.Sql, post: Prisma.Sql, key: Prisma.Sql, now: D
     WHERE o.target_id = ${target} AND o.source_post_id <> ${post} AND orv.content_key = ${key}
       AND o.status IN ('REWRITING', 'VALIDATING', 'READY', 'NEEDS_REVIEW')
       AND (o.expires_at IS NULL OR o.expires_at > ${now})
-      AND (osp.first_seen_at, osp.id) < (me.first_seen_at, me.id)
+      AND (osp.first_seen_at, osp.id) < (me.first_seen_at, me.id)`}
     LIMIT 1`;
 }
 
 /** The source post that already holds this content for the target, if any. */
-export async function contentHolder(t: Q, args: { targetId: string; sourcePostId: string; contentKey: string | null; now: Date }): Promise<string | null> {
+export async function contentHolder(t: Q, args: { targetId: string; sourcePostId: string; contentKey: string | null; now: Date; publicationsOnly?: boolean }): Promise<string | null> {
   if (!args.contentKey) return null;
   const rows = await t.$queryRaw<Array<{ id: string }>>(
-    holderSql(Prisma.sql`${args.targetId}::uuid`, Prisma.sql`${args.sourcePostId}::uuid`, Prisma.sql`${args.contentKey}`, args.now));
+    holderSql(Prisma.sql`${args.targetId}::uuid`, Prisma.sql`${args.sourcePostId}::uuid`, Prisma.sql`${args.contentKey}`, args.now, args.publicationsOnly));
   return rows[0]?.id ?? null;
 }
 
@@ -177,6 +185,15 @@ export async function retireDuplicateVariants(t: Q, args: { now: Date; actor: st
     CROSS JOIN LATERAL (${holderSql(Prisma.sql`v.target_id`, Prisma.sql`v.source_post_id`, Prisma.sql`r.content_key`, args.now)}) h
     WHERE v.status::text IN (${Prisma.join(WAITING)}) ${target}
       AND (v.expires_at IS NULL OR v.expires_at > ${args.now})
+      AND NOT EXISTS (
+        SELECT 1 FROM publication_slots slot
+        JOIN publication_schedules schedule ON schedule.id=slot.schedule_id AND schedule.stopped_at IS NULL
+        WHERE slot.scheduled_variant_id=v.id AND slot.status IN ('PLANNED','DEFERRED','RESERVED','DISPATCHED','STARTED'))
+      AND NOT EXISTS (
+        SELECT 1 FROM profile_sync_items i JOIN profile_syncs ps ON ps.id=i.sync_id
+        JOIN source_target_mappings m ON m.id=ps.mapping_id
+        WHERE i.source_post_id=v.source_post_id AND m.target_id=v.target_id AND ps.publish
+          AND ps.phase IN ('PREPARING','PREPARED') AND i.publish_status='PENDING')
       AND NOT EXISTS (
         SELECT 1 FROM publications own
         WHERE own.target_id = v.target_id AND own.source_post_id = v.source_post_id

@@ -1,6 +1,6 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
-import { COMMENT_QUEUE_MS, COMMENT_READERS, COMMENT_STALL_MS, Q, SUCCESS, UNRESOLVED, workflowFor, type PublishSnapshot } from '@seedingsys/contracts';
+import { ACTIVE, COMMENT_QUEUE_MS, COMMENT_READERS, COMMENT_STALL_MS, Q, SUCCESS, UNRESOLVED, workflowFor, type PublishSnapshot } from '@seedingsys/contracts';
 import { activeKillSwitch, audit, closeVariantReviewTasks, enqueue, freezeSnapshot, movePublication, moveSlot, openOperatorTask, Prisma, SnapshotBlockedError, tx, type Db, type Tx } from '@seedingsys/db';
 import { commentBody, commentReplayBody, facebookCommentId, facebookPostId as postId, facebookPostLink, facebookUrl, hashObject, removeAdvertisingLinks, type Clock } from '@seedingsys/domain';
 import { Roles, type Principal } from './auth';
@@ -9,6 +9,8 @@ import { Actor, parse } from './util';
 
 const SYNC_TIMEOUT_MS = 8 * 60_000;
 const PAGE_SIZE = 25;
+const syncPostChanged = Prisma.sql`(pv.revision_id<>sp.latest_revision_id
+  OR (p.last_reason IS DISTINCT FROM 'operator_native_share' AND pv.caption IS DISTINCT FROM r.text))`;
 const profileFields = { id: true, code: true, name: true, enabled: true } as const;
 const assetFields = { id: true, kind: true, status: true, mime: true } as const;
 const revisionFields = { id: true, text: true, albumTitle: true, incomplete: true, mediaStatus: true, raw: true,
@@ -89,7 +91,7 @@ export class LibraryController {
   @Get('posts/:id')
   async detail(@Param('id', ParseUUIDPipe) id: string) {
     const post = await this.db.sourcePost.findUnique({
-      where: { id }, include: { source: { select: { ...profileFields, connector: true, mappings: {
+      where: { id }, include: { source: { select: { ...profileFields, connector: true, resetGeneration: true, mappings: {
         where: { enabled: true }, select: { target: { select: { ...profileFields, audience: true } } }, orderBy: { target: { code: 'asc' } },
       } } } },
     });
@@ -112,7 +114,7 @@ export class LibraryController {
     const { source, ...record } = post;
     const timedOut = scan?.status === 'RUNNING' && +this.clock.now() - +scan.updatedAt >= COMMENT_STALL_MS;
     return {
-      post: { ...record, permalink: facebookUrl(record.permalink)?.href ?? null },
+      post: { ...record, retiredByReset: record.resetGeneration < source.resetGeneration, permalink: facebookUrl(record.permalink)?.href ?? null },
       source: { id: source.id, code: source.code, name: source.name, enabled: source.enabled, connector: source.connector },
       revision: revisionView(revision),
       scan: timedOut ? { ...scan, status: 'FAILED', detail: 'Lượt quét đã hết thời gian. Có thể quét lại.' } : scan,
@@ -146,8 +148,11 @@ export class LibraryController {
     const { archived } = parse(z.object({ archived: z.boolean() }), body);
     const now = this.clock.now();
     return tx(this.db, async t => {
-      const [post] = await t.$queryRaw<Array<{ archived_at: Date | null }>>`SELECT archived_at FROM source_posts WHERE id=${id}::uuid FOR UPDATE`;
+      const [post] = await t.$queryRaw<Array<{ archived_at: Date | null; retired: boolean }>>`
+        SELECT p.archived_at, p.reset_generation < s.reset_generation AS retired
+        FROM source_posts p JOIN sources s ON s.id=p.source_id WHERE p.id=${id}::uuid FOR UPDATE OF p`;
       if (!post) throw new NotFoundException('Không tìm thấy bài nguồn.');
+      if (!archived && post.retired) throw new ConflictException('Bài thuộc kho trước lần làm lại. Hãy quét lại bài để đưa vào kho hiện tại.');
       if (!!post.archived_at === archived) return { ok: true };
       if (archived && await t.publication.findFirst({ where: { sourcePostId: id, status: { in: [...UNRESOLVED] } }, select: { id: true } })) {
         throw new ConflictException('Bài đang đăng hoặc chờ đối soát. Hoàn tất lượt đăng trước khi xóa khỏi kho.');
@@ -187,20 +192,25 @@ export class LibraryController {
       where: { source: { code }, enabled: true },
       orderBy: { target: { code: 'asc' } },
       select: { target: { select: profileFields }, profileSyncs: { orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 1,
-        select: { id: true, phase: true, history: true, historyDone: true, detail: true, createdAt: true, updatedAt: true },
+        select: { id: true, phase: true, history: true, historyDone: true, publish: true, detail: true, createdAt: true, updatedAt: true },
       } },
     });
     const ids = mappings.flatMap(m => m.profileSyncs.map(s => s.id));
     const stats = ids.length ? await this.db.$queryRaw<Array<{
       id: string; posts: number; toReview: number; approved: number; posted: number; changed: number; missingMedia: number;
+      waiting: number; working: number; needsCheck: number; duplicates: number; blocked: number;
       comments: number; commentsDrafted: number; commentsPosted: number; scansPending: number; scansPartial: number; scansComplete: number; scansUnrequested: number;
     }>>`
       SELECT i.sync_id AS id, count(*)::int AS posts,
         count(*) FILTER (WHERE v.status='NEEDS_REVIEW' AND coalesce(p.status::text,'') NOT IN ('PUBLISHED_VERIFIED','OPERATOR_CONFIRMED'))::int AS "toReview",
         count(*) FILTER (WHERE v.status='READY' AND coalesce(p.status::text,'') NOT IN ('PUBLISHED_VERIFIED','OPERATOR_CONFIRMED'))::int AS approved,
         count(*) FILTER (WHERE p.status IN ('PUBLISHED_VERIFIED','OPERATOR_CONFIRMED'))::int AS posted,
-        count(*) FILTER (WHERE p.status IN ('PUBLISHED_VERIFIED','OPERATOR_CONFIRMED') AND (pv.revision_id<>sp.latest_revision_id
-          OR (p.last_reason IS DISTINCT FROM 'operator_native_share' AND pv.caption IS DISTINCT FROM r.text)))::int AS changed,
+        count(*) FILTER (WHERE i.publish_status='PENDING')::int AS waiting,
+        count(*) FILTER (WHERE p.status::text IN (${Prisma.join(['QUEUED', ...ACTIVE])}))::int AS working,
+        count(*) FILTER (WHERE p.status IN ('UNKNOWN','RECONCILING','NEEDS_OPERATOR'))::int AS "needsCheck",
+        count(*) FILTER (WHERE i.publish_status='DUPLICATE' AND coalesce(p.status::text,'') NOT IN ('PUBLISHED_VERIFIED','OPERATOR_CONFIRMED'))::int AS duplicates,
+        count(*) FILTER (WHERE i.publish_status='BLOCKED' OR (i.publish_status='TRACKED' AND p.status IN ('FAILED_CONFIRMED','CANCELLED')))::int AS blocked,
+        count(*) FILTER (WHERE p.status IN ('PUBLISHED_VERIFIED','OPERATOR_CONFIRMED') AND ${syncPostChanged})::int AS changed,
         count(*) FILTER (WHERE r.media_status IN ('PENDING','FAILED') OR r.incomplete ?| ARRAY['MEDIA_COUNT_UNKNOWN','MEDIA_UNAVAILABLE'])::int AS "missingMedia",
         coalesce(sum(c.stored),0)::int AS comments, coalesce(sum(c.prepared),0)::int AS "commentsDrafted", coalesce(sum(c.posted),0)::int AS "commentsPosted",
         count(*) FILTER (WHERE sc.status IN ('QUEUED','RUNNING'))::int AS "scansPending",
@@ -223,15 +233,45 @@ export class LibraryController {
     return mappings.map(({ target, profileSyncs: [latest] }) => {
       const stale = latest && ['DISCOVERING','PREPARING'].includes(latest.phase) && +now - +latest.updatedAt >= SYNC_TIMEOUT_MS;
       return { target, latest: latest ? { ...latest, stats: stats.find(s => s.id === latest.id) ?? null,
-        ...(stale && { phase: 'FAILED', detail: 'Lượt đồng bộ đã hết thời gian. Có thể chuẩn bị lại.' }),
+        ...(stale && { phase: 'FAILED', detail: 'Lượt đồng bộ đã hết thời gian. Có thể chạy lại.' }),
       } : null };
     });
+  }
+
+  @Get('syncs/:id/items')
+  async profileSyncItems(@Param('id', ParseUUIDPipe) id: string, @Query('filter') filterValue?: string, @Query('page') pageValue?: string) {
+    const { filter, page } = parse(z.object({ filter: z.enum(['all', 'posted', 'missing', 'changed']).default('all'),
+      page: z.coerce.number().int().min(1).max(10_000).default(1) }), { filter: filterValue, page: pageValue });
+    const rows = await this.db.$queryRaw<Array<{ postId: string; caption: string; state: string; reason: string | null; permalink: string | null }>>`
+      SELECT "postId", caption, state, reason, permalink FROM (
+        SELECT sp.id AS "postId", left(r.text, 120) AS caption, p.permalink, coalesce(sp.posted_at, sp.first_seen_at) AS post_time,
+          CASE WHEN p.status IN ('PUBLISHED_VERIFIED','OPERATOR_CONFIRMED') THEN CASE WHEN ${syncPostChanged} THEN 'CHANGED' ELSE 'POSTED' END
+            WHEN p.status IN ('UNKNOWN','RECONCILING','NEEDS_OPERATOR') THEN 'CHECK'
+            WHEN p.status::text IN (${Prisma.join(['QUEUED', ...ACTIVE])}) THEN 'WORKING'
+            WHEN i.publish_status='DUPLICATE' THEN 'DUPLICATE'
+            WHEN i.publish_status='BLOCKED' OR (i.publish_status='TRACKED' AND p.status IN ('FAILED_CONFIRMED','CANCELLED')) THEN 'BLOCKED'
+            ELSE 'WAITING' END AS state,
+          coalesce(CASE WHEN p.status IN ('UNKNOWN','RECONCILING','NEEDS_OPERATOR') THEN 'UNRESOLVED_PUBLICATION' END,
+            i.publish_detail, CASE WHEN p.status IN ('FAILED_CONFIRMED','CANCELLED') THEN coalesce(p.last_reason, p.status::text) END) AS reason
+        FROM profile_sync_items i JOIN profile_syncs ps ON ps.id=i.sync_id AND ps.publish
+        JOIN source_target_mappings m ON m.id=ps.mapping_id
+        JOIN source_posts sp ON sp.id=i.source_post_id AND sp.archived_at IS NULL
+        JOIN source_post_revisions r ON r.id=sp.latest_revision_id
+        LEFT JOIN publications p ON p.source_post_id=sp.id AND p.target_id=m.target_id
+        LEFT JOIN content_variants pv ON pv.id=p.variant_id
+        WHERE i.sync_id=${id}::uuid
+      ) items
+      WHERE ${filter === 'posted' ? Prisma.sql`state IN ('POSTED','CHANGED')` : filter === 'missing'
+        ? Prisma.sql`state NOT IN ('POSTED','CHANGED','DUPLICATE')` : filter === 'changed' ? Prisma.sql`state='CHANGED'` : Prisma.sql`true`}
+      ORDER BY post_time, "postId" LIMIT ${PAGE_SIZE + 1} OFFSET ${(page - 1) * PAGE_SIZE}`;
+    return { items: rows.slice(0, PAGE_SIZE).map(row => ({ ...row, permalink: facebookPostLink(row.permalink)?.url.href ?? null })),
+      more: rows.length > PAGE_SIZE };
   }
 
   @Post('profiles/:code/syncs')
   @Roles('operator')
   async queueProfileSync(@Param('code') code: string, @Body() body: unknown, @Actor() actor: Principal) {
-    const { targetId, history } = parse(z.object({ targetId: z.string().uuid(), history: z.boolean() }), body);
+    const { targetId, history, publish } = parse(z.object({ targetId: z.string().uuid(), history: z.boolean(), publish: z.boolean().default(false) }), body);
     const now = this.clock.now();
     return tx(this.db, async t => {
       const [row] = await t.$queryRaw<Array<{ id: string }>>`SELECT m.id FROM source_target_mappings m JOIN sources s ON s.id=m.source_id
@@ -241,6 +281,10 @@ export class LibraryController {
       const active = await t.profileSync.findFirst({ where: { mappingId: row.id, phase: { in: ['DISCOVERING','PREPARING'] } } });
       if (active && +now - +active.updatedAt < SYNC_TIMEOUT_MS) return { syncId: active.id, queued: false };
       if (active) await t.profileSync.update({ where: { id: active.id }, data: { phase: 'FAILED', detail: 'Lượt trước đã hết thời gian.' } });
+      const publishing = await t.profileSync.findFirst({ where: { mappingId: row.id, publish: true, phase: 'PREPARED',
+        items: { some: { publishStatus: 'PENDING' } } } });
+      if (publishing) return { syncId: publishing.id, queued: false };
+      if (publish && !mapping.target.enabled) throw new ConflictException('Cần bật tài khoản đích trước khi đồng bộ và đăng.');
       if (history && (!mapping.source.enabled || (mapping.source.connector === 'fb-session' && !mapping.target.enabled))) {
         throw new ConflictException('Cần bật nguồn và phiên Facebook dùng để đọc. Bạn có thể chọn dữ liệu đã lưu ngay bây giờ.');
       }
@@ -248,9 +292,9 @@ export class LibraryController {
         throw new ConflictException('Kết nối nguồn này hỗ trợ đồng bộ từ dữ liệu đã lưu.');
       }
       const run = await t.profileSync.create({ data: { mappingId: row.id, phase: history ? 'DISCOVERING' : 'PREPARING',
-        history, capturedUntil: now, requestedBy: actor.actor } });
+        history, publish, capturedUntil: now, requestedBy: actor.actor } });
       await enqueue(t, Q.ProfileSync, { syncId: run.id, step: 0 });
-      await audit(t, { entityType: 'profile_sync', entityId: run.id, action: 'requested', actor: actor.actor, at: now, data: { mappingId: row.id, history } });
+      await audit(t, { entityType: 'profile_sync', entityId: run.id, action: 'requested', actor: actor.actor, at: now, data: { mappingId: row.id, history, publish } });
       return { syncId: run.id, queued: true };
     });
   }
@@ -258,8 +302,8 @@ export class LibraryController {
   @Post('syncs/:id/approve')
   @Roles('reviewer')
   async approveProfileSync(@Param('id', ParseUUIDPipe) id: string, @Actor() actor: Principal) {
-    const run = await this.db.profileSync.findUnique({ where: { id }, select: { phase: true, mapping: { select: { enabled: true } } } });
-    if (!run || !run.mapping.enabled || run.phase !== 'PREPARED') throw new ConflictException('Lượt đồng bộ chưa chuẩn bị xong hoặc luồng đã tắt.');
+    const run = await this.db.profileSync.findUnique({ where: { id }, select: { phase: true, publish: true, mapping: { select: { enabled: true } } } });
+    if (!run || run.publish || !run.mapping.enabled || run.phase !== 'PREPARED') throw new ConflictException('Lượt này không dùng thao tác duyệt hàng loạt.');
     const now = this.clock.now();
     const eligible = (variantId?: string) => Prisma.sql`
       SELECT v.id, r.text AS caption FROM profile_sync_items i
@@ -407,7 +451,7 @@ export class LibraryController {
           where: { id: input.authorTargetId, enabled: true, connector: { startsWith: 'fb-' } }, select: { id: true },
         })) throw new ConflictException('Chọn một profile Facebook đang bật.');
         const status = input.action === 'approve' ? 'APPROVED' : input.action === 'omit' ? 'OMITTED' : 'DRAFT';
-        await t.publicationComment.upsert({ where, update: { status, text, authorTargetId, sendDetail: null },
+        await t.publicationComment.upsert({ where, update: { status, text, authorTargetId, autoAuthor: false, sendDetail: null },
           create: { destinationId: targetId, sourceCommentId: commentId, status, text, authorTargetId } });
       }
       await audit(t, { entityType: 'source_post', entityId: id, action: 'comment_' + input.action, actor: actor.actor,

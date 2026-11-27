@@ -1,7 +1,9 @@
+import { randomInt } from 'node:crypto';
 import { Prisma, type ContentType } from '@prisma/client';
 import { Q as QN, REVIEW_REASONS, SUCCESS, UNRESOLVED, ACTIVE, workflowFor, type IncompleteFlag, type PublishSnapshot } from '@seedingsys/contracts';
 import { HOUR, contentKey, hashObject, isFacebookTimelineReader, removeAdvertisingLinks, revisionContentHash } from '@seedingsys/domain';
 import { audit } from './audit';
+import { activeKillSwitch } from './controls';
 import { contentHolder, duplicateVariant, findSamePost, findSourcePost, hasUnstablePostIds, markDuplicate, onStoredId, recordAlias, revisionContentKey } from './dedup';
 import { enqueue } from './outbox';
 import { closeVariantReviewTasks, openOperatorTask } from './operator-tasks';
@@ -38,12 +40,42 @@ const OPEN_VARIANT: Array<'FETCHING_MEDIA' | 'REWRITING' | 'VALIDATING' | 'READY
 /** Prepare comment drafts for review. Preserve existing edits, omissions and receipts. */
 export async function prepareCommentDrafts(t: Q, sourcePostId: string, targetIds: string[], now: Date) {
   if (!targetIds.length) return 0;
-  return t.$executeRaw`
+  const inserted = await t.$executeRaw`
     INSERT INTO publication_comments (id, destination_id, source_comment_id, text, status, updated_at)
     SELECT gen_random_uuid(), d.target_id, c.id, c.text, 'DRAFT', ${now}
     FROM source_comments c CROSS JOIN unnest(${targetIds}::uuid[]) AS d(target_id)
     WHERE c.source_post_id=${sourcePostId}::uuid AND length(trim(c.text))>0
     ON CONFLICT (destination_id, source_comment_id) DO NOTHING`;
+  const accounts = await t.targetAccount.findMany({
+    where: { enabled: true, connector: 'fb-web', profile: { is: { workerNodeId: { not: null } } } },
+    select: { id: true, audience: true },
+  });
+  const available = [];
+  for (const account of accounts) {
+    if (!await activeKillSwitch(t, { targetId: account.id, connector: 'fb-web' })) available.push(account);
+  }
+  for (const target of accounts.filter(account => targetIds.includes(account.id))) {
+    const publication = await t.publication.findUnique({
+      where: { targetId_sourcePostId: { targetId: target.id, sourcePostId } },
+      select: { variant: { select: { snapshot: true } } },
+    });
+    const snapshot = publication?.variant.snapshot as PublishSnapshot | null | undefined;
+    const pool = (snapshot?.audience ?? target.audience) === 'PUBLIC' ? available.filter(account => account.id !== target.id) : [];
+    const drafts = await t.publicationComment.findMany({
+      where: { destinationId: target.id, source: { sourcePostId } },
+      select: { id: true, status: true, authorTargetId: true },
+      orderBy: [{ source: { position: 'asc' } }, { sourceCommentId: 'asc' }],
+    });
+    for (const [position, draft] of drafts.entries()) {
+      if (draft.status !== 'DRAFT' || draft.authorTargetId) continue;
+      const authorTargetId = position === 0 || !pool.length ? target.id : pool[randomInt(pool.length)].id;
+      await t.publicationComment.updateMany({
+        where: { id: draft.id, status: 'DRAFT', authorTargetId: null },
+        data: { authorTargetId, autoAuthor: true, updatedAt: now },
+      });
+    }
+  }
+  return inserted;
 }
 
 /** Remove the link previews a reader appended to the caption ("caption\n\nhttps://…"). */
@@ -69,14 +101,18 @@ export async function ingestPost(
     draftCaption?: { targetId: string; value: string } },
 ): Promise<IngestOutcome> {
   const { now } = args;
+  const [source] = await t.$queryRaw<Array<{ reset_generation: number }>>`
+    SELECT reset_generation FROM sources WHERE id=${args.sourceId}::uuid FOR SHARE`;
+  if (!source) throw new Error('Source disappeared before post ingestion.');
+  const resetGeneration = source.reset_generation;
   let post = args.connector.startsWith('fb-') ? { ...args.post, text: removeAdvertisingLinks(args.post.text) } : args.post;
   const isPublic = isFacebookTimelineReader(args.connector);
   const trackIncompleteMedia = isPublic || args.connector === 'fb-graph';
   const missingMedia = post.incomplete.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE');
 
-  let sp = await findSourcePost(t, args.sourceId, post.externalId);
+  let sp = await findSourcePost(t, args.sourceId, resetGeneration, post.externalId);
   if (!sp && hasUnstablePostIds(args.connector)) {
-    sp = await findSamePost(t, args.sourceId, post);
+    sp = await findSamePost(t, args.sourceId, resetGeneration, post);
     if (sp) await recordAlias(t, { sourceId: args.sourceId, externalId: post.externalId, post: sp, actor: args.actor, now });
   }
   if (sp) {
@@ -90,6 +126,7 @@ export async function ingestPost(
     sp = await t.sourcePost.create({
       data: {
         sourceId: args.sourceId,
+        resetGeneration,
         externalId: post.externalId,
         identityConfidence: post.identityConfidence,
         permalink: post.permalink,

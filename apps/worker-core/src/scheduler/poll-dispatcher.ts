@@ -1,5 +1,6 @@
 import { Q } from '@seedingsys/contracts';
 import { activeKillSwitch, enqueue, tx } from '@seedingsys/db';
+import { sourceScheduleOpen } from '@seedingsys/domain';
 import type { CoreCtx } from '../ctx';
 
 /**
@@ -13,16 +14,17 @@ export async function dispatchDuePolls(ctx: CoreCtx): Promise<number> {
   let n = 0;
   for (const s of sources) {
     const due = !s.lastPollAt || s.lastPollAt.getTime() + s.pollIntervalSec * 1000 <= now.getTime();
-    if (!due) continue;
+    if (!due || !sourceScheduleOpen(s, now)) continue;
     const kill = await activeKillSwitch(ctx.db, { sourceId: s.id, connector: s.connector });
     if (kill) continue;
     await tx(ctx.db, async (t) => {
       const r = await t.source.updateMany({
-        where: { id: s.id, enabled: true, connector: s.connector, lastPollAt: s.lastPollAt },
+        where: { id: s.id, enabled: true, connector: s.connector, lastPollAt: s.lastPollAt,
+          runStartMinute: s.runStartMinute, runEndMinute: s.runEndMinute, runNowUntil: s.runNowUntil },
         data: { lastPollAt: now },
       });
       if (r.count === 1) {
-        await enqueue(t, Q.SourcePoll, { sourceId: s.id }, { singletonKey: s.id });
+        await enqueue(t, Q.SourcePoll, { sourceId: s.id, scheduled: true }, { singletonKey: s.id });
         n++;
       }
     });

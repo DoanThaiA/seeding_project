@@ -5,12 +5,15 @@ import { useId, useState, type ReactNode } from 'react';
 import { bff, useSubmit } from '@/components/client';
 import { Badge } from '@/components/ui';
 import { fmtTime } from '@/lib/format';
+import { MAX_POLL_POSTS } from '@seedingsys/contracts';
 import { TargetBrowser } from './TargetBrowser';
 import styles from './settings.module.css';
 
 export interface SourceT {
   id: string; code: string; name: string; externalRef: string; connector: string; enabled: boolean;
-  pollIntervalSec: number; overlapCount: number; collectComments: boolean; baselineDone: boolean;
+  pollIntervalSec: number; pollPostLimit: number | null; overlapCount: number; collectComments: boolean; baselineDone: boolean;
+  runStartMinute: number | null; runEndMinute: number | null;
+  runNowUntil: string | null; publishIntervalMin: number | null; publishComments: boolean;
   lastPollAt: string | null; lastSuccessAt: string | null; lastErrorAt: string | null; lastError: string | null;
   watermark?: { lastReadCount?: number } | null;
 }
@@ -62,10 +65,24 @@ function Enabled({ checked, onChange, children }: { checked: boolean; onChange: 
   return <label className={styles.checkbox}><input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)} />{children}</label>;
 }
 
+function formatRunTime(minute: number) {
+  return [Math.floor(minute / 60), minute % 60].map(value => String(value).padStart(2, '0')).join(':');
+}
+
+function parseRunTime(value: string) {
+  const [hour, minute] = value.split(':').map(Number);
+  return hour * 60 + minute;
+}
+
 function sourceDraft(s?: SourceT) {
   return {
     code: s?.code ?? '', name: s?.name ?? '', externalRef: s?.externalRef ?? '', connector: s?.connector ?? 'fb-public',
-    pollIntervalSec: s?.pollIntervalSec ?? 300, overlapCount: s?.overlapCount ?? 5, enabled: s?.enabled ?? true, collectComments: s?.collectComments ?? false,
+    pollIntervalSec: s?.pollIntervalSec ?? 300, pollPostLimit: s?.pollPostLimit ?? null,
+    overlapCount: s?.overlapCount ?? 5, enabled: s?.enabled ?? true, collectComments: s?.collectComments ?? true,
+    publishComments: s?.publishComments ?? true, publishIntervalMin: s?.publishIntervalMin ?? null,
+    runMode: s?.runStartMinute != null ? 'window' : 'all-day',
+    runStart: formatRunTime(s?.runStartMinute ?? 8 * 60),
+    runEnd: formatRunTime(s?.runEndMinute ?? 20 * 60),
   };
 }
 
@@ -87,10 +104,13 @@ export function SourceForm({ source }: { source?: SourceT }) {
   const [form, setForm] = useState(() => sourceDraft(source));
   const save = useSubmit();
   const poll = useSubmit();
+  const stop = useSubmit();
   const status = source ? sourceStatus(source) : undefined;
   const dirty = JSON.stringify(form) !== JSON.stringify(sourceDraft(source));
   const customPoll = form.connector !== 'manual';
   const isTimeline = form.connector === 'fb-public' || form.connector === 'fb-session';
+  const customRun = form.runMode === 'window';
+  const validRunTime = !customRun || !!(form.runStart && form.runEnd && form.runStart !== form.runEnd);
   return (
     <Panel title={source ? 'Nguồn ' + source.code : 'Thêm nguồn quét'}
       description={form.connector === 'fb-session'
@@ -100,7 +120,12 @@ export function SourceForm({ source }: { source?: SourceT }) {
       <form onSubmit={e => {
         e.preventDefault();
         save.run(async () => {
-          const result = await bff<SourceT>(source ? 'PATCH' : 'POST', source ? 'sources/' + source.id : 'sources', form);
+          const { runMode, runStart, runEnd, ...settings } = form;
+          const result = await bff<SourceT>(source ? 'PATCH' : 'POST', source ? 'sources/' + source.id : 'sources', {
+            ...settings,
+            runStartMinute: runMode === 'window' ? parseRunTime(runStart) : null,
+            runEndMinute: runMode === 'window' ? parseRunTime(runEnd) : null,
+          });
           if (result.ok) setForm(sourceDraft(source ? result.data : undefined));
           return result;
         }, source ? 'Đã lưu nguồn' : 'Đã thêm nguồn');
@@ -113,17 +138,46 @@ export function SourceForm({ source }: { source?: SourceT }) {
           </select></div>
           <div className={styles.full}><label htmlFor={id + '-ref'}>{isTimeline ? 'URL Facebook của nguồn' : 'Địa chỉ hoặc ID nguồn'}</label><input id={id + '-ref'} required type="text" inputMode={isTimeline ? 'url' : 'text'} autoComplete="off" spellCheck={false} placeholder={isTimeline ? 'https://www.facebook.com/ten.trang' : undefined} value={form.externalRef} onChange={e => setForm({ ...form, externalRef: e.target.value })} /></div>
           {customPoll && <div className="field"><label htmlFor={id + '-interval'}>Chu kỳ quét (giây)</label><input id={id + '-interval'} type="number" min={60} required value={form.pollIntervalSec || ''} onChange={e => setForm({ ...form, pollIntervalSec: Number(e.target.value) })} /></div>}
+          {customPoll && <div className="field"><label htmlFor={id + '-poll-limit'}>Số bài tối đa mỗi lượt quét</label>
+            <input id={id + '-poll-limit'} type="number" min={1} max={MAX_POLL_POSTS} step={1} value={form.pollPostLimit ?? ''}
+              placeholder="Mặc định" onChange={e => setForm({ ...form, pollPostLimit: e.target.value ? Number(e.target.value) : null })} />
+          </div>}
+          <div className="field"><label htmlFor={id + '-publish-interval'}>Khoảng cách đăng của nguồn (phút)</label>
+            <input id={id + '-publish-interval'} type="number" min={1} max={1440} value={form.publishIntervalMin ?? ''}
+              placeholder="Theo lịch chung" onChange={e => setForm({ ...form, publishIntervalMin: e.target.value ? Number(e.target.value) : null })} /></div>
           <Enabled checked={form.enabled} onChange={enabled => setForm({ ...form, enabled })}>Bật nguồn</Enabled>
+          <div className={styles.full}><label htmlFor={id + '-run-mode'}>Khung giờ quét tự động (giờ Việt Nam)</label>
+            <select id={id + '-run-mode'} value={form.runMode} onChange={e => setForm({ ...form, runMode: e.target.value })}>
+              <option value="all-day">Cả ngày</option>
+              <option value="window">Theo khung giờ</option>
+            </select>
+          </div>
+          {customRun && <>
+            <div className="field"><label htmlFor={id + '-run-start'}>Giờ bắt đầu</label><input id={id + '-run-start'} type="time" required value={form.runStart} onChange={e => setForm({ ...form, runStart: e.target.value })} /></div>
+            <div className="field"><label htmlFor={id + '-run-end'}>Giờ kết thúc</label><input id={id + '-run-end'} type="time" required value={form.runEnd} onChange={e => setForm({ ...form, runEnd: e.target.value })} /></div>
+            <p className={styles.full}>{validRunTime ? 'Áp dụng cho lượt quét và đăng tự động. Nếu giờ kết thúc sớm hơn giờ bắt đầu, lịch chạy qua nửa đêm.' : 'Giờ bắt đầu và giờ kết thúc phải khác nhau.'}</p>
+          </>}
         </div>
+        {(isTimeline || form.connector === 'fb-graph') && <div className={styles.fields}>
+          <fieldset>
+            <legend>Khi quét nguồn</legend>
+            <Enabled checked={form.collectComments}
+              onChange={collectComments => setForm({ ...form, collectComments })}>Quét bài viết kèm bình luận</Enabled>
+          </fieldset>
+          <fieldset>
+            <legend>Khi đăng bài</legend>
+            <Enabled checked={form.publishComments}
+              onChange={publishComments => setForm({ ...form, publishComments })}>Đăng bài viết kèm bình luận đã quét</Enabled>
+          </fieldset>
+          <p className={styles.full}>Chủ bài đích gửi bình luận đầu tiên. Các bình luận còn lại được tự gán hồ sơ khi lưu.</p>
+        </div>}
         {customPoll && <details className={styles.advanced}>
           <summary>Tùy chọn quét</summary>
           <label htmlFor={id + '-overlap'}>Số bài trong vùng đọc lại</label>
           <input id={id + '-overlap'} type="number" min={0} max={50} required value={form.overlapCount} onChange={e => setForm({ ...form, overlapCount: Number(e.target.value) })} />
-          {(isTimeline || form.connector === 'fb-graph') && <Enabled checked={form.collectComments}
-            onChange={collectComments => setForm({ ...form, collectComments })}>Tự quét bình luận khi phát hiện bài mới</Enabled>}
         </details>}
         <div className={styles.formActions}>
-          <button className="primary" type="submit" disabled={save.pending || poll.pending || (!!source && !dirty)}>{save.pending ? 'Đang lưu…' : source ? 'Lưu nguồn' : 'Thêm nguồn'}</button>
+          <button className="primary" type="submit" disabled={!validRunTime || save.pending || poll.pending || (!!source && !dirty)}>{save.pending ? 'Đang lưu…' : source ? 'Lưu nguồn' : 'Thêm nguồn'}</button>
           {source && source.connector !== 'manual' && <button type="button" disabled={!source.enabled || dirty || save.pending || poll.pending}
             onClick={() => poll.run(async () => {
               const result = await bff<{ queued: boolean }>('POST', 'sources/' + source.id + '/poll');
@@ -136,6 +190,11 @@ export function SourceForm({ source }: { source?: SourceT }) {
         </div>
         <Feedback state={save} />
         <Feedback state={poll} />
+        {source?.runNowUntil && new Date(source.runNowUntil) > new Date() &&
+          <button type="button" disabled={stop.pending} onClick={() => stop.run(
+            () => bff('POST', 'sources/' + source.id + '/stop-run'), 'Đã kết thúc đợt. Nguồn quay lại lịch đã lưu.',
+          )}>Kết thúc đợt chạy ngay trước {fmtTime(source.runNowUntil)}</button>}
+        <Feedback state={stop} />
       </form>
       {source && source.connector !== 'manual' && (
         <div className={styles.scanStatus}>
@@ -226,8 +285,8 @@ export function MappingForm({ mapping, sources, targets, mappings, onCreated }: 
   const availableTargets = targets.filter(t => !mappings.some(m => m.sourceId === form.sourceId && m.targetId === t.id));
   const targetId = mapping ? form.targetId : availableTargets.find(t => t.id === form.targetId)?.id ?? availableTargets[0]?.id;
   return (
-    <Panel title={mapping ? 'Duyệt và lịch đăng' : 'Tạo luồng nguồn → đích'}
-      description="Mỗi đích có tối đa một lượt đăng vào đầu mỗi giờ theo giờ Việt Nam."
+    <Panel title={mapping ? 'Quy tắc duyệt và đăng' : 'Tạo luồng nguồn → đích'}
+      description={mapping ? 'Chọn ngày và giờ đăng trong mục Lịch & bài chờ.' : undefined}
       right={mapping && <Link href="/schedule">Xem lịch đăng ↗</Link>}>
       <form onSubmit={e => {
         e.preventDefault();

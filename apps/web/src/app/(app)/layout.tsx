@@ -16,25 +16,29 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
   return (
     <div className="shell">
       <aside className="side">
-        <div className="brand">
-          SeedingSys<small>Bảng vận hành</small>
-        </div>
+        <div className="brand">SeedingSys</div>
         <nav className="nav" aria-label="Điều hướng chính">
           <NavLink href="/">Tổng quan</NavLink>
-          <NavLink href="/library">Kho bài viết</NavLink>
+          <NavLink href="/library">Hồ sơ A &amp; B</NavLink>
+          <NavLink href="/profile-sync">Đồng bộ hồ sơ</NavLink>
+          <NavLink href="/profile-groups">Nhóm hồ sơ</NavLink>
+          <NavLink href="/comment-scripts">Kịch bản bình luận</NavLink>
+          <NavLink href="/schedule">Lịch &amp; bài chờ</NavLink>
           <NavLink href="/review" count={t.REVIEW_CONTENT} warn>Duyệt bài</NavLink>
           <NavLink href="/tasks" count={(t.TAKEOVER_ACCOUNT ?? 0) + (t.CONFIRM_RESULT ?? 0)}>Cần xử lý</NavLink>
-          {(can.review(s.role) || can.operate(s.role)) && <NavLink href="/import">Nhập bài</NavLink>}
-          <NavLink href="/publications">Bài đã đăng</NavLink>
-          <NavLink href="/schedule">Lịch &amp; backlog</NavLink>
-          <NavLink href="/controls">Công tắc dừng</NavLink>
+          {can.admin(s.role) && <NavLink href="/settings">Quản trị luồng</NavLink>}
           <NavLink href="/reports">Báo cáo</NavLink>
-          {can.admin(s.role) && <NavLink href="/settings">Quản trị luồng đăng</NavLink>}
+          <details className="nav-more">
+            <summary>Thao tác khác</summary>
+            <NavLink href="/publications">Bài đã đăng</NavLink>
+            {(can.review(s.role) || can.operate(s.role)) && <NavLink href="/import">Nhập bài</NavLink>}
+            <NavLink href="/controls">Công tắc dừng</NavLink>
+          </details>
         </nav>
         <div className="who">
           <div>{ROLE_VI[s.role] ?? s.role}</div>
           <form action={logout}>
-            <button type="submit" className="sm" style={{ marginTop: 6 }}>Đăng xuất</button>
+            <button type="submit" className="sm">Đăng xuất</button>
           </form>
         </div>
       </aside>

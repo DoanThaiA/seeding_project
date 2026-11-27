@@ -18,6 +18,9 @@ export async function handleCommentScan(ctx: BrowserCtx, { scanId, readTargetId,
   let accountTargetId: string | undefined;
   try {
     if (post.archivedAt) throw new ConnectorError('SOURCE_UNREADABLE', 'Bài nguồn đã chuyển vào thùng rác.');
+    if (!manual && !source.collectComments) {
+      throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn đang tắt quét bình luận tự động.');
+    }
     if ((!source.enabled && !manual) || await activeKillSwitch(ctx.db, { sourceId: source.id, connector: source.connector })) {
       throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn đang tắt hoặc bị tạm dừng.');
     }

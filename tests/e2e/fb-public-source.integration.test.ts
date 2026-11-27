@@ -8,6 +8,9 @@ import { accountResource, acquireLease, dispatchBacklogItem, editBacklogCaption,
 import { handleSourcePoll } from '../../apps/worker-browser/src/handlers/source-poll';
 import { handleCommentScan } from '../../apps/worker-browser/src/handlers/comment-scan';
 import { LibraryController } from '../../apps/api/src/library.controller';
+import { ProfileArtworkController } from '../../apps/api/src/profile-artwork.controller';
+import { handleProfileArtwork } from '../../apps/worker-browser/src/handlers/profile-artwork';
+import { handleApplyProfileArtwork } from '../../apps/worker-browser/src/handlers/apply-profile-artwork';
 import { createHarness, cycle, MIN, pubsOf, type Harness } from '../helpers/harness';
 import { MockProfile } from '../helpers/mock-profile';
 
@@ -36,6 +39,32 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     await mock.stop();
     await h.close();
   });
+
+  it('caps a timeline poll and its comment tasks, while keeping profile history separate', async () => {
+    const sourceId = h.ids.sources.A1;
+    await h.db.source.update({ where: { id: sourceId }, data: { pollPostLimit: 2 } });
+    mock.posts = ['ONE', 'TWO', 'THREE', 'FOUR'].map(word => ({ id: `pfbid${word}`, text: `Bài số ${word}` }));
+    expect(await handleSourcePoll(h.browser, { sourceId, collectComments: true })).toMatchObject({ outcome: 'OK', counts: { NEW_POST: 2 } });
+    expect(await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).toMatchObject({
+      watermark: { lastReadCount: 2 }, lastIncomplete: [],
+    });
+    expect(await h.db.commentScan.count()).toBe(2);
+    expect(await handleSourcePoll(h.browser, { sourceId, history: { targetId: h.ids.targets.B1 } })).toMatchObject({ outcome: 'OK' });
+    expect(await h.db.sourcePost.count({ where: { sourceId } })).toBe(4);
+    expect(await h.db.commentScan.count()).toBe(2);
+  }, 45_000);
+
+  it('keeps scrolling to reach the configured limit after a card without a permalink pulls the page back', async () => {
+    const sourceId = h.ids.sources.A1;
+    await h.db.source.update({ where: { id: sourceId }, data: { pollPostLimit: 10 } });
+    mock.latePostsStart = 7;
+    mock.posts = [
+      { id: 'pfbidBROKEN', text: 'Bài Facebook chưa có liên kết nhận diện', missingPermalink: true },
+      ...Array.from({ length: 11 }, (_, i) => ({ id: `pfbidPAGE${i}`, text: `Bài đọc được số ${i}` })),
+    ];
+    expect(await handleSourcePoll(h.browser, { sourceId })).toMatchObject({ outcome: 'OK', counts: { NEW_POST: 10 } });
+    expect(await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).toMatchObject({ watermark: { lastReadCount: 10 }, lastIncomplete: [] });
+  }, 40_000);
 
   it('queues every guest post from the first scan, restores album photos and video, and publishes the selected item once', async () => {
     const caption = 'Khai trương chi nhánh mới ngày 5/12, giảm 20% cho các sản phẩm trong chương trình tại cửa hàng. Đội ngũ tại cửa hàng sẽ hướng dẫn khách chọn đúng sản phẩm cần dùng, kiểm tra thông tin và hỗ trợ nhận hàng trong ngày.';
@@ -164,6 +193,73 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     expect(revision.assets.every(({ asset }) => asset.status === 'STORED')).toBe(true);
   }, 45_000);
 
+  it('recovers photos from the exact story without taking unrelated photos', async () => {
+    mock.posts = [
+      { id: 'pfbidPHOTO', text: 'Ảnh của bài nguồn', detailPhotoIds: ['111'] },
+      { id: 'pfbidGROUP', text: 'Hai ảnh của bài nguồn', detailPhotoIds: ['222', '333'] },
+    ];
+    const reader = h.browser.registry.reader('fb-public');
+    const result = await reader.readSince({
+      id: h.ids.sources.A1, code: 'A1', externalRef: 'https://www.facebook.com/profile.php?id=' + mock.userId,
+      exactPermalinks: mock.posts.map(post => mock.baseUrl + '/profile/posts/' + post.id),
+    }, null, 5);
+    expect(result.posts.map(post => [post.contentType, post.incomplete, post.media.map(media => media.ref)])).toEqual([
+      ['SINGLE_PHOTO', [], ['fb-public:pfbidPHOTO:image:111']],
+      ['MULTI_PHOTO', [], ['fb-public:pfbidGROUP:image:222', 'fb-public:pfbidGROUP:image:333']],
+    ]);
+  }, 30_000);
+
+  it('saves both original profile photos for a mapping and rejects a photo from another owner', async () => {
+    mock.profileArtwork = { avatar: '111', cover: '222' };
+    await h.db.targetAccount.update({ where: { id: h.ids.targets.B1 }, data: { connector: 'fb-web' } });
+    const mapping = await h.db.sourceTargetMapping.findFirstOrThrow({ where: { targetId: h.ids.targets.B1 } });
+    const controller = new ProfileArtworkController(h.db, h.clock, h.browser.store);
+    const read = async () => {
+      expect(await controller.read(mapping.id, { role: 'admin', actor: 'test' })).toEqual({ queued: true });
+      const record = await h.db.profileArtwork.findUniqueOrThrow({ where: { mappingId: mapping.id } });
+      await handleProfileArtwork(h.browser, { mappingId: mapping.id, requestId: record.requestId });
+      return (await controller.list())[0];
+    };
+    const artwork = await read();
+    expect(artwork).toMatchObject({ status: 'READY', images: { avatar: { photoId: '111' }, cover: { photoId: '222' } } });
+    const download = await controller.media(mapping.id, 'cover', artwork.requestId, '1');
+    expect(download.getHeaders()).toMatchObject({ type: 'image/png', disposition: 'attachment; filename="cover.png"' });
+    const chunks: Buffer[] = [];
+    for await (const chunk of download.getStream()) chunks.push(chunk);
+    expect(Buffer.concat(chunks).byteLength).toBeGreaterThan(20);
+
+    const fake = h.browser.registry.publisher('fake');
+    let failBeforeCover = true;
+    const saved: string[] = [];
+    h.browser.registry.addPublisher({
+      key: 'fb-web', version: fake.version, capabilities: target => fake.capabilities(target),
+      async openSession(target) {
+        const session = await fake.openSession(target);
+        session.replaceProfilePhoto = async ({ kind, beforeSave }) => {
+          if (kind === 'cover' && failBeforeCover) throw new Error('Chưa mở được hộp ảnh bìa');
+          await beforeSave(kind === 'avatar' ? '100' : '200');
+          saved.push(kind);
+          return { photoId: kind === 'avatar' ? '901' : '902' };
+        };
+        return session;
+      },
+    });
+    const apply = async () => {
+      expect(await controller.apply(mapping.id, { requestId: artwork.requestId }, { actor: 'test', role: 'admin' })).toEqual({ queued: true });
+      const { applyId } = await h.db.profileArtwork.findUniqueOrThrow({ where: { mappingId: mapping.id } });
+      await handleApplyProfileArtwork({ ...h.browser, actor: 'browser:test' }, { mappingId: mapping.id, requestId: artwork.requestId, applyId: applyId! });
+      return (await controller.list())[0].apply;
+    };
+    expect(await apply()).toMatchObject({ status: 'FAILED', avatarId: '901', coverId: null });
+    failBeforeCover = false;
+    expect(await apply()).toMatchObject({ status: 'DONE', avatarId: '901', coverId: '902' });
+    expect(saved).toEqual(['avatar', 'cover']);
+
+    mock.profileArtwork.avatarOwner = '999';
+    expect(await read()).toMatchObject({ status: 'FAILED', images: null });
+    expect(await h.db.publication.count()).toBe(0);
+  }, 30_000);
+
   it('saves the Reel native MP4 when the HD link fails and queues comments for every post in a manual scan', async () => {
     const reelId = '1014939';
     mock.posts = [
@@ -172,11 +268,12 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
       ...Array.from({ length: 8 }, (_, i) => ({ id: 'pfbidCOMMENTS' + i, text: 'Bài có bình luận số ' + i, comments: true })),
     ];
     const sourceId = h.ids.sources.A1;
+    await h.db.source.update({ where: { id: sourceId }, data: { collectComments: false } });
     expect((await handleSourcePoll(h.browser, { sourceId, collectComments: true })).outcome).toBe('OK');
     expect(await h.db.commentScan.count()).toBe(0);
     await h.db.source.update({ where: { id: sourceId }, data: { collectComments: true } });
     expect((await handleSourcePoll(h.browser, { sourceId, collectComments: true })).outcome).toBe('OK');
-    const reel = await h.db.sourcePost.findUniqueOrThrow({ where: { sourceId_externalId: { sourceId, externalId: reelId } } });
+    const reel = await h.db.sourcePost.findUniqueOrThrow({ where: { sourceId_resetGeneration_externalId: { sourceId, resetGeneration: 0, externalId: reelId } } });
     expect(await h.db.commentScan.count()).toBe(10);
     await h.drain();
     const revision = await h.db.sourcePostRevision.findUniqueOrThrow({ where: { id: reel.latestRevisionId! },

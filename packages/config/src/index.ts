@@ -11,6 +11,9 @@ export const EnvSchema = z.object({
   DATABASE_URL: z.string().url(),
   WORKER_NAME: z.string().default('local-1'),
   TZ_OPERATIONS: z.string().default('Asia/Ho_Chi_Minh'),
+  SCHEDULED_PUBLISH_LIMIT: z.coerce.number().int().positive().optional(),
+  SCHEDULED_PUBLISH_FROM: z.string().datetime({ offset: true }).optional(),
+  SCHEDULED_PUBLISH_INTERVAL_MIN: z.coerce.number().int().min(5).max(60).optional(),
 
   // LLM gateway (only the core server holds the key)
   LLM_MODE: z.enum(['fake', 'claude']).default('fake'),
@@ -59,6 +62,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error(`Invalid configuration: ${issues}`);
   }
   const cfg = parsed.data;
+  if ((cfg.SCHEDULED_PUBLISH_LIMIT === undefined) !== (cfg.SCHEDULED_PUBLISH_FROM === undefined)) {
+    throw new Error('SCHEDULED_PUBLISH_LIMIT and SCHEDULED_PUBLISH_FROM must be configured together');
+  }
   // LLM_MODE=claude without ANTHROPIC_API_KEY is allowed: the SDK also resolves
   // ANTHROPIC_AUTH_TOKEN / `ant auth login` profiles / workload identity federation.
   if (cfg.STORAGE_DRIVER === 'r2' && !(cfg.R2_ACCOUNT_ID && cfg.R2_ACCESS_KEY_ID && cfg.R2_SECRET_ACCESS_KEY && cfg.R2_BUCKET)) {

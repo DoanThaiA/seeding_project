@@ -8,6 +8,7 @@ import { handleProfileSync } from '../../apps/worker-browser/src/handlers/profil
 import { handleCommentPublish } from '../../apps/worker-browser/src/handlers/comment-publish';
 import { handlePublish } from '../../apps/worker-browser/src/handlers/publish';
 import { handleSourcePoll } from '../../apps/worker-browser/src/handlers/source-poll';
+import { dispatchProfileSync } from '../../apps/worker-core/src/maintenance/profile-sync-publish';
 import { createHarness, MIN, type Harness } from '../helpers/harness';
 
 const actor = { actor: 'test-profile-admin', role: 'admin' } as const;
@@ -20,6 +21,61 @@ describe('profile sync and source trash', () => {
     library = new LibraryController(h.db, h.clock);
   });
   afterEach(async () => { await h.close(); });
+
+  it('queues the full archive for workers, skips verified matches and drains sequentially after restarts', async () => {
+    const sourceId = h.ids.sources.A1;
+    const targetId = h.ids.targets.B1;
+    const now = h.clock.now();
+    const add = (externalId: string, text: string, offset: number) => h.db.$transaction(t => ingestPost(t, {
+      sourceId, connector: 'fake', now: h.clock.now(), baseline: false, actor: actor.actor, archiveOnly: true,
+      post: { externalId, text, postedAt: new Date(+now - HOUR + offset), contentType: 'TEXT',
+        identityConfidence: 'HIGH', isPinned: false, isShared: false, incomplete: [], media: [] },
+    }));
+    const original = 'Bài đã có ở đích từ lượt trước';
+    await add('already', original, 0);
+    const old = await library.queueProfileSync('A1', { targetId, history: false }, actor);
+    await handleProfileSync(h.browser, { syncId: old.syncId, step: 0 });
+    await library.approveProfileSync(old.syncId, actor);
+    const previous = await h.db.contentVariant.findFirstOrThrow({ where: { status: 'READY' } });
+    const previousPublication = await dispatchBacklogItem(h.core, previous.id);
+    await h.drain();
+    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+    const permalink = 'https://www.facebook.com/B1/posts/123';
+    await h.db.publication.update({ where: { id: previousPublication }, data: { permalink } });
+
+    await h.db.source.update({ where: { id: sourceId }, data: { publishIntervalMin: 5 } });
+    h.advance(5 * MIN);
+    await h.workerHeartbeat();
+    await add('already', 'Bài nguồn đã sửa sau khi đăng', 0);
+    await add('duplicate', original, 1);
+    for (let index = 0; index < 41; index++) await add('missing-' + index, 'Bài còn thiếu số ' + index, index + 2);
+    const { syncId } = await library.queueProfileSync('A1', { targetId, history: false, publish: true }, actor);
+    await handleProfileSync(h.browser, { syncId, step: 0 });
+    await handleProfileSync(h.browser, { syncId, step: 1 });
+    const pending = await h.db.profileSyncItem.count({ where: { syncId, publishStatus: 'PENDING' } });
+    expect(pending).toBe(43);
+    expect(await h.db.outboxEvent.count({ where: { queue: Q.ProfileSyncPublish } })).toBe(1);
+    expect(await library.queueProfileSync('A1', { targetId, history: false, publish: true }, actor)).toEqual({ syncId, queued: false });
+
+    expect((await Promise.all([dispatchProfileSync(h.core, syncId), dispatchProfileSync(h.core, syncId)])).sort()).toEqual([0, 1]);
+    expect(await listBacklog(h.db, h.clock.now())).toEqual([]);
+    const [progress] = await library.profileSyncs('A1');
+    expect(progress.latest?.stats).toMatchObject({ posts: 43, posted: 1, changed: 1, duplicates: 1, waiting: 40, working: 1 });
+    expect(await library.profileSyncItems(syncId, 'changed')).toMatchObject({ more: false, items: [{ state: 'CHANGED', permalink }] });
+    expect(await library.profileSyncItems(syncId, 'missing')).toMatchObject({ more: true, items: [{ state: 'WORKING' }, ...Array(24).fill(expect.objectContaining({ state: 'WAITING' }))] });
+    await h.drain();
+    expect(h.platform.timeline('fb-B1')).toHaveLength(2);
+    expect(await dispatchProfileSync(h.core, syncId)).toBe(0);
+    for (let remaining = 0; remaining < 40; remaining++) {
+      h.advance(5 * MIN);
+      expect((await h.tick()).profileSyncs).toBe(1);
+      await h.drain();
+    }
+    const sent = await h.db.publication.findMany({ where: { targetId, status: 'PUBLISHED_VERIFIED' },
+      orderBy: { committedAt: 'asc' }, include: { post: true } });
+    expect(sent.map(p => p.post.externalId)).toEqual(['already', ...Array.from({ length: 41 }, (_, i) => 'missing-' + i)]);
+    expect(await library.profileSyncItems(syncId, 'missing')).toEqual({ more: false, items: [] });
+  }, 90_000);
 
   it('stages only the chosen target, blocks dispatch from trash, and retains the archive across re-reads', async () => {
     const origin = h.ids.sources.A1;

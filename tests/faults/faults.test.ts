@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Q } from '@seedingsys/contracts';
-import { setControl } from '@seedingsys/db';
+import { prepareCommentDrafts, setControl, tx } from '@seedingsys/db';
 import { handlePublish, handleReconcile } from '../../apps/worker-browser/src';
-import { dispatchDueSlots, ensureSlots } from '../../apps/worker-core/src';
+import { handleSourcePoll } from '../../apps/worker-browser/src/handlers/source-poll';
+import { dispatchDuePolls, dispatchDueSlots, ensureSlots } from '../../apps/worker-core/src';
+import { dispatchAutomaticComments } from '../../apps/worker-core/src/maintenance/automatic-comments';
+import { ConfigController } from '../../apps/api/src/config.controller';
 import { createHarness, cycle, MIN, pubsOf, type Harness } from '../helpers/harness';
 
 let h: Harness;
@@ -239,6 +242,130 @@ describe('fault injection (spec §12, plan phase 6)', () => {
     expect(await h.db.publicationSlot.count({ where: { slotAt: new Date('2026-11-20T03:00:00.000Z') } })).toBe(3);
     expect(await h.db.publication.count()).toBe(1);
     expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+  });
+
+  it('caps scheduled assignments per target across hourly slots', async () => {
+    h.core.scheduledPublishBatch = { limit: 1, from: new Date('2026-11-20T03:00:00.000Z') };
+    await readyPostForB1();
+    h.setTime(TEN);
+    await cycle(h);
+    h.platform.addSourcePost('A1', { text: 'Thông báo lịch làm việc mới', contentType: 'TEXT', media: [] });
+    h.platform.addSourcePost('A2', { text: 'Lịch tổ chức hội thảo tháng tới', contentType: 'TEXT', media: [] });
+    h.advance(5 * MIN);
+    await cycle(h);
+    h.setTime(ELEVEN);
+    await cycle(h);
+
+    const slot = await h.db.publicationSlot.findUniqueOrThrow({
+      where: { targetId_slotAt: { targetId: h.ids.targets.B1, slotAt: new Date('2026-11-20T04:00:00.000Z') } },
+    });
+    expect(slot).toMatchObject({ status: 'DEFERRED', reason: 'SCHEDULED_PUBLISH_LIMIT_REACHED', publicationId: null });
+    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+    expect(h.platform.timeline('fb-B2')).toHaveLength(1);
+  });
+
+  it('creates five-minute slots and defers an account whose last commit was too recent', async () => {
+    await readyPostForB1();
+    h.core.scheduledPublishIntervalMin = 5;
+    h.setTime('2026-11-20T03:03:00.000Z');
+    await cycle(h);
+    h.setTime('2026-11-20T03:05:10.000Z');
+    await cycle(h);
+
+    const slot = await h.db.publicationSlot.findUniqueOrThrow({
+      where: { targetId_slotAt: { targetId: h.ids.targets.B1, slotAt: new Date('2026-11-20T03:05:00.000Z') } },
+    });
+    expect(slot).toMatchObject({ status: 'DEFERRED', reason: 'PUBLISH_INTERVAL_NOT_ELAPSED' });
+    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+  });
+
+  it('runs scheduled scans and posts only inside each source window', async () => {
+    await readyPostForB1();
+    await h.db.source.update({
+      where: { id: h.ids.sources.A1 },
+      data: { runStartMinute: 11 * 60, runEndMinute: 12 * 60, lastPollAt: null },
+    });
+    h.setTime(TEN);
+    await ensureSlots(h.core);
+    await dispatchDuePolls(h.core);
+    expect(await h.db.source.findUniqueOrThrow({ where: { id: h.ids.sources.A1 } })).toMatchObject({ lastPollAt: null });
+    expect(await h.db.publicationSlot.count({ where: { targetId: h.ids.targets.B1 } })).toBe(0);
+
+    h.setTime(ELEVEN);
+    await cycle(h);
+    expect(await h.db.source.findUniqueOrThrow({ where: { id: h.ids.sources.A1 } })).toMatchObject({ lastPollAt: new Date(ELEVEN) });
+    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+  });
+
+  it('starts a selected batch outside the schedule without selecting other posts', async () => {
+    await readyPostForB1();
+    await h.db.source.update({ where: { id: h.ids.sources.A1 }, data: { runStartMinute: 11 * 60, runEndMinute: 12 * 60 } });
+    const text = 'Bài số hai cần đăng trong đợt này';
+    h.platform.addSourcePost('A1', { text, contentType: 'TEXT', media: [] });
+    await handleSourcePoll(h.browser, { sourceId: h.ids.sources.A1 });
+    await h.drain();
+    const variants = await h.db.contentVariant.findMany({
+      where: { targetId: h.ids.targets.B1 }, include: { revision: { select: { text: true } } },
+    });
+    expect(variants).toHaveLength(2);
+    const selected = variants.find(variant => variant.revision.text === text)!;
+    await h.db.source.update({ where: { id: h.ids.sources.A1 }, data: { enabled: false } });
+    h.setTime('2026-11-20T03:07:00.000Z');
+    const controller = new ConfigController(h.db, h.clock);
+    await controller.startSourceRun({ variantIds: [selected.id], durationMinutes: 90, limit: 1 }, { role: 'admin', actor: 'test' });
+    await cycle(h);
+    const [published] = await pubsOf(h, 'B1');
+    expect(await pubsOf(h, 'B1')).toHaveLength(1);
+    expect(published).toMatchObject({ variantId: selected.id, status: 'PUBLISHED_VERIFIED' });
+  });
+
+  it('queues verified-post comments once, waiting for a confirmed parent before its reply', async () => {
+    await readyPostForB1();
+    h.setTime(TEN);
+    await cycle(h);
+    const [pub] = await pubsOf(h, 'B1');
+    await h.db.targetAccount.updateMany({
+      where: { id: { in: [pub.targetId, h.ids.targets.B2] } }, data: { connector: 'fb-web', audience: 'PUBLIC' },
+    });
+    const variant = await h.db.contentVariant.findUniqueOrThrow({ where: { id: pub.variantId } });
+    await h.db.contentVariant.update({ where: { id: variant.id }, data: {
+      snapshot: { ...(variant.snapshot as object), audience: 'PUBLIC' },
+    } });
+    await h.db.publication.update({ where: { id: pub.id }, data: {
+      autoReplayComments: true, permalink: 'https://www.facebook.com/123/posts/789',
+    } });
+    await h.db.sourcePost.update({ where: { id: pub.sourcePostId }, data: { permalink: 'https://www.facebook.com/123/posts/456' } });
+    await h.db.source.update({ where: { id: h.ids.sources.A1 }, data: { collectComments: true, publishComments: true } });
+    const scan = await h.db.commentScan.create({ data: { sourcePostId: pub.sourcePostId, requestedBy: 'test', status: 'PARTIAL', readCount: 2 } });
+    for (const [position, externalId, parentExternalId] of [[0, '100', null], [1, '101', '100']] as const) {
+      await h.db.sourceComment.create({ data: {
+        sourcePostId: pub.sourcePostId, externalId, parentExternalId, text: 'Bình luận ' + position, position, lastSeenAt: h.clock.now(),
+      } });
+    }
+    await tx(h.db, t => prepareCommentDrafts(t, pub.sourcePostId, [pub.targetId], h.clock.now()));
+    await tx(h.db, t => prepareCommentDrafts(t, pub.sourcePostId, [pub.targetId], h.clock.now()));
+    const saved = await h.db.publicationComment.findMany({
+      where: { destinationId: pub.targetId },
+      orderBy: { source: { position: 'asc' } },
+      select: { authorTargetId: true, autoAuthor: true },
+    });
+    expect(saved).toEqual([
+      { authorTargetId: pub.targetId, autoAuthor: true },
+      { authorTargetId: h.ids.targets.B2, autoAuthor: true },
+    ]);
+    expect(await dispatchAutomaticComments(h.core)).toBe(0);
+    await h.db.commentScan.update({ where: { id: scan.id }, data: { status: 'COMPLETE' } });
+    expect(await dispatchAutomaticComments(h.core)).toBe(1);
+    expect(await dispatchAutomaticComments(h.core)).toBe(0);
+    const parent = await h.db.publicationComment.findFirstOrThrow({ where: { status: 'QUEUED' } });
+    expect(parent.authorTargetId).toBe(pub.targetId);
+    await h.db.publicationComment.update({ where: { id: parent.id }, data: {
+      status: 'POSTED', permalink: 'https://www.facebook.com/123/posts/789?comment_id=100',
+    } });
+    expect(await dispatchAutomaticComments(h.core)).toBe(1);
+    expect(await h.db.outboxEvent.count({ where: { queue: Q.CommentPublish } })).toBe(2);
+    const reply = await h.db.publicationComment.findFirstOrThrow({ where: { status: 'QUEUED' } });
+    expect(reply.authorTargetId).toBe(h.ids.targets.B2);
   });
 
   it('album with a missing image never posts partially', async () => {

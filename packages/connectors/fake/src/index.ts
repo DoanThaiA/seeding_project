@@ -55,8 +55,13 @@ export class FakeReadConnector implements ReadConnector {
     // newest first, like a timeline; include posts edited after the watermark
     const ordered = [...src.posts].sort((a, b) => b.seq - a.seq);
     const fresh = ordered.filter((p) => p.seq > last || p.editSeq > last);
-    const overlapPosts = ordered.filter((p) => p.seq <= last && p.editSeq <= last).slice(0, overlap);
-    const posts = [...fresh, ...overlapPosts].map((p) => ({
+    const maxPosts = source.history ? undefined : source.maxPosts;
+    const changeSeq = (post: (typeof src.posts)[number]) => Math.max(post.seq, post.editSeq);
+    // In a capped incremental poll, commit the oldest changes first so advancing the sequence does not skip posts.
+    const selected = maxPosts === undefined ? fresh : (watermark ? fresh.sort((a, b) => changeSeq(a) - changeSeq(b)) : fresh).slice(0, maxPosts);
+    const remaining = maxPosts === undefined ? overlap : Math.min(overlap, maxPosts - selected.length);
+    const overlapPosts = ordered.filter((p) => p.seq <= last && p.editSeq <= last).slice(0, remaining);
+    const posts = [...selected, ...overlapPosts].map((p) => ({
       externalId: p.id,
       identityConfidence: 'HIGH' as const,
       permalink: `fake://${source.externalRef}/${p.id}`,
@@ -69,8 +74,9 @@ export class FakeReadConnector implements ReadConnector {
       media: p.media.map((m) => ({ kind: m.kind, ref: m.ref, expectedChecksum: createHash('sha256').update(fakeMediaBytes(m.ref)).digest('hex') })),
       incomplete: (p.incomplete ?? []) as IncompleteFlag[],
     }));
-    const maxSeq = src.posts.reduce((m, p) => Math.max(m, p.seq, p.editSeq), last);
-    return { posts, nextWatermark: { lastSeq: maxSeq }, incomplete: [] };
+    const pending = !!watermark && selected.length < fresh.length;
+    const maxSeq = (pending ? selected : src.posts).reduce((m, p) => Math.max(m, changeSeq(p)), last);
+    return { posts, nextWatermark: { lastSeq: maxSeq }, incomplete: pending ? ['PAGINATION_INCOMPLETE'] : [] };
   }
 
   async fetchMedia(media: { ref: string }): Promise<{ bytes: Buffer; mime: string }> {

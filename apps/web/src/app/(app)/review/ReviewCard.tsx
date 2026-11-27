@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { ActionButton, bff, useSubmit } from '@/components/client';
 import { Badge } from '@/components/ui';
-import { fmtTime, label, reasonText } from '@/lib/format';
+import { fmtTime, reasonText } from '@/lib/format';
 import { ReviewMediaUpload } from './ReviewMediaUpload';
 
 export interface ReviewItem {
@@ -50,7 +50,7 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState('');
   const s = useSubmit();
-  const edited = caption.trim() !== (v.caption ?? '').trim();
+  const edited = caption.trim() !== (v.caption ?? v.revision.text).trim();
   const missingMedia = v.revision.incomplete.some(flag => flag === 'MEDIA_UNAVAILABLE' || flag === 'MEDIA_COUNT_UNKNOWN');
   const mediaOk = !missingMedia && ['READY', 'NOT_REQUIRED'].includes(v.revision.mediaStatus)
     && (!['VIDEO', 'REEL'].includes(v.contentType) || (v.revision.assets.length === 1 && v.revision.assets[0].asset.kind === 'video'))
@@ -138,7 +138,6 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
           )}
           {s.error && <p className="err" role="alert">{s.error}</p>}
           {s.done && <p className="okmsg">{s.done}</p>}
-          {!share && <p className="muted" style={{ marginBottom: 0 }}>Khi duyệt, caption và danh sách media được chốt để đăng. Định dạng {label(v.contentType)}.</p>}
         </div>
       )}
     </section>

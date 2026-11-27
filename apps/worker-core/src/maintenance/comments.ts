@@ -16,5 +16,13 @@ export async function settleStalledComments(ctx: CoreCtx) {
     where: { status: 'SENDING', updatedAt: stale },
     data: { status: 'UNKNOWN', sendDetail: 'Chưa rõ kết quả. Đối chiếu trên Facebook.', updatedAt: now },
   });
+  await ctx.db.commentScriptStep.updateMany({
+    where: { status: 'QUEUED', updatedAt: { lte: new Date(+now - COMMENT_QUEUE_MS) } },
+    data: { status: 'FAILED', detail: 'Hết thời gian chờ worker. Có thể gửi lại.', updatedAt: now },
+  });
+  await ctx.db.commentScriptStep.updateMany({
+    where: { status: 'SENDING', updatedAt: stale },
+    data: { status: 'UNKNOWN', detail: 'Chưa rõ kết quả. Đối chiếu bình luận trên Facebook.', updatedAt: now },
+  });
   return { scans: scans.count, queued: queued.count, sending: sending.count };
 }

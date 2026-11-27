@@ -1,7 +1,7 @@
 import { ConnectorError, isConnectorError, type ReadPost, type ReadResult, type SourceRef } from '@seedingsys/connectors-core';
 import { COMMENT_READERS, Q } from '@seedingsys/contracts';
 import { accountResource, acquireLease, activeKillSwitch, assertLeaseHeld, enqueue, ingestPost, releaseLease, sourceResource, tx, type Lease } from '@seedingsys/db';
-import { isFacebookTimelineReader, sha256 } from '@seedingsys/domain';
+import { isFacebookTimelineReader, sha256, sourceScheduleOpen } from '@seedingsys/domain';
 import { assetObjectKey } from '@seedingsys/storage';
 import type { BrowserCtx } from '../ctx';
 import { withTimeout } from '../runtime/timeout';
@@ -21,7 +21,7 @@ export function uniqueReads(posts: ReadPost[]): ReadPost[] {
  * The watermark only advances after the results are committed. A read error is recorded as a
  * source error — never as "no new posts".
  */
-export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; collectComments?: boolean; history?: { targetId: string; cursor?: string } }): Promise<{
+export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; collectComments?: boolean; scheduled?: boolean; history?: { targetId: string; cursor?: string } }): Promise<{
   outcome: string; counts?: Record<string, number>; history?: ReadResult['history']; error?: string;
 }> {
   const lease = await acquireLease(ctx.db, {
@@ -38,12 +38,17 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
   try {
     const source = await ctx.db.source.findUnique({ where: { id: p.sourceId } });
     if (!source || !source.enabled) return { outcome: 'DISABLED' };
+    if (p.scheduled && !sourceScheduleOpen(source, ctx.clock.now())) {
+      await ctx.db.source.updateMany({ where: { id: source.id, lastPollAt: source.lastPollAt }, data: { lastPollAt: source.lastSuccessAt } });
+      return { outcome: 'OUTSIDE_SOURCE_WINDOW' };
+    }
     const sourceControl = { sourceId: source.id, connector: source.connector };
     if (await activeKillSwitch(ctx.db, sourceControl)) return { outcome: 'PAUSED' };
 
     const currentSource = {
       id: source.id, connector: source.connector, externalRef: source.externalRef,
-      baselineDone: source.baselineDone, lastSuccessAt: source.lastSuccessAt, enabled: true,
+      baselineDone: source.baselineDone, lastSuccessAt: source.lastSuccessAt, resetGeneration: source.resetGeneration, enabled: true,
+      ...(!p.history && { pollPostLimit: source.pollPostLimit }),
     };
     let result;
     try {
@@ -86,12 +91,15 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
         LIMIT ${p.collectComments ? 16 : 5}` : [];
       const reading = reader.readSince(
         { id: source.id, code: source.code, externalRef: source.externalRef, retryPermalinks: retry.map(item => item.permalink), readAccount,
-          ...(p.history && { history: { cursor: p.history.cursor } }) },
+          ...(p.history ? { history: { cursor: p.history.cursor } } : { maxPosts: source.pollPostLimit ?? undefined }) },
         p.history ? null : source.watermark as Record<string, unknown> | null, source.overlapCount,
       );
       // The session reader closes its browser at its own deadline. Await that cleanup before releasing B's lock.
       result = isFacebookTimelineReader(source.connector) || ['fb-web', 'fb-graph'].includes(source.connector)
         ? await reading : await withTimeout(reading, ctx.timeouts.stepMs, 'read');
+      if (!p.history && source.pollPostLimit !== null && uniqueReads(result.posts).length > source.pollPostLimit) {
+        throw new ConnectorError('TRANSIENT', 'Kết nối nguồn đọc quá số bài đã cấu hình. Giữ nguyên mốc quét.');
+      }
     } catch (e) {
       const msg = isConnectorError(e) ? `${e.kind}: ${e.message}` : e instanceof Error ? e.message : String(e);
       if (!p.history) await tx(ctx.db, async t => {
@@ -104,7 +112,7 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
       return { outcome: 'READ_ERROR', error: msg.slice(0, 400) };
     }
 
-    const baseline = !p.history && !source.baselineDone && !isFacebookTimelineReader(source.connector);
+    const baseline = !p.history && !source.baselineDone && source.resetGeneration === 0 && !isFacebookTimelineReader(source.connector);
     const posts = await Promise.all(uniqueReads(result.posts).map(async post => {
       const media = await Promise.all(post.media.map(async item => {
         const { renderedImage, ...asset } = item;
@@ -135,7 +143,7 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
         const updated = await t.source.updateMany({
           where: currentSource,
           data: p.history ? { updatedAt: now } : {
-            watermark: { ...result.nextWatermark, lastReadCount: result.posts.length },
+            watermark: { ...result.nextWatermark, lastReadCount: posts.length },
             baselineDone: true,
             lastSuccessAt: now,
             lastError: null,

@@ -19,7 +19,7 @@ import {
   type Tx,
   type Workflow,
 } from '@seedingsys/db';
-import { FencedOutError, RetryLaterError, captionFingerprint, hashObject, isPastLaunchWindow } from '@seedingsys/domain';
+import { FencedOutError, RetryLaterError, captionFingerprint, hashObject, isPastLaunchWindow, sourceScheduleOpen } from '@seedingsys/domain';
 import type { BrowserCtx } from '../ctx';
 import { cleanupMedia, materializeMedia } from '../runtime/media';
 import { withTimeout } from '../runtime/timeout';
@@ -36,9 +36,9 @@ export type PublishOutcome =
   | 'NEEDS_OPERATOR'
   | 'FENCED';
 
-async function closeMissedSlot(t: Tx, slotId: string, actor: string, now: Date) {
-  if (!(await moveSlot(t, { id: slotId, from: 'DISPATCHED', to: 'MISSED', actor, now, reason: 'STARTED_TOO_LATE' }))) {
-    await moveSlot(t, { id: slotId, from: 'STARTED', to: 'DONE', actor, now, reason: 'RETRY_WINDOW_EXPIRED' });
+async function closeMissedSlot(t: Tx, slotId: string, actor: string, now: Date, reason?: string) {
+  if (!(await moveSlot(t, { id: slotId, from: 'DISPATCHED', to: 'MISSED', actor, now, reason: reason ?? 'STARTED_TOO_LATE' }))) {
+    await moveSlot(t, { id: slotId, from: 'STARTED', to: 'DONE', actor, now, reason: reason ?? 'RETRY_WINDOW_EXPIRED' });
   }
 }
 
@@ -142,10 +142,18 @@ export async function handlePublish(ctx: BrowserCtx, p: { publicationId: string;
     });
     if (!certified) throw new StopPreCommit('CANCELLED', 'FORMAT_NOT_CERTIFIED');
   };
+  // Shared with the stop operation's row lock, so a stop and the committing decision have a single order.
+  const scheduleIsOpen = async (t: Tx) => {
+    if (!slot?.scheduleId) return true;
+    const [schedule] = await t.$queryRaw<Array<{ stopped_at: Date | null }>>`
+      SELECT stopped_at FROM publication_schedules WHERE id=${slot.scheduleId}::uuid FOR SHARE`;
+    return schedule?.stopped_at === null;
+  };
 
   const move = async (to: PublicationStatus, commit?: { at: Date; connectorVersion: string }) => {
     const ok = await tx(ctx.db, async (t) => {
       if (commit) {
+        if (!await scheduleIsOpen(t)) throw new StopPreCommit('CANCELLED', 'SCHEDULE_STOPPED');
         await checkSource(t);
         await checkControls(t);
         await checkRelease(t, commit.connectorVersion);
@@ -156,10 +164,22 @@ export async function handlePublish(ctx: BrowserCtx, p: { publicationId: string;
           throw new StopPreCommit('CANCELLED', 'TARGET_CONFIG_CHANGED');
         }
         const mapping = await t.sourceTargetMapping.findUnique({
-          where: { sourceId_targetId: { sourceId, targetId: target.id } }, select: { enabled: true, source: { select: { enabled: true } } },
+          where: { sourceId_targetId: { sourceId, targetId: target.id } },
+          select: { enabled: true, source: { select: {
+            enabled: true, runStartMinute: true, runEndMinute: true, runNowUntil: true, runNowVariantIds: true,
+          } } },
         });
         if (!mapping?.enabled) throw new StopPreCommit('CANCELLED', 'MAPPING_DISABLED');
-        if (!slot?.manual && !mapping.source.enabled) throw new StopPreCommit('CANCELLED', 'SOURCE_DISABLED');
+        if (!slot?.manual && !slot?.scheduleId && !mapping.source.enabled) throw new StopPreCommit('CANCELLED', 'SOURCE_DISABLED');
+        if (!slot?.manual && !slot?.scheduleId && !sourceScheduleOpen(mapping.source, commit.at)) throw new StopPreCommit('CANCELLED', 'OUTSIDE_SOURCE_WINDOW');
+        const sourceSchedule = mapping.source;
+        if (slot?.reason === 'SOURCE_RUN' && (!sourceSchedule.runNowUntil || sourceSchedule.runNowUntil <= commit.at)) {
+          throw new StopPreCommit('CANCELLED', 'SOURCE_RUN_STOPPED');
+        }
+        if (!slot?.manual && !slot?.scheduleId && sourceSchedule.runNowUntil && sourceSchedule.runNowUntil > commit.at
+          && sourceSchedule.runNowVariantIds.length && !sourceSchedule.runNowVariantIds.includes(pub0.variantId)) {
+          throw new StopPreCommit('CANCELLED', 'SOURCE_RUN_SELECTION_CHANGED');
+        }
         const variant = await t.contentVariant.findUnique({ where: { id: pub0.variantId }, select: { status: true, expiresAt: true, snapshotHash: true } });
         if (variant?.expiresAt && variant.expiresAt <= ctx.clock.now()) throw new StopPreCommit('CANCELLED', 'ITEM_EXPIRED');
         if (variant?.status !== 'READY' || variant.snapshotHash !== pub0.snapshotHash) throw new StopPreCommit('CANCELLED', 'ITEM_UNAVAILABLE');
@@ -192,6 +212,13 @@ export async function handlePublish(ctx: BrowserCtx, p: { publicationId: string;
     const connector = ctx.registry.publisher(target.connector);
     attemptId = await tx(ctx.db, async (t) => {
       const now = ctx.clock.now();
+      if (slot && !await scheduleIsOpen(t)) {
+        if (await movePublication(t, { id: pub0.id, from: 'QUEUED', to: 'CANCELLED', actor: ctx.actor, now,
+          fence: lease, expectedJobVersion: p.jobVersion, reason: 'SCHEDULE_STOPPED' })) {
+          await closeMissedSlot(t, slot.id, ctx.actor, now, 'SCHEDULE_STOPPED');
+        }
+        return null;
+      }
       const ok = await movePublication(t, { id: pub0.id, from: 'QUEUED', to: 'PREPARING', actor: ctx.actor, now, fence: lease, expectedJobVersion: p.jobVersion, data: { publishTries: { increment: 1 } } });
       if (!ok) return null;
       const n = await t.publicationAttempt.count({ where: { publicationId: pub0.id } });

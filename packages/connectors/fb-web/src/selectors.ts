@@ -46,7 +46,9 @@ export const sel = {
   textbox: (dlg: Locator) => dlg.getByRole('textbox').first(),
   reelOpen: (p: Page) => p.getByRole('button', { name: /^(Tạo (thước phim|reel)|Create reel)$/i })
     .or(p.getByRole('link', { name: /^(Tạo (thước phim|reel)|Create reel)$/i })).first(),
-  createMenu: (p: Page) => p.getByRole('button', { name: /^(Menu trên Facebook|Menu)$/i }),
+  createMenu: (p: Page) => p.getByRole('button', { name: 'Menu trên Facebook', exact: true })
+    .or(p.getByRole('banner').getByRole('button', { name: 'Menu', exact: true })).filter({ visible: true }),
+  genericCreateMenu: (p: Page) => p.getByRole('button', { name: /^Menu$/i }).filter({ visible: true }),
   menuReel: (p: Page) => p.getByRole('button', { name: /^(Thước phim|Reel)$/i }).filter({ visible: true }),
   reelComposer: (p: Page) => {
     const heading = p.getByRole('heading', { name: /^(?:tạo|chỉnh sửa|chia sẻ|cài đặt) (?:thước phim|reel)$|^(?:create|edit|share) reel$|^reel settings$/i });

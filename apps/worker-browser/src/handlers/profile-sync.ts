@@ -76,9 +76,10 @@ export async function handleProfileSync(ctx: BrowserCtx, { syncId, step }: { syn
         const blocked = post.publications.some(p => HOLD_PUBLICATION.includes(p.status));
         // Another source post already gave (or is giving) this target the same content: nothing to prepare.
         const duplicate = !blocked && !!await contentHolder(t, {
-          targetId: target.id, sourcePostId: post.id, contentKey: await revisionContentKey(t, revision.id), now,
+          targetId: target.id, sourcePostId: post.id, contentKey: await revisionContentKey(t, revision.id), now, publicationsOnly: run.publish,
         });
-        if (!blocked && !duplicate && (!prior || ['EXPIRED', 'BASELINE', 'SUPERSEDED'].includes(prior.status))) {
+        if (!blocked && (!duplicate || run.publish) && (!prior || ['EXPIRED', 'BASELINE', 'SUPERSEDED'].includes(prior.status)
+          || (run.publish && prior.status === 'DUPLICATE'))) {
           for (const old of openOlder.filter(v => v.sourcePostId === post.id)) {
             const changed = await moveVariant(t, { id: old.id, from: old.status, to: 'SUPERSEDED', actor: ctx.actor, now, reason: 'profile_sync_newer_revision' });
             if (changed && old.status === 'NEEDS_REVIEW') await closeVariantReviewTasks(t, old.id, ctx.actor, now, 'profile_sync_newer_revision');
@@ -89,7 +90,9 @@ export async function handleProfileSync(ctx: BrowserCtx, { syncId, step }: { syn
             ? await t.contentVariant.update({ where: { id: prior.id }, data })
             : await t.contentVariant.create({ data: { ...data, sourcePostId: post.id, revisionId: revision.id, targetId: target.id, contentType: post.contentType } });
           preparedVariantId = prepared.id;
-          await openOperatorTask(t, { kind: 'REVIEW_CONTENT', targetId: target.id, variantId: prepared.id, now, reason: 'PROFILE_SYNC_REVIEW' });
+          if (!run.publish || run.mapping.reviewMode === 'MANUAL') {
+            await openOperatorTask(t, { kind: 'REVIEW_CONTENT', targetId: target.id, variantId: prepared.id, now, reason: 'PROFILE_SYNC_REVIEW' });
+          }
         }
 
         const latestScan = post.commentScans[0];
@@ -100,7 +103,13 @@ export async function handleProfileSync(ctx: BrowserCtx, { syncId, step }: { syn
           scanId = scan.id;
           await enqueue(t, Q.CommentScan, { scanId, ...(source.connector === 'fb-session' && { readTargetId: target.id }) });
         }
-        await t.profileSyncItem.create({ data: { syncId, sourcePostId: post.id, preparedVariantId, commentScanId: scanId } });
+        await t.profileSyncItem.create({ data: { syncId, sourcePostId: post.id, preparedVariantId, commentScanId: scanId,
+          publishStatus: run.publish ? 'PENDING' : null } });
+        if (run.publish && source.publishComments && COMMENT_READERS.includes(source.connector)
+          && target.connector === 'fb-web' && post.publications.some(p => p.status === 'PUBLISHED_VERIFIED')) {
+          await t.publication.updateMany({ where: { sourcePostId: post.id, targetId: target.id, status: 'PUBLISHED_VERIFIED',
+            permalink: { not: null }, autoReplayComments: false }, data: { autoReplayComments: true } });
+        }
         if (!duplicate) await prepareCommentDrafts(t, post.id, [target.id], now);
       }
       const more = found.length === BATCH;
@@ -109,7 +118,10 @@ export async function handleProfileSync(ctx: BrowserCtx, { syncId, step }: { syn
       } });
       if (!moved.count) throw new RetryLaterError('Lượt đồng bộ đã được cập nhật ở worker khác.');
       if (more) await enqueue(t, Q.ProfileSync, { syncId, step: step + 1 });
-      else await audit(t, { entityType: 'profile_sync', entityId: syncId, action: 'prepared', actor: ctx.actor, at: now });
+      else {
+        if (run.publish) await enqueue(t, Q.ProfileSyncPublish, { syncId });
+        await audit(t, { entityType: 'profile_sync', entityId: syncId, action: 'prepared', actor: ctx.actor, at: now });
+      }
     }, 30_000);
   } catch (error) {
     if (retryCount < 8) throw error;

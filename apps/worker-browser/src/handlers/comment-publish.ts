@@ -1,10 +1,10 @@
 import { isConnectorError, type PublishSession } from '@seedingsys/connectors-core';
 import { COMMENT_PUBLISH_RETRIES, COMMENT_QUEUE_MS, SUCCESS, type PublishSnapshot } from '@seedingsys/contracts';
-import { accountResource, acquireLease, activeKillSwitch, assertLeaseHeld, audit, releaseLease, tx, type Tx } from '@seedingsys/db';
+import { accountResource, acquireLease, activeKillSwitch, assertLeaseHeld, audit, calendarForPublicationSlot, releaseLease, tx, type Tx } from '@seedingsys/db';
 import { commentReplayBody, facebookCommentId, facebookPostId, facebookPostLink, facebookUrl, RetryLaterError } from '@seedingsys/domain';
 import type { BrowserCtx } from '../ctx';
 
-export async function handleCommentPublish(ctx: BrowserCtx, { replayId, sendVersion }: { replayId: string; sendVersion: number }, retryCount = 0) {
+export async function handleCommentPublish(ctx: BrowserCtx, { replayId, sendVersion, automatic }: { replayId: string; sendVersion: number; automatic?: boolean }, retryCount = 0) {
   const where = { id: replayId, sendVersion };
   const replay = await ctx.db.publicationComment.findFirst({ where: { ...where, status: 'QUEUED' }, include: {
     author: { include: { profile: { include: { workerNode: true } } } },
@@ -30,10 +30,14 @@ export async function handleCommentPublish(ctx: BrowserCtx, { replayId, sendVers
     if (!destination || !publication || !SUCCESS.includes(publication.status) || !publication.target.enabled) {
       throw new Error('Bài đích chưa được xác nhận hoặc không còn khả dụng.');
     }
+    if (automatic && (await calendarForPublicationSlot(ctx.db, publication.slotId))?.stoppedAt) {
+      throw new Error('Lịch đăng đã dừng.');
+    }
     const { url: post, id: postId } = destination;
     const snapshot = publication.variant.snapshot as PublishSnapshot | null;
-    if (author.id !== destinationId && (snapshot?.audience ?? publication.target.audience) === 'ONLY_ME') {
-      throw new Error('Bài đích ở chế độ Chỉ mình tôi. Hồ sơ khác không thể bình luận.');
+    const audience = snapshot?.audience ?? publication.target.audience;
+    if (author.id !== destinationId && (audience === 'ONLY_ME' || automatic && audience !== 'PUBLIC')) {
+      throw new Error('Đối tượng xem của bài đích yêu cầu dùng hồ sơ đã đăng bài để bình luận.');
     }
     const parent = source.parentExternalId ? await ctx.db.publicationComment.findFirst({
       where: { destinationId, source: { externalId: source.parentExternalId, sourcePostId: source.sourcePostId } },
@@ -70,6 +74,8 @@ export async function handleCommentPublish(ctx: BrowserCtx, { replayId, sendVers
     if (!text) throw new Error('Bình luận trống sau khi bỏ nhãn tác giả.');
     const result = await session.postComment({ post, parentId, text }, async () => {
       await tx(ctx.db, async t => {
+        const calendar = automatic ? await calendarForPublicationSlot(t, publication.slotId) : null;
+        if (calendar?.stoppedAt) throw new Error('Lịch đăng đã dừng.');
         const [current] = await t.$queryRaw<Array<{ archived_at: Date | null }>>`SELECT archived_at FROM source_posts WHERE id=${source.sourcePostId}::uuid FOR SHARE`;
         const now = ctx.clock.now();
         if (+now >= expiresAt || !current || current.archived_at || !await assertLeaseHeld(t, lease!, now, 30_000)) {
@@ -77,11 +83,21 @@ export async function handleCommentPublish(ctx: BrowserCtx, { replayId, sendVers
         }
         if (await paused(t)) throw new Error('Đăng bình luận vừa được tạm dừng.');
         const valid = await t.publication.findFirst({ where: { id: publication.id, permalink: publication.permalink,
-          status: { in: [...SUCCESS] }, target: { enabled: true } }, select: { id: true } });
+          ...(automatic && { slotId: publication.slotId }), status: { in: [...SUCCESS] }, target: { enabled: true } }, select: { id: true } });
         const authorReady = await t.targetAccount.findFirst({ where: { id: author.id, enabled: true, connector: author.connector,
           externalId: author.externalId, profile: { is: { id: author.profile!.id, profileDir: author.profile!.profileDir,
             workerNodeId: author.profile!.workerNodeId } } }, select: { id: true } });
-        if (!valid || !authorReady) throw new Error('Bài đích hoặc hồ sơ đăng vừa thay đổi.');
+        const autoSource = automatic ? await t.source.findFirst({ where: {
+          id: source.post.sourceId, publishComments: true,
+          mappings: { some: { targetId: destinationId, enabled: true } },
+        }, select: { enabled: true } }) : null;
+        let autoEnabled = !automatic || !!autoSource?.enabled;
+        if (automatic && autoSource && !autoEnabled && calendar) {
+          const scan = await t.commentScan.findFirst({ where: { sourcePostId: source.sourcePostId },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], select: { status: true } });
+          autoEnabled = scan?.status === 'COMPLETE';
+        }
+        if (!valid || !authorReady || !autoEnabled) throw new Error('Bài đích, hồ sơ đăng hoặc cấu hình vừa thay đổi.');
         const changed = await t.publicationComment.updateMany({ where: { ...where, status: 'QUEUED' }, data: {
           status: 'SENDING', text, updatedAt: now,
         } });
