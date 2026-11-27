@@ -11,6 +11,7 @@ export { PgBoss };
  */
 export const QUEUE_SETTINGS: Record<QueueName, Omit<PgBoss.Queue, 'name'>> = {
   // stately + singletonKey=sourceId → at most one queued and one running poll per source.
+  [Q.TargetBrowser]: { policy: 'standard', retryLimit: 1, retryDelay: 10, expireInSeconds: 60 * 60 },
   [Q.SourcePoll]: { policy: 'stately', retryLimit: 0, expireInSeconds: 4 * 60 },
   [Q.ProfileSync]: { policy: 'standard', retryLimit: 8, retryDelay: 25, expireInSeconds: 5 * 60 },
   [Q.CommentScan]: { policy: 'standard', retryLimit: 6, retryDelay: 30, expireInSeconds: 4 * 60 },

@@ -201,6 +201,7 @@ model TargetAccount {
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   mappings     SourceTargetMapping[]
+  browserRuns  TargetBrowserRun[]
   profile      BrowserProfile?
   variants     ContentVariant[]
   slots        PublicationSlot[]
@@ -210,6 +211,21 @@ model TargetAccount {
   commentDestinations PublicationComment[] @relation("CommentDestination")
 
   @@map("target_accounts")
+}
+
+model TargetBrowserRun {
+  id String @id @default(uuid()) @db.Uuid
+  targetId String @map("target_id") @db.Uuid
+  target TargetAccount @relation(fields: [targetId], references: [id])
+  kind String
+  status String @default("QUEUED")
+  profileUrl String? @map("profile_url")
+  limit Int @default(0)
+  results Json @default("[]")
+  message String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  @@index([targetId, kind, createdAt])
+  @@map("target_browser_runs")
 }
 
 model SourceTargetMapping {

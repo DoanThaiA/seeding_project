@@ -5,6 +5,7 @@ import { z } from 'zod';
  * Handlers must be idempotent: the queue delivers at least once.
  */
 export const Q = {
+  TargetBrowser: 'target.browser',
   SourcePoll: 'source.poll',
   ProfileSync: 'profile.sync',
   CommentScan: 'comment.scan',
@@ -26,6 +27,7 @@ export type QueueName = (typeof Q)[keyof typeof Q];
 const id = z.string().uuid();
 
 export const JobSchemas = {
+  [Q.TargetBrowser]: z.object({ runId: id }),
   [Q.SourcePoll]: z.object({ sourceId: id, collectComments: z.boolean().optional() }),
   [Q.ProfileSync]: z.object({ syncId: id, step: z.number().int().min(0) }),
   [Q.CommentScan]: z.object({ scanId: id, readTargetId: id.optional(), manual: z.boolean().optional() }),

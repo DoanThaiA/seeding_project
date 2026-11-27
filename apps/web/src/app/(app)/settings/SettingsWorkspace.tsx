@@ -112,7 +112,7 @@ export function SettingsWorkspace({ sources, targets, mappings, capabilities }: 
       <div className={styles.resourcePicker}><label htmlFor="admin-target">Tài khoản đích</label><select id="admin-target" value={targetId} onChange={e => setTargetId(e.target.value)}>
         {targets.map(t => <option key={t.id} value={t.id}>{t.code} · {t.name}</option>)}<option value="new">+ Thêm đích</option>
       </select></div>
-      <TargetForm key={targetId} target={byTarget.get(targetId)} capabilities={capabilities} />
+      <TargetForm onCreated={setTargetId} key={byTarget.get(targetId)?.id ?? 'new'} target={byTarget.get(targetId)} capabilities={capabilities} />
       <Readiness capabilities={capabilities} />
     </div>}
   </div>;

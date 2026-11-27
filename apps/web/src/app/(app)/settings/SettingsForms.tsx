@@ -5,6 +5,7 @@ import { useId, useState, type ReactNode } from 'react';
 import { bff, useSubmit } from '@/components/client';
 import { Badge } from '@/components/ui';
 import { fmtTime } from '@/lib/format';
+import { TargetBrowser } from './TargetBrowser';
 import styles from './settings.module.css';
 
 export interface SourceT {
@@ -155,7 +156,7 @@ function targetDraft(t?: TargetT) {
   return { code: t?.code ?? '', name: t?.name ?? '', externalId: t?.externalId ?? '', connector: t?.connector ?? 'fake', audience: t?.audience ?? 'ONLY_ME', enabled: t?.enabled ?? true };
 }
 
-export function TargetForm({ target, capabilities }: { target?: TargetT; capabilities: Capabilities }) {
+export function TargetForm({ target, capabilities, onCreated }: { target?: TargetT; capabilities: Capabilities; onCreated?: (id: string) => void }) {
   const id = useId();
   const [form, setForm] = useState(() => targetDraft(target));
   const savedStyle = JSON.stringify(target?.styleProfile ?? {}, null, 2);
@@ -182,6 +183,7 @@ export function TargetForm({ target, capabilities }: { target?: TargetT; capabil
         sub.run(async () => {
           const result = await bff<TargetT>(target ? 'PATCH' : 'POST', target ? 'targets/' + target.id : 'targets', { ...form, styleProfile });
           if (result.ok) {
+            if (!target) onCreated?.(result.data.id);
             setForm(targetDraft(target ? result.data : undefined));
             setStyle(JSON.stringify(target ? result.data.styleProfile : {}, null, 2));
           }
@@ -205,7 +207,7 @@ export function TargetForm({ target, capabilities }: { target?: TargetT; capabil
         <Feedback state={sub} />
       </form>
       {target?.connector === 'fb-web' && <div className={styles.scanStatus}>
-        <p>{target.profile ? 'Đã gắn hồ sơ trình duyệt.' : 'Cần gắn hồ sơ trình duyệt trên máy worker.'}</p>
+        <TargetBrowser targetId={target.id} disabled={dirty} />
         <p>{formats.length ? formats.length + ' định dạng đã đạt kiểm thử với phiên bản hiện hành.' : 'Định dạng đăng theo cấu hình worker. Kiểm thử là tùy chọn.'}</p>
       </div>}
     </Panel>

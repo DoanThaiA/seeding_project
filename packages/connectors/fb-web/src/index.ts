@@ -3,7 +3,6 @@ import {
   ConnectorError,
   type CapabilitySet,
   type PublishConnector,
-  type PublishSession,
   type ReadConnector,
   type ReadResult,
   type TargetRef,
@@ -54,7 +53,7 @@ export class FbWebPublishConnector implements PublishConnector {
    * 2-step, any checkpoint). Nothing here types credentials or automates the login.
    * `closed` resolves when the person closes the window. The profile must not be in use.
    */
-  async openForManualLogin(target: TargetRef): Promise<{ closed: Promise<void> }> {
+  async openForManualLogin(target: TargetRef): Promise<{ closed: Promise<void>; close: () => Promise<void> }> {
     const ctx = await chromium.launchPersistentContext(this.profilePath(target), {
       headless: false,
       channel: this.opts.channel,
@@ -64,11 +63,17 @@ export class FbWebPublishConnector implements PublishConnector {
       viewport: null,
     });
     const page = ctx.pages()[0] ?? (await ctx.newPage());
-    await page.goto(this.opts.baseUrl).catch(() => undefined);
-    return { closed: new Promise<void>((resolve) => ctx.on('close', () => resolve())) };
+    const closed = new Promise<void>(resolve => ctx.once('close', () => resolve()));
+    try {
+      await page.goto(this.opts.baseUrl, { waitUntil: 'domcontentloaded' });
+      return { closed, close: () => ctx.close() };
+    } catch (error) {
+      await ctx.close().catch(() => undefined);
+      throw error;
+    }
   }
 
-  async openSession(target: TargetRef): Promise<PublishSession> {
+  async openSession(target: TargetRef): Promise<FbWebSession> {
     let ctx;
     try {
       ctx = await chromium.launchPersistentContext(this.profilePath(target), {

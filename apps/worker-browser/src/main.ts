@@ -15,6 +15,7 @@ import { createStore } from '@seedingsys/storage';
 import { DEFAULT_BROWSER_SETTINGS, handleAgentRecover, handlePublish, handleReconcile, handleSourcePoll, Semaphore, type BrowserCtx } from './index';
 import { handleCommentScan } from './handlers/comment-scan';
 import { handleCommentPublish } from './handlers/comment-publish';
+import { handleTargetBrowser } from './handlers/target-browser';
 import { handleProfileSync } from './handlers/profile-sync';
 
 async function main() {
@@ -70,6 +71,7 @@ async function main() {
     }
   };
 
+  await work(boss, Q.TargetBrowser, cfg.COLLECTOR_CONCURRENCY, log, (p, job) => collectors.run(() => handleTargetBrowser(ctx, p.runId, node.id, job.retryCount)));
   await work(boss, Q.SourcePoll, cfg.COLLECTOR_CONCURRENCY, log, (p) => retryable(() => collectors.run(() => handleSourcePoll(ctx, p))));
   await work(boss, Q.CommentScan, 1, log, (p, job) => retryable(() => collectors.run(() => handleCommentScan(ctx, p, job.retryCount))));
   await work(boss, Q.CommentPublish, 1, log, (p, job) => retryable(() => publishers.run(() => handleCommentPublish(ctx, p, job.retryCount))));

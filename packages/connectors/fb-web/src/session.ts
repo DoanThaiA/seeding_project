@@ -17,6 +17,7 @@ import { facebookPostId } from '@seedingsys/domain';
 import { confirmedCommentPostIds } from './comments';
 import type { FbWebOptions } from './config';
 import { AUDIENCE_LABEL, CHECKPOINT_TEXT, PROCESSING_TEXT, URLS, sel } from './selectors';
+import { scanFriends, type FriendProfile } from './friends';
 import { parseViTime } from './vi-time';
 
 const norm = (s: string) => s.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -186,6 +187,12 @@ export class FbWebSession implements PublishSession {
   }
 
   // ───────────── session & identity ─────────────
+  async scanFriends(source: string, limit: number, progress: (rows: FriendProfile[]) => Promise<void>) {
+    return scanFriends(this.page, this.opts.baseUrl, source, limit, async () => {
+      if (await this.classify() !== 'OK') throw new Error('Phiên Facebook cần đăng nhập hoặc xác minh lại.');
+    }, progress);
+  }
+
   async sessionState() {
     await this.step('open-home', () => this.go('/'));
     return this.classify();

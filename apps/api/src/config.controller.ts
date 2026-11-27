@@ -136,6 +136,39 @@ export class ConfigController {
     return out(t);
   }
 
+  @Get('targets/:id/browser')
+  @Roles('admin')
+  async browserRuns(@Param('id', ParseUUIDPipe) id: string) {
+    const latest = (kind: string) => this.db.targetBrowserRun.findFirst({ where: { targetId: id, kind }, orderBy: { createdAt: 'desc' } });
+    const [login, scan] = await Promise.all([latest('login'), latest('scan')]);
+    const visible = (run: typeof scan) => run && ['QUEUED', 'RUNNING', 'OPEN'].includes(run.status)
+      && this.clock.now().getTime() - run.createdAt.getTime() >= 60 * 60_000
+      ? { ...run, status: 'FAILED', message: 'Lượt xử lý đã hết thời gian. Bạn có thể chạy lại.' } : run;
+    return out({ login: visible(login), scan: visible(scan) });
+  }
+
+  @Post('targets/:id/browser')
+  @Roles('admin')
+  async browserAction(@Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const input = parse(z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('login') }),
+      z.object({ kind: z.literal('scan'), profile: z.string().trim().min(1), limit: z.number().int().min(1).max(100) }),
+    ]), body);
+    const profileUrl = input.kind === 'scan' ? publicSourceRef(/^\d+$/.test(input.profile)
+      ? 'https://www.facebook.com/profile.php?id=' + input.profile : input.profile) : null;
+    return tx(this.db, async t => {
+      await t.$queryRaw`SELECT id FROM target_accounts WHERE id = ${id}::uuid FOR UPDATE`;
+      const target = await t.targetAccount.findUnique({ where: { id } });
+      if (!target || target.connector !== 'fb-web') throw new BadRequestException('Chọn tài khoản Facebook đã lưu.');
+      const busy = await t.targetBrowserRun.findFirst({ where: { targetId: id, status: { in: ['QUEUED', 'RUNNING', 'OPEN'] },
+        createdAt: { gt: new Date(this.clock.now().getTime() - 60 * 60_000) } } });
+      if (busy) throw new ConflictException('Tài khoản đang bận. Đóng cửa sổ đăng nhập hoặc chờ lượt quét hoàn tất.');
+      const run = await t.targetBrowserRun.create({ data: { targetId: id, kind: input.kind, profileUrl, limit: input.kind === 'scan' ? input.limit : 0 } });
+      await enqueue(t, Q.TargetBrowser, { runId: run.id });
+      return out(run);
+    });
+  }
+
   @Get('mappings')
   async mappings() {
     return out(await this.db.sourceTargetMapping.findMany({ include: { source: { select: { code: true } }, target: { select: { code: true } } } }));
