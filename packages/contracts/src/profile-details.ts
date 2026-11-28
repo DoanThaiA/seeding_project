@@ -30,3 +30,20 @@ export const SyncedProfileDetails = z.object({
   snapshot: ProfileDetailsSnapshot,
 });
 export type SyncedProfileDetails = z.infer<typeof SyncedProfileDetails>;
+
+/** Read existing wall archives from before source-only persona imports. */
+export const PersonaWallSnapshot = z.object({
+  targetExternalId: z.string(),
+  profile: ProfileDetailsSnapshot,
+  posts: z.array(z.object({
+    id: z.string(),
+    permalink: z.string().url(),
+    caption: z.string(),
+    contentType: z.string(),
+    postedAt: z.string().datetime().nullable(),
+    postedAtExact: z.boolean().optional(),
+    incomplete: z.array(z.string()),
+  })).max(40),
+  postWarning: z.string().nullable(),
+});
+export type PersonaWallSnapshot = z.infer<typeof PersonaWallSnapshot>;

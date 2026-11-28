@@ -2,9 +2,9 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { ConnectorError, type MediaFile, type PublishSession } from '@seedingsys/connectors-core';
-import { FbPublicReadConnector, FbWebPublishConnector, parseViTime, runCapability, type FbWebOptions } from '@seedingsys/connectors-fb-web';
-import type { ContentType, PublishSnapshot } from '@seedingsys/contracts';
+import { ConnectorError, type MediaFile, type PublishSession, type VerifyHint } from '@seedingsys/connectors-core';
+import { FbPublicReadConnector, FbWebPublishConnector, fbWebOptionsFromEnv, parseViTime, runCapability, type FbWebOptions } from '@seedingsys/connectors-fb-web';
+import { FB_WEB_PUBLISH_FORMATS, type ContentType, type PublishSnapshot } from '@seedingsys/contracts';
 import { captionFingerprint } from '@seedingsys/domain';
 import { MockFb } from '../helpers/mock-fb';
 
@@ -111,6 +111,9 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
     expect(new FbWebPublishConnector({ ...opts, enabledFormats: [] }).capabilities(target)).toMatchObject({ TEXT: false, VIDEO: false, MULTI_PHOTO: false });
     expect(connector.capabilities(target)).toMatchObject({ TEXT: true, SINGLE_PHOTO: true, MULTI_PHOTO: true, VIDEO: false });
     expect(connector.capabilities(target)).not.toHaveProperty('NAMED_ALBUM');
+    expect(fbWebOptionsFromEnv({}).enabledFormats).toEqual(FB_WEB_PUBLISH_FORMATS);
+    expect(fbWebOptionsFromEnv({ FB_ENABLED_FORMATS: '' }).enabledFormats).toEqual(FB_WEB_PUBLISH_FORMATS);
+    expect(fbWebOptionsFromEnv({ FB_ENABLED_FORMATS: 'VIDEO' }).enabledFormats).toEqual(['VIDEO']);
   });
 
   it('changes and verifies the avatar and cover only after authorization to save', async () => {
@@ -154,8 +157,8 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
   });
 
   it('checks identity by numeric id or vanity name and rejects a different account', async () => {
-    expect(await withSession((s) => s.checkIdentity('100012345'))).toMatchObject({ ok: true });
-    expect(await withSession((s) => s.checkIdentity('999'))).toMatchObject({ ok: false, observed: '100012345' });
+    expect(await withSession((s) => s.checkIdentity(' 100012345 '))).toMatchObject({ ok: true, observed: '100012345' });
+    expect(await withSession((s) => s.checkIdentity(' 999 '))).toMatchObject({ ok: false, observed: '100012345' });
     mock.vanity = 'tester.vn';
     expect(await withSession((s) => s.checkIdentity('Tester.VN'))).toMatchObject({ ok: true });
     mock.session = 'LOGGED_OUT';
@@ -262,6 +265,30 @@ describe.skipIf(!BROWSER)('fb-web connector against the mock Facebook UI', () =>
         { text: 'Bình luận gốc' }, { text: 'Phản hồi đúng nhánh', parentId: root?.externalId },
         { text: 'Phản hồi tiếp', parentId: reply?.externalId },
       ]);
+    });
+  });
+
+  it.each(['12345', '12345:67890'])('reads only the verified caption for %s and a photo with an empty caption', async id => {
+    const post = mock.addPost({ id, caption: 'Hội sách cuối tuần.\nVào cửa tự do.', previewFixture: true });
+    const photo = mock.addPost({ caption: '', photoId: '346576', previewFixture: true });
+    mock.comments.push({ postId: post.id, id: 'c1', text: 'Bình luận có sẵn' });
+    await withSession(async session => {
+      expect(await session.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const link = new URL('https://www.facebook.com/posts/' + post.id);
+      expect(await session.readCommentPost!(link)).toMatchObject({ url: link.href, caption: post.caption, author: 'Hồ sơ thử nghiệm' });
+      expect(await session.readCommentPost!(new URL('https://www.facebook.com/photo?fbid=' + photo.photoId))).toMatchObject({
+        author: 'Hồ sơ thử nghiệm', caption: '',
+      });
+      expect(mock.comments).toMatchObject([{ text: 'Bình luận có sẵn' }]);
+    });
+  });
+
+  it('reads the primary album story when its numeric permalink has a pfbid alias', async () => {
+    const post = mock.addPost({ id: '54321', caption: 'Album có link số và pfbid ❤️', storyAlias: 'pfbidAlbumAlias', previewFixture: true });
+    await withSession(async session => {
+      expect(await session.checkIdentity(target.externalId)).toMatchObject({ ok: true });
+      const link = new URL(`https://www.facebook.com/permalink.php?story_fbid=${post.id}&id=${target.externalId}`);
+      expect(await session.readCommentPost!(link)).toMatchObject({ url: link.href, caption: post.caption });
     });
   });
 
@@ -528,7 +555,7 @@ describe.skipIf(!BROWSER)('verify modes (caption = default, off)', () => {
       ...over,
     });
   const hint = (caption: string, mediaCount = 0) => ({ captionFingerprint: captionFingerprint(caption), caption, mediaCount, committedAt: new Date(), windowMs: 30 * 60_000 });
-  const verifyWith = async (c: FbWebPublishConnector, h: ReturnType<typeof hint>) => {
+  const verifyWith = async (c: FbWebPublishConnector, h: VerifyHint) => {
     const s = await c.openSession(target);
     try {
       return await s.verify(h);
@@ -605,6 +632,42 @@ describe.skipIf(!BROWSER)('verify modes (caption = default, off)', () => {
     mock.addPost({ caption: 'Video mới đăng', video: true, hiddenTime: true, videoHref: '/reel/222' });
     expect(await verifyWith(mk('caption'), hint('Video mới đăng', 1))).toMatchObject({
       kind: 'VERIFIED', permalink: expect.stringMatching(/\/reel\/222$/), externalPostId: '222',
+    });
+  });
+
+  it('uses a Reel notification when Facebook publishes a standard video as a Reel without a timeline link', async () => {
+    const post = mock.addPost({ caption: 'ABC', reel: true, video: true, hiddenTime: true });
+    expect(await verifyWith(mk('caption'), { ...hint('ABC', 1), contentType: 'VIDEO' })).toMatchObject({
+      kind: 'VERIFIED', externalPostId: post.id, evidence: { method: 'reel_notification' },
+    });
+  });
+
+  it('opens the permalink to confirm a long photo caption rendered with inline emoji', async () => {
+    const opening = 'Hội sách cuối tuần ❤️ ' + 'Những câu chuyện đáng nhớ của bạn đọc ở Huế. '.repeat(4);
+    const post = mock.addPost({ caption: opening + 'Đăng ký tại quầy.', media: 11, previewFixture: true, lazyHref: true,
+      timelineCaptionHtml: opening.trimEnd().replace('❤️', '<img alt="❤️">') + '… <button>Xem thêm</button>' });
+    const connector = mk('caption');
+    expect(await verifyWith(connector, { ...hint(post.caption, 11), contentType: 'MULTI_PHOTO' })).toMatchObject({
+      kind: 'VERIFIED', externalPostId: post.id,
+    });
+    expect(await verifyWith(connector, { ...hint(opening + 'Nhận sách tại thư viện.', 11), contentType: 'MULTI_PHOTO' })).toMatchObject({
+      kind: 'NOT_FOUND', conclusive: false, evidence: { permalinkCaptionUnconfirmed: true },
+    });
+  });
+
+  it('expands a photo caption cut at 100 characters before verifying its permalink', async () => {
+    const opening = 'Mời mọi người cùng xem lại những khoảnh khắc đáng nhớ của buổi gặp mặt. '.repeat(4);
+    const caption = opening + 'Xem ảnh ở cuối bài.';
+    const post = mock.addPost({ caption, media: 16, previewFixture: true, lazyHref: true,
+      timelineCaptionHtml: `<span>${caption.slice(0, 100)}…</span>
+        <button onclick="this.previousElementSibling.hidden=true;this.nextElementSibling.hidden=false;this.hidden=true">Xem thêm</button>
+        <span hidden>${caption} <button>Ẩn bớt</button></span>` });
+    const connector = mk('caption');
+    expect(await verifyWith(connector, { ...hint(caption, 16), contentType: 'MULTI_PHOTO' })).toMatchObject({
+      kind: 'VERIFIED', externalPostId: post.id,
+    });
+    expect(await verifyWith(connector, { ...hint(opening + 'Xem album của người khác.', 16), contentType: 'MULTI_PHOTO' })).toMatchObject({
+      kind: 'NOT_FOUND', conclusive: false,
     });
   });
 

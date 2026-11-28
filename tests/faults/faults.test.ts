@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { Q } from '@seedingsys/contracts';
+import { Q, RECONCILE_EXHAUSTED } from '@seedingsys/contracts';
 import { prepareCommentDrafts, setControl, tx } from '@seedingsys/db';
 import { handlePublish, handleReconcile } from '../../apps/worker-browser/src';
 import { handleSourcePoll } from '../../apps/worker-browser/src/handlers/source-poll';
@@ -124,9 +124,13 @@ describe('fault injection (spec §12, plan phase 6)', () => {
     expect(h.platform.timeline('fb-B1')).toHaveLength(1);
   });
 
-  it('recovers a lost reconcile lease without posting again', async () => {
+  it.each([true, false])('respects the total verify budget after a lost reconcile lease (initial verify: %s)', async initialVerify => {
     await readyPostForB1();
-    h.platform.inject({ stage: 'verify', action: { kind: 'verifyNotFound' }, match: 'fb-B1' });
+    if (initialVerify) {
+      h.platform.inject({ stage: 'verify', action: { kind: 'verifyNotFound' }, match: 'fb-B1' });
+    } else {
+      h.platform.inject({ stage: 'commit.after', action: { kind: 'throw', errorKind: 'TRANSIENT', sideEffectPossible: true }, match: 'fb-B1' });
+    }
     h.setTime(TEN);
     await cycle(h);
     const [p] = await pubsOf(h, 'B1');
@@ -148,7 +152,9 @@ describe('fault injection (spec §12, plan phase 6)', () => {
       expect(await running).toBe('FENCED');
     }
     const [settled] = await pubsOf(h, 'B1');
-    expect(settled.status).toBe('PUBLISHED_VERIFIED');
+    expect(settled.status).toBe(initialVerify ? 'NEEDS_OPERATOR' : 'PUBLISHED_VERIFIED');
+    expect(settled.reconcileTries).toBe(initialVerify ? 1 : 2);
+    if (initialVerify) expect(settled.lastReason).toBe(RECONCILE_EXHAUSTED);
     expect(settled.attempts.filter(attempt => attempt.outcome === 'RUNNING')).toHaveLength(0);
     expect(h.platform.timeline('fb-B1')).toHaveLength(1);
     expect(h.failures).toEqual([]);
@@ -188,8 +194,8 @@ describe('fault injection (spec §12, plan phase 6)', () => {
     ['a source kill switch enabled during preparation', 'KILL_SWITCH_SOURCE', async () => {
       await setControl(h.db, 'SOURCE', h.ids.sources.A1, true, 'test', 'paused mid-draft');
     }],
-    ['a certification removed during preparation', 'FORMAT_NOT_CERTIFIED', async () => {
-      await h.db.capabilityCheck.deleteMany({ where: { targetId: h.ids.targets.B1, contentType: 'TEXT' } });
+    ['a format kill switch enabled during preparation', 'KILL_SWITCH_FORMAT', async () => {
+      await setControl(h.db, 'FORMAT', 'TEXT', true, 'test', 'paused mid-draft');
     }],
   ])('stops before commit for %s', async (_label, reason, change) => {
     await readyPostForB1();
@@ -210,26 +216,32 @@ describe('fault injection (spec §12, plan phase 6)', () => {
     expect(h.platform.timeline('fb-B1')).toHaveLength(0);
   });
 
-  it('UI said "posted" but nothing exists → stays UNKNOWN until conclusive, then republished once', async () => {
-    await readyPostForB1();
+  it('stops after two verification attempts and dispatches a different post to the same account', async () => {
+    await readyPostForB1('Bài cũ báo đăng thành công nhưng chưa tìm thấy');
     h.platform.inject({ stage: 'commit.after', action: { kind: 'dropPost' }, match: 'fb-B1' });
     h.setTime(TEN);
     await cycle(h);
     expect((await pubsOf(h, 'B1'))[0].status).toBe('UNKNOWN');
-    for (let i = 0; i < 6; i++) {
-      h.advance(2 * MIN + 1000);
-      await h.workerHeartbeat();
-      await h.drain();
-    }
-    expect((await pubsOf(h, 'B1'))[0].status).toBe('FAILED_CONFIRMED');
+    h.advance(h.browser.reconcileMinAgeMs + MIN);
+    await h.drain();
+    h.advance(3 * MIN);
+    await h.drain();
+    const [skipped] = await pubsOf(h, 'B1');
+    expect(skipped).toMatchObject({ status: 'NEEDS_OPERATOR', lastReason: RECONCILE_EXHAUSTED, reconcileTries: 1, publishTries: 1 });
+    expect(skipped.attempts.map(attempt => attempt.kind)).toEqual(['publish', 'reconcile']);
+    expect(await h.db.operatorTask.count({ where: { publicationId: skipped.id, kind: 'CONFIRM_RESULT', status: 'OPEN' } })).toBe(1);
     expect(h.platform.timeline('fb-B1')).toHaveLength(0);
 
+    h.platform.addSourcePost('A1', { text: 'Bài tiếp theo có nội dung riêng', contentType: 'TEXT', media: [] });
+    h.advance(5 * MIN);
+    await cycle(h);
     h.setTime(ELEVEN);
     await cycle(h);
-    const [p] = await pubsOf(h, 'B1');
-    expect(p.status).toBe('PUBLISHED_VERIFIED');
-    expect(p.publishTries).toBe(2);
-    expect(h.platform.timeline('fb-B1')).toHaveLength(1);
+    const rows = await pubsOf(h, 'B1');
+    expect(rows).toHaveLength(2);
+    expect(rows.find(row => row.id !== skipped.id)).toMatchObject({ status: 'PUBLISHED_VERIFIED', publishTries: 1 });
+    expect(rows.find(row => row.id === skipped.id)).toMatchObject({ status: 'NEEDS_OPERATOR', publishTries: 1, reconcileTries: 1 });
+    expect(h.platform.timeline('fb-B1')).toMatchObject([{ caption: expect.stringContaining('Bài tiếp theo có nội dung riêng') }]);
   });
 
   it('scheduler running twice for the same hour creates no duplicate slots or posts', async () => {
@@ -325,8 +337,9 @@ describe('fault injection (spec §12, plan phase 6)', () => {
     await cycle(h);
     const [pub] = await pubsOf(h, 'B1');
     await h.db.targetAccount.updateMany({
-      where: { id: { in: [pub.targetId, h.ids.targets.B2] } }, data: { connector: 'fb-web', audience: 'PUBLIC' },
+      where: { id: { in: [pub.targetId, h.ids.targets.B2, h.ids.targets.B3] } }, data: { connector: 'fb-web', audience: 'PUBLIC' },
     });
+    await setControl(h.db, 'TARGET', h.ids.targets.B3, true, 'test', 'paused comment profile');
     const variant = await h.db.contentVariant.findUniqueOrThrow({ where: { id: pub.variantId } });
     await h.db.contentVariant.update({ where: { id: variant.id }, data: {
       snapshot: { ...(variant.snapshot as object), audience: 'PUBLIC' },
@@ -342,30 +355,30 @@ describe('fault injection (spec §12, plan phase 6)', () => {
         sourcePostId: pub.sourcePostId, externalId, parentExternalId, text: 'Bình luận ' + position, position, lastSeenAt: h.clock.now(),
       } });
     }
-    await tx(h.db, t => prepareCommentDrafts(t, pub.sourcePostId, [pub.targetId], h.clock.now()));
-    await tx(h.db, t => prepareCommentDrafts(t, pub.sourcePostId, [pub.targetId], h.clock.now()));
-    const saved = await h.db.publicationComment.findMany({
+    const assignments = () => h.db.publicationComment.findMany({
       where: { destinationId: pub.targetId },
       orderBy: { source: { position: 'asc' } },
       select: { authorTargetId: true, autoAuthor: true },
     });
-    expect(saved).toEqual([
-      { authorTargetId: pub.targetId, autoAuthor: true },
-      { authorTargetId: h.ids.targets.B2, autoAuthor: true },
-    ]);
+    await tx(h.db, t => prepareCommentDrafts(t, pub.sourcePostId, [pub.targetId], h.clock.now()));
+    const saved = await assignments();
+    expect(saved.every(item => item.autoAuthor)).toBe(true);
+    expect(new Set(saved.map(item => item.authorTargetId))).toEqual(new Set([pub.targetId, h.ids.targets.B2]));
+    await tx(h.db, t => prepareCommentDrafts(t, pub.sourcePostId, [pub.targetId], h.clock.now()));
+    expect(await assignments()).toEqual(saved);
     expect(await dispatchAutomaticComments(h.core)).toBe(0);
     await h.db.commentScan.update({ where: { id: scan.id }, data: { status: 'COMPLETE' } });
     expect(await dispatchAutomaticComments(h.core)).toBe(1);
     expect(await dispatchAutomaticComments(h.core)).toBe(0);
     const parent = await h.db.publicationComment.findFirstOrThrow({ where: { status: 'QUEUED' } });
-    expect(parent.authorTargetId).toBe(pub.targetId);
+    expect(parent.authorTargetId).toBe(saved[0].authorTargetId);
     await h.db.publicationComment.update({ where: { id: parent.id }, data: {
       status: 'POSTED', permalink: 'https://www.facebook.com/123/posts/789?comment_id=100',
     } });
     expect(await dispatchAutomaticComments(h.core)).toBe(1);
     expect(await h.db.outboxEvent.count({ where: { queue: Q.CommentPublish } })).toBe(2);
     const reply = await h.db.publicationComment.findFirstOrThrow({ where: { status: 'QUEUED' } });
-    expect(reply.authorTargetId).toBe(h.ids.targets.B2);
+    expect(reply.authorTargetId).toBe(saved[1].authorTargetId);
   });
 
   it('album with a missing image never posts partially', async () => {

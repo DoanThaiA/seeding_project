@@ -52,15 +52,20 @@ export class ProfileDetailsController {
     return tx(this.db, async t => {
       const mapping = await this.lockMapping(t, mappingId);
       const { source, target } = mapping;
-      if (source.connector === 'fb-session' && (!target.enabled || !target.profile)) {
-        throw new ConflictException('Nguồn này cần phiên Facebook đang bật của hồ sơ B để quét.');
-      }
+      await t.$queryRaw`SELECT id FROM target_accounts WHERE id=${target.id}::uuid FOR UPDATE`;
       const now = this.clock.now();
       const previous = matchingScan(mapping);
       if (previous && applying.includes(previous.bioStatus) && fresh(previous.bioUpdatedAt, now)) {
         throw new ConflictException('Đang cập nhật tiểu sử Facebook.');
       }
       if (previous && reading.includes(previous.status) && fresh(previous.updatedAt, now)) return { queued: false };
+      const cutoff = new Date(+now - PROFILE_SCAN_TIMEOUT_MS);
+      const other = await t.profileDetailsScan.findFirst({ where: { mappingId: { not: mappingId }, mapping: { targetId: target.id },
+        targetExternalId: target.externalId, OR: [
+          { status: { in: reading }, updatedAt: { gt: cutoff } },
+          { bioStatus: { in: applying }, bioUpdatedAt: { gt: cutoff } },
+        ] }, select: { mappingId: true } });
+      if (other) throw new ConflictException('Hồ sơ B đang nhận dữ liệu từ một nguồn khác. Hãy chờ lượt đó hoàn tất.');
       const requestId = randomUUID();
       const values = { requestId, sourceRef: source.externalRef, sourceConnector: source.connector, targetExternalId: target.externalId,
         status: 'QUEUED', snapshot: Prisma.DbNull, error: null, updatedAt: now,

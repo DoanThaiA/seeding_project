@@ -7,6 +7,8 @@ import { createLogger, initObservability } from '@seedingsys/observability';
 import { createBoss, relayOutboxOnce, work } from '@seedingsys/queue';
 import { handleContentRewrite, handleContentValidate, schedulerTick, type CoreCtx } from './index';
 import { dispatchProfileSync } from './maintenance/profile-sync-publish';
+import { handleCommentScriptGeneration } from './handlers/comment-script-generate';
+import { handlePersonaInsight } from './handlers/persona-insight';
 
 async function main() {
   const cfg = loadConfig();
@@ -38,6 +40,10 @@ async function main() {
     log.info(r, 'scheduler tick');
   });
   await work(boss, Q.ContentRewrite, cfg.LLM_MAX_CONCURRENCY, log, (p) => handleContentRewrite(ctx, p));
+  await work(boss, Q.CommentScriptGenerate, cfg.LLM_MAX_CONCURRENCY, log,
+    ({ generationId }, job) => handleCommentScriptGeneration(ctx, generationId, job.retryCount));
+  await work(boss, Q.PersonaSummary, cfg.LLM_MAX_CONCURRENCY, log,
+    ({ runId }, job) => handlePersonaInsight(ctx, runId, job.retryCount));
   await work(boss, Q.ContentValidate, 3, log, (p) => handleContentValidate(ctx, p));
   await work(boss, Q.ProfileSyncPublish, 1, log, async ({ syncId }) => { await dispatchProfileSync(ctx, syncId); });
 

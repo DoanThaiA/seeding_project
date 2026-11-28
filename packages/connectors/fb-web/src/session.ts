@@ -12,9 +12,11 @@ import {
   type VerifyHint,
   type VerifyResult,
 } from '@seedingsys/connectors-core';
-import type { PublishSnapshot } from '@seedingsys/contracts';
+import { COMMENT_POST_IMAGE_BYTES, COMMENT_POST_IMAGE_MIME, COMMENT_POST_IMAGES,
+  type CommentPostImage, type PublishSnapshot } from '@seedingsys/contracts';
 import { facebookPostId, facebookScriptPost } from '@seedingsys/domain';
 import { confirmedCommentPostIds } from './comments';
+import { readPostCaption, readPostImageSources } from './comment-post';
 import type { FbWebOptions } from './config';
 import { AUDIENCE_LABEL, CHECKPOINT_TEXT, PROCESSING_TEXT, URLS, sel } from './selectors';
 import { scanFriends, type FriendProfile } from './friends';
@@ -25,8 +27,63 @@ import { prepareProfileBio, readProfileIntro } from './profile-details';
 const norm = (s: string) => s.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
 const normalizedComment = (text: string) => text.normalize('NFC').replace(/\s+/g, ' ').trim();
 const storyCard = 'article,[role="article"],[data-pagelet^="FeedUnit"],[data-post]';
+const postMessage = '[data-ad-preview="message"],[data-ad-comet-preview="message"],[data-ad-rendering-role="story_message"],[data-testid="post_message"]';
+const expandCaptionAttr = 'data-sb-expand-caption';
 const commentCard = 'article,[role="article"],[data-comment-id],[data-commentid],[aria-label^="Bình luận dưới "],[aria-label^="Phản hồi bình luận "],[aria-label^="Comment by "],[aria-label^="Reply by "]';
 const commentAncestor = 'xpath=ancestor::*[self::article or @role="article" or @data-comment-id or @data-commentid or starts-with(@aria-label, "Bình luận dưới ") or starts-with(@aria-label, "Phản hồi bình luận ") or starts-with(@aria-label, "Comment by ") or starts-with(@aria-label, "Reply by ")][1]';
+
+// Facebook may render an emoji as <img alt="…"> inside a caption. innerText omits it.
+const TIMELINE_CAPTION = String.raw`(expected, selector) => {
+  const clean = text => (text || '').normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
+  const compact = text => clean(text).replace(/\s+/g, '');
+  const emoji = /[\p{Extended_Pictographic}\p{Regional_Indicator}]/u;
+  const hasEmoji = emoji.test(expected);
+  const compactExpected = compact(expected);
+  const collapsedPrefix = shown => {
+    const visible = clean(shown);
+    return /(?:…|[.]{3}|xem thêm|see more)$/.test(visible)
+      ? visible.replace(/ *(?:…|[.]{3})? *(?:xem thêm|see more)?$/, '').trimEnd() : null;
+  };
+  const matches = (shown, want, key) => {
+    if (key(shown) === want) return true;
+    const visible = collapsedPrefix(shown);
+    if (expected.length <= 160 || !visible) return false;
+    const prefix = key(visible);
+    return prefix.length >= key(expected.slice(0, 160)).length && want.startsWith(prefix);
+  };
+  const recoveredEmoji = el => {
+    if (!hasEmoji || !el.matches(selector) || !el.querySelector('img[alt]')) return null;
+    const copy = el.cloneNode(true);
+    let recovered = false;
+    for (const image of copy.querySelectorAll('img[alt]')) {
+      if (!emoji.test(image.alt)) continue;
+      image.replaceWith(image.alt);
+      recovered = true;
+    }
+    return recovered ? copy.textContent : null;
+  };
+  const withoutCollapseButton = (el, text) => {
+    const cleanText = clean(text);
+    const button = Array.from(el.querySelectorAll('button,[role="button"]'))
+      .find(b => /^(?:ẩn bớt|thu gọn|hiển thị ít hơn|see less|show less)$/i.test(clean(b.innerText)));
+    const label = button && clean(button.innerText);
+    return label && cleanText.endsWith(label) ? cleanText.slice(0, -label.length).trimEnd() : text;
+  };
+  const match = el => {
+    if (matches(el.innerText, expected, clean)) return 'text';
+    if (!el.matches(selector)) return null;
+    if (matches(withoutCollapseButton(el, el.innerText), expected, clean)) return 'text';
+    // An exact permalink read confirms matches reconstructed from detached text nodes.
+    const recovered = recoveredEmoji(el);
+    return recovered && matches(withoutCollapseButton(el, recovered), compactExpected, compact) ? 'emoji' : null;
+  };
+  const isShortPrefix = (shown, want, key) => {
+    const prefix = key(collapsedPrefix(shown));
+    return prefix.length >= 32 && prefix.length < want.length && want.startsWith(prefix);
+  };
+  const canExpand = el => isShortPrefix(el.innerText, expected, clean) || isShortPrefix(recoveredEmoji(el), compactExpected, compact);
+  return { clean, compact, hasEmoji, match, canExpand };
+}`;
 
 function commentKey(value: string | null) {
   if (!value || /^\d+$/.test(value)) return value;
@@ -62,6 +119,7 @@ interface ScanResult {
   hits: Hit[];
   /** Copies of the caption visible outside the composer (independent of finding a timestamp). */
   occ: number;
+  emojiMatch: boolean;
   /** Text of the post card around each copy (filled even when the timestamp link is not usable yet). */
   cards: string[];
 }
@@ -213,7 +271,8 @@ export class FbWebSession implements PublishSession {
     if (state !== 'OK') return { ok: false, observed: state.toLowerCase() };
     const url = new URL(this.page.url());
     const observed = profileIdentity(url) ?? '';
-    const ok = url.origin === new URL(this.opts.baseUrl).origin && observed !== '' && observed.toLowerCase() === expectedExternalId.toLowerCase();
+    const expected = expectedExternalId.trim().toLowerCase();
+    const ok = url.origin === new URL(this.opts.baseUrl).origin && observed !== '' && observed.toLowerCase() === expected;
     if (ok) this.checkedIdentity = observed.toLowerCase();
     return { ok, observed };
   }
@@ -301,6 +360,47 @@ export class FbWebSession implements PublishSession {
       throw new ConnectorError('UI_UNEXPECTED', 'Liên kết chưa mở ra đúng bài Facebook. Hãy dùng liên kết trực tiếp của bài.');
     }
     return post.url;
+  }
+
+  async readCommentPost(link: URL) {
+    if (!this.checkedIdentity) throw new ConnectorError('WRONG_IDENTITY', 'Cần xác nhận phiên Facebook trước khi lấy bài viết.');
+    let post = facebookScriptPost(link.href);
+    if (post && !post.id) post = facebookScriptPost((await this.resolveCommentPost(post.url)).href);
+    if (!post?.id) throw new ConnectorError('PERMANENT', 'Không xác định được liên kết bài viết.');
+    const response = await this.page.goto(new URL(post.url.pathname + post.url.search, this.opts.baseUrl).href,
+      { waitUntil: 'domcontentloaded', timeout: Math.min(25_000, this.opts.stepTimeoutMs) });
+    const observed = new URL(this.page.url());
+    if (!response?.ok() || observed.origin !== new URL(this.opts.baseUrl).origin ||
+      facebookPostId(observed) !== post.id || await this.classify() !== 'OK') {
+      throw new ConnectorError('UI_UNEXPECTED', 'Không mở được đúng bài. Kiểm tra quyền xem của tài khoản B đã chọn.');
+    }
+    const content = await readPostCaption(this.page, post.id, Math.min(12_000, this.opts.stepTimeoutMs));
+    if (!content || this.page.url() !== observed.href || await this.classify() !== 'OK') {
+      throw new ConnectorError('UI_UNEXPECTED', 'Chưa lấy được nội dung đúng bài. Hãy kiểm tra liên kết hoặc thử bằng tài khoản B khác.');
+    }
+    const images = await this.readPostImages(COMMENT_POST_IMAGES);
+    return { url: post.url.href, caption: content.caption, author: content.author?.slice(0, 250) || null,
+      images, capturedAt: this.now().toISOString() };
+  }
+
+  /**
+   * Ảnh của bài được tải bằng chính phiên Facebook đang mở (có cookie, đúng referer), rồi đổi sang
+   * base64 để gửi kèm caption cho LLM. Ảnh nào quá nặng, sai kiểu hoặc tải lỗi thì bỏ qua.
+   */
+  private async readPostImages(limit: number): Promise<Array<{ mime: CommentPostImage['mime']; data: string }>> {
+    const sources = await readPostImageSources(this.page, limit);
+    const allowed: readonly string[] = COMMENT_POST_IMAGE_MIME;
+    const images: Array<{ mime: CommentPostImage['mime']; data: string }> = [];
+    for (const src of sources) {
+      const response = await this.ctx.request.get(src, { timeout: 15_000, failOnStatusCode: false }).catch(() => null);
+      if (!response?.ok()) continue;
+      const mime = (response.headers()['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+      if (!allowed.includes(mime)) continue;
+      const body = await response.body().catch(() => null);
+      if (!body?.byteLength || body.byteLength > COMMENT_POST_IMAGE_BYTES) continue;
+      images.push({ mime: mime as CommentPostImage['mime'], data: body.toString('base64') });
+    }
+    return images;
   }
 
   async postComment({ post, parentId, text }: { post: URL; parentId?: string; text: string }, beforeSubmit: () => Promise<void>) {
@@ -775,8 +875,8 @@ export class FbWebSession implements PublishSession {
   private async scanOnce(want: string): Promise<ScanResult> {
     const script = `(() => {
       const WANT = ${JSON.stringify(want)};
-      const WS = new RegExp('[' + String.fromCharCode(32, 9, 10, 13, 160) + ']+', 'g');
-      const norm = (s) => (s || '').normalize('NFC').replace(WS, ' ').trim().toLowerCase();
+      const message = ${JSON.stringify(postMessage)};
+      const { clean: norm, compact, hasEmoji, match } = (${TIMELINE_CAPTION})(WANT, message);
       const isPost = (h) => !!h && (h.indexOf('permalink.php') >= 0 || h.indexOf('/posts/') >= 0 || h.indexOf('/reel/') >= 0 || h.indexOf('story_fbid') >= 0 || h.indexOf('pfbid') >= 0);
       const big = (e) => { const r = e.getBoundingClientRect(); return r.width >= 60 && r.height >= 60; };
       const short = (a) => { const t = (a.innerText || '').trim(); return t.length > 0 && t.length <= 25; };
@@ -785,28 +885,23 @@ export class FbWebSession implements PublishSession {
       const hits = [];
       const cards = [];
       let occ = 0;
-      // Line breaks (<br>, paragraph divs) add no whitespace to textContent: compare with all whitespace removed.
-      const squash = (s) => (s || '').normalize('NFC').replace(WS, '').toLowerCase();
+      let emojiMatch = false;
       const PREFIX = WANT.slice(0, 160);
-      const probe = squash(PREFIX).slice(0, 10);
-      const message = '[data-ad-preview="message"],[data-ad-comet-preview="message"],[data-ad-rendering-role="story_message"],[data-testid="post_message"]';
+      const probe = compact(PREFIX).slice(0, 10);
       const story = ${JSON.stringify(storyCard)};
-      const matches = (el) => {
-        const text = norm(el.innerText);
-        return text === WANT || (WANT.length > 160 && text.startsWith(PREFIX)
-          && /(?:…|[.]{3}|xem thêm|see more)$/.test(text)
-          && WANT.startsWith(text.replace(/ *(?:…|[.]{3})? *(?:xem thêm|see more)?$/, '').trimEnd()));
-      };
-      if (WANT && norm(document.body.innerText).includes(PREFIX)) {
-        for (const el of Array.from(document.querySelectorAll('div,span,p'))) {
-          if (!squash(el.textContent).includes(probe)) continue;
-          if (!matches(el)) continue;
+      if (WANT) {
+        const candidates = norm(document.body.innerText).includes(PREFIX) ? 'div,span,p' : hasEmoji ? message : null;
+        for (const el of candidates ? document.querySelectorAll(candidates) : []) {
+          if (!compact(el.textContent).includes(probe) && !(hasEmoji && el.matches(message))) continue;
+          const matched = match(el);
+          if (!matched) continue;
           const ownMessage = el.closest(message);
-          if (ownMessage && !matches(ownMessage)) continue;
-          if (Array.from(el.children).some(matches)) continue;
+          if (ownMessage && ownMessage !== el && !match(ownMessage)) continue;
+          if (Array.from(el.children).some(match)) continue;
           if (el.closest('[role=dialog],nav,[role=navigation],[role=banner],[contenteditable=true]')) continue;
           if (el.closest('[data-commentid],[data-comment-id],[role=article][aria-label^="Bình luận"],[role=article][aria-label^="Phản hồi"],[role=article][aria-label^="Comment by"],[role=article][aria-label^="Reply by"]')) continue;
           occ++;
+          if (matched === 'emoji') emojiMatch = true;
           const card = el.closest(story);
           // Text around this copy even when it has no usable timestamp link yet (new posts: href="?__cft__…"),
           // so "video is being processed" notices can still be seen.
@@ -829,15 +924,43 @@ export class FbWebSession implements PublishSession {
           hits.push({ time: info(timeA), imgs: Array.from(box.querySelectorAll('img')).filter(big).length, videos: Array.from(box.querySelectorAll('video')).filter(big).length, text: withoutCaption(box).slice(0, 300) });
         }
       }
-      return { dated, hits, occ, cards };
+      return { dated, hits, occ, cards, emojiMatch };
     })()`;
     const r = (await this.page.evaluate(script).catch(() => null)) as ScanResult | null;
-    return r ?? { dated: [], hits: [], occ: 0, cards: [] };
+    return r ?? { dated: [], hits: [], occ: 0, cards: [], emojiMatch: false };
   }
 
   /** Parse a post-link timestamp from its text, falling back to its aria-label. */
   private dateOf(l: LinkInfo) {
     return parseViTime(l.text, this.now()) ?? (l.label ? parseViTime(l.label, this.now()) : null);
+  }
+
+  /** Open a few likely captions to read their full text. A short prefix only identifies a button to expand. */
+  private async expandTimelineCaptions(want: string, limit: number) {
+    const count = await this.page.evaluate<number>(`(() => {
+      const message = ${JSON.stringify(postMessage)};
+      const attr = ${JSON.stringify(expandCaptionAttr)};
+      const { clean, canExpand } = (${TIMELINE_CAPTION})(${JSON.stringify(want)}, message);
+      document.querySelectorAll('[' + attr + ']').forEach(el => el.removeAttribute(attr));
+      const buttons = new Set();
+      for (const el of document.querySelectorAll(message)) {
+        if (el.closest('[role=dialog],nav,[role=navigation],[contenteditable=true],[data-comment-id],[data-commentid]') ||
+          !el.getClientRects().length || !canExpand(el)) continue;
+        const button = Array.from(el.querySelectorAll('button,[role="button"]'))
+          .find(b => /^(?:xem thêm|see more)$/.test(clean(b.innerText)) && b.getClientRects().length);
+        if (button) buttons.add(button);
+        if (buttons.size >= ${limit}) break;
+      }
+      [...buttons].forEach((button, i) => button.setAttribute(attr, String(i)));
+      return buttons.size;
+    })()`).catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const button = this.page.locator(`[${expandCaptionAttr}="${i}"]`);
+      if (await button.click({ timeout: 1500 }).then(() => true, () => false)) {
+        await button.waitFor({ state: 'hidden', timeout: 650 }).catch(() => undefined);
+      }
+    }
+    return count;
   }
 
   /**
@@ -854,11 +977,21 @@ export class FbWebSession implements PublishSession {
     const cards = new Set<string>();
     let steps = 0;
     let copies = 0;
+    let emojiMatch = false;
+    let expansions = 0;
     for (; steps < maxSteps; steps++) {
-      const r = await this.scanOnce(want);
+      let r = await this.scanOnce(want);
+      if (!r.occ && want.length > 32 && expansions < 3) {
+        const found = await this.expandTimelineCaptions(want, 3 - expansions);
+        if (found) {
+          expansions += found;
+          r = await this.scanOnce(want);
+        }
+      }
       for (const h of r.hits) hits.set(h.time.href, h);
       for (const c of r.cards) cards.add(c);
       copies = Math.max(copies, r.occ);
+      emojiMatch ||= r.emojiMatch;
       for (const d of r.dated) dated.set(d.href, d);
       const passedWindow = olderThan !== null && [...dated.values()].some((d) => {
         const w = this.dateOf(d);
@@ -868,7 +1001,8 @@ export class FbWebSession implements PublishSession {
       await this.page.mouse.wheel(0, 700);
       await this.page.waitForTimeout(900);
     }
-    return { hits: [...hits.values()], dated: [...dated.values()], steps, copies, cards: [...cards] };
+    return { hits: [...hits.values()], dated: [...dated.values()], steps, copies, cards: [...cards],
+      needsCaptionReadback: emojiMatch || expansions > 0 };
   }
 
   /**
@@ -881,16 +1015,13 @@ export class FbWebSession implements PublishSession {
     const want = norm(caption);
     const found = (await this.page.evaluate(`(() => {
       const WANT = ${JSON.stringify(want)};
-      const WS = new RegExp('[' + String.fromCharCode(32, 9, 10, 13, 160) + ']+', 'g');
-      const norm = (s) => (s || '').normalize('NFC').replace(WS, ' ').trim().toLowerCase();
-      const PREFIX = WANT.slice(0, 160);
       const isPost = (h) => !!h && (h.indexOf('permalink.php') >= 0 || h.indexOf('/posts/') >= 0 || h.indexOf('/reel/') >= 0 || h.indexOf('story_fbid') >= 0 || h.indexOf('pfbid') >= 0);
-      const message = '[data-ad-preview="message"],[data-ad-comet-preview="message"],[data-ad-rendering-role="story_message"],[data-testid="post_message"]';
+      const message = ${JSON.stringify(postMessage)};
+      const { match } = (${TIMELINE_CAPTION})(WANT, message);
       const story = ${JSON.stringify(storyCard)};
       document.querySelectorAll('[data-sb-probe]').forEach((a) => a.removeAttribute('data-sb-probe'));
       const els = Array.from(document.querySelectorAll('div,span,p')).filter((el) => {
-        const t = norm(el.innerText);
-        return (t === WANT || (WANT.length > 160 && t.startsWith(PREFIX))) && !Array.from(el.children).some((c) => norm(c.innerText) === t)
+        return match(el) && !Array.from(el.children).some(match)
           && !el.closest('[role=dialog],[contenteditable=true],[data-commentid],[data-comment-id]');
       });
       // Facebook may render the caption twice (collapsed + full); use the visible one.
@@ -973,9 +1104,9 @@ export class FbWebSession implements PublishSession {
   /** Find the direct link of an already-published post on the own profile (read-only). */
   async findPermalink(caption: string): Promise<string | null> {
     const scan = await this.scanProfile(caption, null, 12);
-    if (scan.copies === 0) return null;
-    if (scan.hits.length === 1) return this.postPermalink(scan.hits[0].time.href)?.href ?? null;
-    return scan.hits.length ? null : this.revealPermalink(caption);
+    if (scan.copies === 0 || scan.hits.length > 1) return null;
+    const url = this.postPermalink(scan.hits.length ? scan.hits[0].time.href : await this.revealPermalink(caption) ?? undefined);
+    return url && (!scan.needsCaptionReadback || await this.matchesPermalinkCaption(url, caption)) ? url.href : null;
   }
 
   private postPermalink(value?: string): URL | null {
@@ -986,6 +1117,23 @@ export class FbWebSession implements PublishSession {
     for (const key of [...url.searchParams.keys()]) if (!['id', 'story_fbid', 'fbid', 'v', 'set'].includes(key)) url.searchParams.delete(key);
     url.hash = '';
     return url;
+  }
+
+  private async matchesPermalinkCaption(permalink: URL, caption: string) {
+    const id = facebookPostId(permalink);
+    if (!id) return false;
+    const tab = await this.ctx.newPage();
+    try {
+      const response = await tab.goto(permalink.href, { waitUntil: 'domcontentloaded', timeout: 8000 });
+      const current = new URL(tab.url());
+      if (!response?.ok() || current.origin !== permalink.origin || facebookPostId(current) !== id) return false;
+      const content = await readPostCaption(tab, id, 4500);
+      return !!content && norm(content.caption) === norm(caption);
+    } catch {
+      return false;
+    } finally {
+      await tab.close().catch(() => undefined);
+    }
   }
 
   async verify(hint: VerifyHint): Promise<VerifyResult> {
@@ -1017,8 +1165,15 @@ export class FbWebSession implements PublishSession {
       const permalink = this.postPermalink(hit?.time.href) ?? this.postPermalink(hint.commitSignal?.permalink)
         ?? this.postPermalink(await this.revealPermalink(hint.caption) ?? undefined);
       if (!permalink) {
+        if (hint.contentType === 'VIDEO') {
+          const reel = await this.verifyReelNotification(hint);
+          if (reel) return reel;
+        }
         await this.dumpMiss('verify-nolink', { evidence, hits: scan.hits, cards: scan.cards.map((c) => c.slice(0, 400)), postLinks: await this.postLinksNear(hint.caption) });
         return { kind: 'NOT_FOUND', conclusive: false, evidence: { ...evidence, missingPermalink: true } };
+      }
+      if (scan.needsCaptionReadback && !await this.matchesPermalinkCaption(permalink, hint.caption)) {
+        return { kind: 'NOT_FOUND', conclusive: false, evidence: { ...evidence, permalinkCaptionUnconfirmed: true } };
       }
       return { kind: 'VERIFIED', permalink: permalink.href, externalPostId: facebookPostId(permalink) ?? undefined, evidence };
     }
@@ -1032,7 +1187,9 @@ export class FbWebSession implements PublishSession {
       const media = h.videos > 0 ? h.videos : h.imgs;
       if (media !== hint.mediaCount) continue;
       const permalink = this.postPermalink(h.time.href);
-      if (permalink) matches.push({ permalink: permalink.href, at: when.at.toISOString(), processing: PROCESSING_TEXT.test(h.text) });
+      if (permalink && (!scan.needsCaptionReadback || await this.matchesPermalinkCaption(permalink, hint.caption))) {
+        matches.push({ permalink: permalink.href, at: when.at.toISOString(), processing: PROCESSING_TEXT.test(h.text) });
+      }
     }
 
     let unreadable = 0;
@@ -1049,7 +1206,7 @@ export class FbWebSession implements PublishSession {
       return { kind: 'VERIFIED', permalink: matches[0].permalink, externalPostId: facebookPostId(new URL(matches[0].permalink)) ?? undefined, evidence };
     }
     // Absence is only conclusive if we scrolled past the commit time and could date every post link we saw.
-    const conclusive = sawOlder && unreadable === 0 && scan.hits.length === 0;
+    const conclusive = sawOlder && unreadable === 0 && scan.hits.length === 0 && scan.copies === 0 && !scan.needsCaptionReadback;
     if (this.opts.screenshotDir && !this.verifyDumped) {
       // First miss of a session: record what the profile really looks like so selectors can be fixed.
       this.verifyDumped = true;
@@ -1078,18 +1235,11 @@ export class FbWebSession implements PublishSession {
       if (observed) return observed;
     }
     if (!norm(hint.caption ?? '')) return { kind: 'NOT_FOUND', conclusive: false };
+    const notice = await this.verifyReelNotification(hint);
+    if (notice) return notice;
     const from = +hint.committedAt - hint.windowMs;
-    const notices = await this.reelNotifications();
-    const matches: VerifyResult[] = [];
-    for (const [candidate, at] of notices) {
-      if (+at.at + at.tolMs < from || +at.at - at.tolMs > +hint.committedAt + hint.windowMs) continue;
-      const observed = await this.readReel(candidate, hint.caption);
-      if (observed?.kind === 'VERIFIED') matches.push(observed);
-    }
-    if (matches.length > 1) return { kind: 'AMBIGUOUS', matches: matches.length };
-    if (matches.length === 1) return matches[0];
-    const { hits } = await this.scanProfile(hint.caption ?? '', from);
-    const timeline = hits.filter(hit => {
+    const scan = await this.scanProfile(hint.caption ?? '', from);
+    const timeline = scan.hits.filter(hit => {
       const time = this.dateOf(hit.time);
       return this.reelId(hit.time.href) && time && +time.at + time.tolMs >= from && +time.at - time.tolMs <= +hint.committedAt + hint.windowMs;
     });
@@ -1097,7 +1247,23 @@ export class FbWebSession implements PublishSession {
     const hit = timeline[0];
     if (!hit) return { kind: 'NOT_FOUND', conclusive: false };
     if (PROCESSING_TEXT.test(hit.text)) return { kind: 'PROCESSING' };
-    return { kind: 'VERIFIED', permalink: new URL(hit.time.href, this.opts.baseUrl).href, externalPostId: this.reelId(hit.time.href) };
+    const link = new URL(hit.time.href, this.opts.baseUrl);
+    if (scan.needsCaptionReadback && !await this.matchesPermalinkCaption(link, hint.caption ?? '')) {
+      return { kind: 'NOT_FOUND', conclusive: false, evidence: { permalinkCaptionUnconfirmed: true } };
+    }
+    return { kind: 'VERIFIED', permalink: link.href, externalPostId: this.reelId(hit.time.href) };
+  }
+
+  private async verifyReelNotification(hint: VerifyHint): Promise<VerifyResult | null> {
+    const from = +hint.committedAt - hint.windowMs;
+    const to = +hint.committedAt + hint.windowMs;
+    const matches: VerifyResult[] = [];
+    for (const [candidate, at] of await this.reelNotifications()) {
+      if (+at.at + at.tolMs < from || +at.at - at.tolMs > to) continue;
+      const observed = await this.readReel(candidate, hint.caption);
+      if (observed?.kind === 'VERIFIED') matches.push({ ...observed, evidence: { method: 'reel_notification' } });
+    }
+    return matches.length > 1 ? { kind: 'AMBIGUOUS', matches: matches.length } : matches[0] ?? null;
   }
 
   private async readReel(id: string, expectedCaption?: string): Promise<VerifyResult | null> {
@@ -1108,6 +1274,8 @@ export class FbWebSession implements PublishSession {
     const text = await this.page.locator('body').innerText();
     if (!await video.isVisible()) return PROCESSING_TEXT.test(text) ? { kind: 'PROCESSING' } : null;
     const caption = norm(expectedCaption ?? '');
+    if (caption.length > 0 && caption.length < 10 &&
+      await this.page.getByText(expectedCaption!, { exact: true }).filter({ visible: true }).count() === 0) return null;
     const firstLine = norm((expectedCaption ?? '').split('\n')[0] ?? '');
     if (caption && !norm(text).includes(caption) && !this.truncatedCaption(norm(text), caption, firstLine)) return null;
     return { kind: 'VERIFIED', permalink: this.page.url(), externalPostId: id };

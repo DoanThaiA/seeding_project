@@ -64,6 +64,13 @@ h2 { font-size: 15px; margin: 0 0 10px; }
 .nav a { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border-radius: 8px; color: var(--text); }
 .nav a:hover { background: var(--panel-2); text-decoration: none; }
 .nav a[aria-current="page"] { background: var(--info-bg); color: var(--info); font-weight: 600; }
+.nav-group > summary { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 8px 10px; border-radius: 8px; color: var(--text); cursor: pointer; list-style: none; }
+.nav-group > summary::-webkit-details-marker { display: none; }
+.nav-group > summary::after { content: '›'; color: var(--muted); transition: transform .15s; }
+.nav-group[open] > summary::after { transform: rotate(90deg); }
+.nav-group > summary:hover { background: var(--panel-2); }
+.nav-group > summary[aria-current] { color: var(--info); font-weight: 600; }
+.nav-group a { padding-inline-start: 17px; }
 .nav-more { margin-top: 5px; padding-top: 4px; border-top: 1px solid var(--line); }
 .nav-more summary { padding: 7px 10px; color: var(--muted); cursor: pointer; border-radius: 8px; }
 .nav-more summary:hover { background: var(--panel-2); }
@@ -81,6 +88,8 @@ h2 { font-size: 15px; margin: 0 0 10px; }
   .brand { padding: 4px 10px; }
   .nav { order: 2; width: 100%; display: flex; flex-wrap: wrap; gap: 2px; }
   .nav a { gap: 4px; padding: 6px 8px; }
+  .nav-group > summary { padding: 6px 8px; }
+  .nav-group a { padding-inline-start: 8px; }
   .nav-more { margin: 0; padding: 0; border: 0; position: relative; }
   .nav-more summary { padding: 6px 8px; }
   .nav-more[open] { min-width: 136px; }
@@ -169,7 +178,7 @@ dl.kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px 12px; margin: 
 dl.kv dt { color: var(--muted); }
 dl.kv dd { margin: 0; word-break: break-word; }
 
-/* Profile groups and comment scripts */
+/* Personas and comment scripts */
 .workflow-stack, .workflow-form, .profile-details-view { display: grid; gap: 12px; min-width: 0; }
 .workflow-stack > :is(h1,h2,h3,p), .workflow-toolbar > :is(h1,h2,h3), .workflow-form > p, .workflow-step h3 { margin: 0; }
 .workflow-stack .card, .workflow-layout > .card { margin: 0; }
@@ -178,11 +187,8 @@ dl.kv dd { margin: 0; word-break: break-word; }
 .workflow-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .workflow-form label { display: grid; gap: 4px; margin: 0; }
 .workflow-form textarea { min-height: 72px; }
-.member-list { min-width: 0; border: 1px solid var(--line); border-radius: 8px; margin: 0; padding: 0 10px 8px; max-height: 245px; overflow-y: auto; }
-.member-list legend { color: var(--muted); padding: 0 4px; }
-.member-list label { display: flex; align-items: center; gap: 8px; padding-block: 4px; color: var(--text); }
-.member-list input { width: auto; accent-color: var(--accent); }
-.workflow-members, .profile-details-view ul { margin: 0; padding-inline-start: 20px; }
+.workflow-fields { display: grid; gap: 12px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.profile-details-view ul { margin: 0; padding-inline-start: 20px; }
 .workflow-nav a { display: grid; gap: 3px; color: var(--text); padding: 7px 8px; border-radius: 6px; overflow-wrap: anywhere; }
 .workflow-nav a[aria-current="page"] { background: var(--panel-2); outline: 1px solid var(--line); }
 .workflow-nav small { color: var(--muted); }

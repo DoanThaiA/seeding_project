@@ -4,32 +4,14 @@ import Link from 'next/link';
 import { useState } from 'react';
 import { AutoRefresh } from '@/components/client';
 import { Badge, Empty } from '@/components/ui';
-import { fmtTime, label } from '@/lib/format';
-import { MappingForm, Panel, SourceForm, TargetForm, sourceMethods, sourceStatus, type Capabilities, type MappingT, type SourceT, type TargetT } from './SettingsForms';
+import { MappingForm, Panel, SourceForm, TargetForm, sourceMethods, sourceStatus, type MappingT, type SourceT, type TargetT } from './SettingsForms';
 import styles from './settings.module.css';
 
 const views = { flows: 'Luồng A → B', sources: 'Nguồn quét', targets: 'Tài khoản đích' };
 type View = keyof typeof views;
 
-function Readiness({ capabilities }: { capabilities: Capabilities }) {
-  return <details className={styles.capability}>
-    <summary>Kết quả kiểm thử định dạng</summary>
-    <p className="muted">Worker dùng định dạng Facebook đang bật trong cấu hình. Xem kết quả kiểm thử theo phiên bản tại đây.</p>
-    {capabilities.checks.length ? <div className="tw">
-      <table>
-        <thead><tr><th>Đích</th><th>Định dạng</th><th>Phiên bản</th><th>Kết quả</th><th>Ca đạt</th><th>Lần kiểm thử</th></tr></thead>
-        <tbody>{capabilities.checks.map(c => <tr key={c.id}>
-          <td>{c.target.code}</td><td>{label(c.contentType)}</td><td className="mono">{c.connector}@{c.connectorVersion}</td>
-          <td><Badge s={c.qualified ? 'DONE' : 'MISSED'} text={c.qualified ? 'Đạt' : c.passed ? 'Thiếu ca kiểm thử' : 'Chưa đạt'} />{c.notes && <div className="muted">{c.notes}</div>}</td>
-          <td>{c.cases - c.failures}/{c.cases}</td><td>{fmtTime(c.checkedAt)}</td>
-        </tr>)}</tbody>
-      </table>
-    </div> : <Empty>Chưa có kết quả kiểm thử định dạng.</Empty>}
-  </details>;
-}
-
-export function SettingsWorkspace({ sources, targets, mappings, capabilities }: {
-  sources: SourceT[]; targets: TargetT[]; mappings: MappingT[]; capabilities: Capabilities;
+export function SettingsWorkspace({ sources, targets, mappings }: {
+  sources: SourceT[]; targets: TargetT[]; mappings: MappingT[];
 }) {
   const [view, setView] = useState<View>('flows');
   const bySource = new Map(sources.map(s => [s.id, s]));
@@ -82,7 +64,7 @@ export function SettingsWorkspace({ sources, targets, mappings, capabilities }: 
             </div>
             <div className={styles.cards}>
               <SourceForm key={activeFlow.source.id} source={activeFlow.source} />
-              <TargetForm key={activeFlow.target.id} target={activeFlow.target} capabilities={capabilities} />
+              <TargetForm key={activeFlow.target.id} target={activeFlow.target} />
             </div>
             <MappingForm key={activeFlow.mapping.id} {...{ sources, targets, mappings }} mapping={activeFlow.mapping} onCreated={setFlowId} />
             {(mappings.filter(m => m.sourceId === activeFlow.source.id).length > 1 || mappings.filter(m => m.targetId === activeFlow.target.id).length > 1)
@@ -110,8 +92,7 @@ export function SettingsWorkspace({ sources, targets, mappings, capabilities }: 
       <div className={styles.resourcePicker}><label htmlFor="admin-target">Tài khoản đích</label><select id="admin-target" value={targetId} onChange={e => setTargetId(e.target.value)}>
         {targets.map(t => <option key={t.id} value={t.id}>{t.code} · {t.name}</option>)}<option value="new">+ Thêm đích</option>
       </select></div>
-      <TargetForm onCreated={setTargetId} key={byTarget.get(targetId)?.id ?? 'new'} target={byTarget.get(targetId)} capabilities={capabilities} />
-      <Readiness capabilities={capabilities} />
+      <TargetForm onCreated={setTargetId} key={byTarget.get(targetId)?.id ?? 'new'} target={byTarget.get(targetId)} />
     </div>}
   </div>;
 }

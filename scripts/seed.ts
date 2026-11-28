@@ -1,6 +1,6 @@
 /**
  * Idempotent pilot seed: A1–A5 → B1–B5 (1:1), one browser worker host, profiles pinned to it.
- *   APP_ENV=local      → FakeConnector, fake platform file, capability checks pre-certified
+ *   APP_ENV=local      → FakeConnector, fake platform file
  *   APP_ENV=pilot-test → fb-web, register the bundled connector release
  * Real URLs/IDs for A/B are filled in through the API or env (SEED_A1_REF=..., SEED_B1_ID=...).
  */
@@ -8,7 +8,6 @@ import { resolve } from 'node:path';
 import { loadConfig } from '@seedingsys/config';
 import { FakePlatform } from '@seedingsys/connectors-fake';
 import { FB_WEB_VERSION } from '@seedingsys/connectors-fb-web';
-import { CONTENT_TYPES } from '@seedingsys/contracts';
 import { createDb } from '@seedingsys/db';
 
 async function main() {
@@ -54,18 +53,8 @@ async function main() {
       create: { targetId: t.id, workerNodeId: node.id, profileDir: `/profiles/B${i}` },
       update: {},
     });
-    if (local) {
-      for (const ct of CONTENT_TYPES) {
-        if (ct === 'UNSUPPORTED' || ct === 'NAMED_ALBUM' || ct === 'REEL') continue;
-        await db.capabilityCheck.upsert({
-          where: { targetId_contentType_connector_connectorVersion: { targetId: t.id, contentType: ct, connector: 'fake', connectorVersion: 'fake-1.0.0' } },
-          create: { targetId: t.id, contentType: ct, connector: 'fake', connectorVersion: 'fake-1.0.0', passed: true, cases: 20, notes: 'local fake' },
-          update: {},
-        });
-      }
-      platform!.ensureSource(ref);
-      platform!.ensureAccount(ext);
-    }
+    platform?.ensureSource(ref);
+    platform?.ensureAccount(ext);
   }
   console.log(`seeded ${n} sources/targets (${connector})`);
   await db.$disconnect();

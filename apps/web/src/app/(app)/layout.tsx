@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { logout } from '../login/actions';
-import { NavLink } from '@/components/client';
+import { NavGroup, NavLink } from '@/components/client';
 import { apiGet, can, getSession } from '@/lib/api';
 
 interface Dash {
@@ -19,14 +19,18 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
         <div className="brand">SeedingSys</div>
         <nav className="nav" aria-label="Điều hướng chính">
           <NavLink href="/">Tổng quan</NavLink>
-          <NavLink href="/library">Hồ sơ A &amp; B</NavLink>
-          <NavLink href="/profile-sync">Đồng bộ hồ sơ</NavLink>
-          <NavLink href="/profile-groups">Nhóm hồ sơ</NavLink>
+          <NavGroup label="Quản lý hồ sơ" items={[
+            { href: '/library?kind=A', label: 'Hồ sơ A' },
+            { href: '/library?kind=B', label: 'Hồ sơ B' },
+            { href: '/profile-sync', label: 'Đồng bộ hồ sơ' },
+            ...(can.admin(s.role) ? [{ href: '/settings', label: 'Quản trị luồng' }] : []),
+          ]} />
           <NavLink href="/comment-scripts">Kịch bản bình luận</NavLink>
-          <NavLink href="/schedule">Lịch &amp; bài chờ</NavLink>
-          <NavLink href="/review" count={t.REVIEW_CONTENT} warn>Duyệt bài</NavLink>
-          <NavLink href="/tasks" count={(t.TAKEOVER_ACCOUNT ?? 0) + (t.CONFIRM_RESULT ?? 0)}>Cần xử lý</NavLink>
-          {can.admin(s.role) && <NavLink href="/settings">Quản trị luồng</NavLink>}
+          <NavGroup label="Quản trị bài đăng" items={[
+            { href: '/schedule', label: 'Lịch và bài chờ' },
+            { href: '/review', label: 'Duyệt bài', count: t.REVIEW_CONTENT, warn: true },
+            { href: '/tasks', label: 'Cần xử lý', count: (t.TAKEOVER_ACCOUNT ?? 0) + (t.CONFIRM_RESULT ?? 0) },
+          ]} />
           <NavLink href="/reports">Báo cáo</NavLink>
           <details className="nav-more">
             <summary>Thao tác khác</summary>

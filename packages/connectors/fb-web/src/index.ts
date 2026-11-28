@@ -26,7 +26,7 @@ export { FbPublicReadConnector } from './public-read';
 /**
  * Publish connector: drives a dedicated Chromium persistent profile per target account that a
  * person logged into by hand (`pnpm fb:login <B>`). It never types passwords, never solves
- * checkpoints, and advertises only formats listed in FB_ENABLED_FORMATS (empty by default).
+ * checkpoints, and supports every implemented format by default. FB_ENABLED_FORMATS can limit them.
  */
 export class FbWebPublishConnector implements PublishConnector {
   readonly key = 'fb-web';

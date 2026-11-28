@@ -12,7 +12,7 @@
 | Đọc nguồn (A) từ Facebook | Có kết nối khách, kết nối dùng phiên đã đăng nhập và Graph API. Xem mục “Phía đọc” để biết phạm vi từng kết nối. |
 | Chuyển mã video, tiếp quản qua noVNC, agent UI | ❌ Chưa làm |
 
-Worker đăng các định dạng được bật trong `FB_ENABLED_FORMATS` với phiên bản connector đang hoạt động. Giá trị rỗng tắt mọi định dạng. Kết quả `capability_checks` được lưu để theo dõi các lượt kiểm thử tự chọn.
+Mặc định, worker cho phép đăng tất cả định dạng Facebook đã triển khai. Để giới hạn định dạng, đặt `FB_ENABLED_FORMATS` thành danh sách phân tách bằng dấu phẩy. Khi cài mới, worker đăng ký phiên bản connector đi kèm mà không cần chạy bài thử.
 
 ## Cách hoạt động và các chốt an toàn
 
@@ -29,7 +29,7 @@ Worker đăng các định dạng được bật trong `FB_ENABLED_FORMATS` vớ
 
 ### Giới hạn đã biết
 
-- Reel cần đúng một tệp video. Reel không có caption cần liên kết trực tiếp trả về sau khi đăng để xác minh. Chạy công cụ chứng nhận với `--formats REEL --video <tệp>` khi đã chuẩn bị hồ sơ thử. Công cụ chứng nhận tạo bài thật theo đối tượng “Chỉ mình tôi”.
+- Reel cần đúng một tệp video. Reel không có caption cần liên kết trực tiếp trả về sau khi đăng để xác minh.
 - Bình luận vào bài đã xác minh được phân công theo hồ sơ. Điều phối viên duyệt từng bình luận rồi gửi từ Kho bài. Phản hồi cần có liên kết bình luận cha đã xác minh. Bài ở chế độ “Chỉ mình tôi” chỉ cho phép dùng chính hồ sơ đăng bài.
 - Thứ tự ảnh đảm bảo nhờ thứ tự tải lên, **không** kiểm tra được bằng mắt (không đọc được checksum từ ảnh thu nhỏ); số ảnh thì được kiểm tra.
 - Mốc thời gian trên timeline là tương đối (“5 phút”, “2 giờ”); hệ thống hiểu các dạng phổ biến bằng tiếng Việt. Dạng lạ → coi là không đọc được.
@@ -45,18 +45,7 @@ Worker đăng các định dạng được bật trong `FB_ENABLED_FORMATS` vớ
    pnpm fb:login B1
    ```
    Đăng nhập, đóng cửa sổ.
-4. **Thử một ca** để xem selector có khớp giao diện thật không (đăng 1 bài thử chỉ mình bạn thấy, rồi tự xóa):
-   ```powershell
-   pnpm fb:capability B1 --formats TEXT --cases 1 --pause-sec 5 --yes
-   ```
-   Nếu báo `UI_UNEXPECTED`, mở `selectors.ts` và chỉnh theo giao diện thật (đặt `FB_HEADLESS=false` và `FB_SCREENSHOT_DIR` để xem), rồi thử lại. Nâng `SELECTORS_VERSION` khi đổi.
-5. **Kiểm thử tùy chọn:** mỗi định dạng ≥20 ca, ngưỡng 95% (chữ, một ảnh) / 90% (nhiều ảnh, video):
-   ```powershell
-   pnpm fb:capability B1 --yes --activate
-   ```
-   Lệnh giãn cách mỗi bài 60 giây (đổi bằng `--pause-sec`), dừng ngay khi gặp checkpoint, đăng xuất, sai danh tính, sai đối tượng hoặc kết quả chưa rõ. Kết quả ghi vào `capability_checks` và hiện ở trang Cấu hình. Bài thử **không tự xóa**.
-6. Đặt `FB_ENABLED_FORMATS` theo các định dạng cần đăng trên máy worker rồi bật lại `worker-browser`.
-7. Chỉ khi đã soak ≥7 ngày ở “Chỉ mình tôi” mới cân nhắc đổi đối tượng xem sang thật và `APP_ENV=pilot-live`.
+4. Bật lại `worker-browser`. Chọn đối tượng xem phù hợp cho tài khoản B trong **Quản trị luồng đăng**.
 
 ## Phía đọc (nguồn A)
 
@@ -92,7 +81,7 @@ Giới hạn cố ý của `fb-web` khi đọc:
 Những gì đọc được: toàn bộ caption (tự bấm "Xem thêm"), ID bài ổn định (lấy từ liên kết thời gian sau khi rê chuột), ảnh theo kích thước hiển thị trên trang cá nhân. Không lấy được: **video** (trang phát video theo luồng, không có tệp) → bài video vào **Duyệt bài** để người tải tệp lên; album nhiều hơn số ảnh hiển thị ("+N") → vào **Duyệt bài**. Lần đọc đầu tiên của mỗi nguồn chỉ ghi nhận bài cũ, không đăng lại chúng.
 
 ## Khi Facebook đổi giao diện
-Bật công tắc dừng theo connector `fb-web` (trang Công tắc dừng) → sửa `selectors.ts`/flow → chạy test (`pnpm test`) → chạy lại `pnpm fb:capability` → tăng phiên bản (kết quả cũ không còn hiệu lực vì khóa theo phiên bản) → tắt công tắc dừng.
+Bật công tắc dừng theo connector `fb-web` (trang Công tắc dừng) → sửa `selectors.ts`/flow → chạy test (`pnpm test`) → cập nhật phiên bản connector → tắt công tắc dừng.
 # Kho bài viết và bình luận
 
 - Mở **Kho bài viết**, chọn profile nguồn hoặc đích rồi chọn bài. Trang đích hiển thị các bản nháp và bài đăng trong lịch sử SeedingSys. Cột đối chiếu lấy caption và media của đúng bản duyệt hoặc bản đã đăng.

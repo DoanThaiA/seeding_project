@@ -29,11 +29,6 @@ export interface MappingT {
   reviewMode: 'AUTO' | 'MANUAL'; maxPublishTries: number;
 }
 
-export interface Capabilities {
-  checks: Array<{ id: string; contentType: string; connector: string; connectorVersion: string; passed: boolean; qualified: boolean; cases: number; failures: number; notes: string | null; checkedAt: string; target: { code: string } }>;
-  releases: Array<{ connector: string; version: string; active: boolean }>;
-}
-
 export const sourceMethods: Record<string, string> = {
   'fb-public': 'Facebook công khai',
   'fb-session': 'Facebook qua tài khoản đích',
@@ -215,16 +210,13 @@ function targetDraft(t?: TargetT) {
   return { code: t?.code ?? '', name: t?.name ?? '', externalId: t?.externalId ?? '', connector: t?.connector ?? 'fake', audience: t?.audience ?? 'ONLY_ME', enabled: t?.enabled ?? true };
 }
 
-export function TargetForm({ target, capabilities, onCreated }: { target?: TargetT; capabilities: Capabilities; onCreated?: (id: string) => void }) {
+export function TargetForm({ target, onCreated }: { target?: TargetT; onCreated?: (id: string) => void }) {
   const id = useId();
   const [form, setForm] = useState(() => targetDraft(target));
   const savedStyle = JSON.stringify(target?.styleProfile ?? {}, null, 2);
   const [style, setStyle] = useState(savedStyle);
   const sub = useSubmit();
   const real = form.connector === 'fb-web';
-  const release = capabilities.releases.find(r => r.active && r.connector === target?.connector);
-  const formats = target && release ? capabilities.checks.filter(check => check.target.code === target.code && check.qualified
-    && check.connector === target.connector && release.version === check.connectorVersion) : [];
   const dirty = JSON.stringify(form) !== JSON.stringify(targetDraft(target)) || style !== savedStyle;
   return (
     <Panel title={target ? 'Đích ' + target.code : 'Thêm tài khoản đích'}
@@ -267,7 +259,6 @@ export function TargetForm({ target, capabilities, onCreated }: { target?: Targe
       </form>
       {target?.connector === 'fb-web' && <div className={styles.scanStatus}>
         <TargetBrowser targetId={target.id} disabled={dirty} />
-        <p>{formats.length ? formats.length + ' định dạng đã đạt kiểm thử với phiên bản hiện hành.' : 'Định dạng đăng theo cấu hình worker. Kiểm thử là tùy chọn.'}</p>
       </div>}
     </Panel>
   );

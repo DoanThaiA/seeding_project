@@ -1,6 +1,6 @@
 # Triển khai SeedingSys
 
-> Connector đăng bài `fb-web` dùng các định dạng bật trong `FB_ENABLED_FORMATS`. Có thể chạy kiểm thử tùy chọn ở chế độ “Chỉ mình tôi”. Nguồn A có thể dùng `fb-public` để đọc trang cá nhân hoặc fanpage truy cập được ở chế độ khách. [Hướng dẫn cấu hình Facebook](FB-WEB.md)
+> Connector `fb-web` mặc định bật tất cả định dạng đăng đã triển khai. Có thể giới hạn bằng `FB_ENABLED_FORMATS`. Nguồn A có thể dùng `fb-public` để đọc trang cá nhân hoặc fanpage truy cập được ở chế độ khách. [Hướng dẫn cấu hình Facebook](FB-WEB.md)
 
 ## 1. Chọn cách chạy
 
@@ -135,7 +135,7 @@ Compose tự chạy migration trước khi bật api/worker. Caddy tự xin ch�
 4. Thư mục profile (`PROFILES_DIR`) nằm trên **ổ đĩa mã hóa**, không đồng bộ lên cloud.
 5. `docker compose -f infra/compose/worker.yml --env-file .env.worker up -d --build`.
 
-> `infra/Dockerfile.worker` cài Chromium cho `fb-web` nhưng **chưa được build thử** (máy phát triển không có Docker): build một lần trên máy worker và chạy `pnpm fb:login` / `pnpm fb:capability` để kiểm tra. Xvfb/noVNC (tiếp quản từ xa) chưa có: hiện đăng nhập/xử lý checkpoint bằng cách ngồi trực tiếp tại máy worker hoặc dùng điều khiển từ xa của hệ điều hành.
+> `infra/Dockerfile.worker` cài Chromium cho `fb-web`. Đăng nhập và xử lý checkpoint trực tiếp trên máy worker hoặc qua điều khiển từ xa của hệ điều hành.
 
 ### 3.4 Sao lưu & vận hành
 - Sao lưu Postgres **ra ngoài máy** hằng ngày (ví dụ `pg_dump` lên R2/ổ khác) và diễn tập khôi phục trước khi chạy thật.
@@ -165,7 +165,7 @@ Mỗi người một mã riêng nếu có thể (thêm vào `API_TOKENS`). Mã �
 ## 6. Còn thiếu để đăng lên Facebook thật
 
 1. Giai đoạn 0 (người làm): quyền sử dụng nội dung, văn bản đồng ý của chủ B1–B5, cố định locale `vi-VN` và đối tượng xem, người phụ trách checkpoint.
-2. **Kiểm tra phiên Facebook và bật định dạng cần đăng.** Có thể chạy capability test ở chế độ “Chỉ mình tôi” theo [hướng dẫn Facebook](FB-WEB.md).
+2. **Đăng nhập phiên Facebook của tài khoản B.** Xem [hướng dẫn Facebook](FB-WEB.md).
 3. Build và kiểm tra image worker có Chromium trên máy worker thật.
 4. Chuyển mã video (FFmpeg), agent xử lý ngoại lệ UI, tiếp quản qua noVNC.
 5. Soak 7 ngày trước khi chuyển `APP_ENV=pilot-live` và đổi đối tượng xem sang thật.

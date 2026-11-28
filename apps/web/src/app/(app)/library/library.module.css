@@ -80,6 +80,13 @@
 .commentList li header small { color: var(--muted); }
 .commentList li p { margin: 4px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .commentEditor, .commentHandoff { display: grid; gap: 8px; margin-top: 8px; }
+.insight { display: grid; grid-template-columns: minmax(150px, 210px) minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+.insight dt { color: var(--muted); }
+.insight dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+@media (max-width: 600px) { .insight { grid-template-columns: minmax(0, 1fr); } .insight dd { margin-bottom: 6px; } }
+.wallPost { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.wallPost p { margin: 0; }
+.wallCaption { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 .trashNav { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
 .trashNav a[aria-current] { font-weight: 700; text-decoration: underline; }
 @media (max-width: 1130px) { .body { grid-template-columns: minmax(200px, 245px) minmax(0, 1fr); } }

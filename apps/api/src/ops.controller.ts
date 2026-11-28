@@ -1,7 +1,7 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Param, ParseUUIDPipe, Patch, Post, Put, Query, Req, Res, StreamableFile } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { FB_CAPABILITY_MIN_CASES, Q, SUCCESS } from '@seedingsys/contracts';
+import { FB_CAPABILITY_MIN_CASES, Q, REVIEW_PUBLISH_CHOICES, SUCCESS } from '@seedingsys/contracts';
 import { audit, BacklogDispatchError, dispatchBacklogItem, editBacklogCaption, enqueue, freezeSnapshot, listBacklog, movePublication, moveVariant, setControl, SnapshotBlockedError, tx, type Db } from '@seedingsys/db';
 import { facebookPostId, facebookPostLink, facebookUrl, removeAdvertisingLinks, vnDay, type Clock } from '@seedingsys/domain';
 import { Roles, type Principal } from './auth';
@@ -78,7 +78,7 @@ export class OpsController {
     return new StreamableFile(await this.store.open(a.objectKey, selected));
   }
 
-  /** Which formats passed their capability test, per target and connector version. */
+  /** Historical results of optional diagnostics, per target and connector version. */
   @Get('capabilities')
   async capabilities() {
     const [checks, releases] = await Promise.all([
@@ -259,17 +259,19 @@ export class OpsController {
   @Post('review/:id/approve')
   @Roles('reviewer')
   async approve(@Param('id', ParseUUIDPipe) id: string, @Body() body: unknown, @Actor() a: Principal) {
-    const { caption } = parse(z.object({ caption: z.string().trim().max(5000).optional() }), body ?? {});
+    const { caption, publishAs } = parse(z.object({ caption: z.string().trim().max(5000).optional(),
+      publishAs: z.enum(REVIEW_PUBLISH_CHOICES).optional() }), body ?? {});
     const now = this.clock.now();
     const ok = await tx(this.db, async (t) => {
       let done: boolean;
       try {
-        done = await freezeSnapshot(t, { variantId: id, from: 'NEEDS_REVIEW', now, actor: a.actor, caption, reviewedBy: a.actor });
+        done = await freezeSnapshot(t, { variantId: id, from: 'NEEDS_REVIEW', now, actor: a.actor, caption, publishAs, reviewedBy: a.actor });
       } catch (e) {
         if (!(e instanceof SnapshotBlockedError)) throw e;
         throw new ConflictException(e.message);
       }
-      if (done) await this.closeTasks(t, { variantId: id, kind: 'REVIEW_CONTENT' }, a.actor, { approved: true, edited: !!caption });
+      if (done) await this.closeTasks(t, { variantId: id, kind: 'REVIEW_CONTENT' }, a.actor,
+        { approved: true, edited: !!caption, ...(publishAs && { publishAs }) });
       return done;
     });
     if (!ok) throw new ConflictException('Bài đã thay đổi, hết hiệu lực hoặc không còn chờ duyệt.');

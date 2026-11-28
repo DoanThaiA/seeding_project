@@ -16,7 +16,7 @@ import {
   type VerifyResult,
   type ConnectorErrorKind,
 } from '@seedingsys/connectors-core';
-import type { IncompleteFlag, PublishSnapshot } from '@seedingsys/contracts';
+import { FAKE_PUBLISH_FORMATS, type IncompleteFlag, type PublishSnapshot } from '@seedingsys/contracts';
 import { FakePlatform, fakeMediaBytes, type FaultAction } from './platform';
 
 export * from './platform';
@@ -189,7 +189,7 @@ export class FakePublishConnector implements PublishConnector {
   constructor(private readonly p: FakePlatform) {}
 
   capabilities(_t: TargetRef): CapabilitySet {
-    return { TEXT: true, QUOTE_IMAGE: true, SINGLE_PHOTO: true, MULTI_PHOTO: true, VIDEO: true, NAMED_ALBUM: false, REEL: false };
+    return { ...Object.fromEntries(FAKE_PUBLISH_FORMATS.map(format => [format, true])), NAMED_ALBUM: false, REEL: false };
   }
 
   async openSession(target: TargetRef): Promise<PublishSession> {

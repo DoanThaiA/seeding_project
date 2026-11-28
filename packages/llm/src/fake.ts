@@ -1,6 +1,6 @@
 import { extractNumericTokens } from '@seedingsys/domain';
 import { PROMPT_VERSION } from './prompts';
-import type { LlmEditor, RewriteInput, RewriteOutput, Usage } from './types';
+import type { LlmEditor, PersonaInsight, PersonaInsightInput, RewriteInput, RewriteOutput, Usage } from './types';
 
 /**
  * Deterministic offline editor for local dev and CI. It keeps the source text and wraps it with
@@ -10,6 +10,29 @@ import type { LlmEditor, RewriteInput, RewriteOutput, Usage } from './types';
 export class FakeEditor implements LlmEditor {
   readonly modelId = 'fake-editor';
   calls = 0;
+
+  /** Bản tóm tắt giả: chỉ lặp lại dữ liệu có thật để test không phụ thuộc mạng. */
+  async summarizePersona(input: PersonaInsightInput): Promise<{ output: PersonaInsight; usage: Usage[] }> {
+    this.calls++;
+    const lines = [input.bio, ...input.intro, ...input.about.flatMap(item => item.values)].filter((item): item is string => !!item);
+    const summary = `Hồ sơ ${input.name} (${input.code}): ${lines.slice(0, 3).join(' · ') || 'chưa có thông tin đã lưu'}.`;
+    return {
+      output: {
+        occupation: lines[0]?.slice(0, 120) ?? null,
+        gender: 'UNKNOWN',
+        ageRange: null,
+        location: null,
+        interests: [],
+        traits: [],
+        voice: null,
+        topics: input.posts.length ? ['bài đã đăng của chính nhân vật'] : [],
+        avoid: [],
+        summary: summary.slice(0, 1400),
+        confidence: lines.length ? 'MEDIUM' : 'LOW',
+      },
+      usage: [{ inputTokens: Math.ceil(summary.length / 3), outputTokens: Math.ceil(summary.length / 3), modelId: this.modelId }],
+    };
+  }
 
   async rewrite(input: RewriteInput): Promise<{ output: RewriteOutput; usage: Usage[] }> {
     this.calls++;

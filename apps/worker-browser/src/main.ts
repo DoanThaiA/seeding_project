@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import { loadConfig } from '@seedingsys/config';
 import { ConnectorRegistry } from '@seedingsys/connectors-core';
 import { FakePlatform, FakePublishConnector, FakeReadConnector } from '@seedingsys/connectors-fake';
-import { FbPublicReadConnector, FbWebPublishConnector, FbWebReadConnector, fbWebOptionsFromEnv } from '@seedingsys/connectors-fb-web';
+import { FB_WEB_VERSION, FbPublicReadConnector, FbWebPublishConnector, FbWebReadConnector, fbWebOptionsFromEnv } from '@seedingsys/connectors-fb-web';
 import { ManualReadConnector } from '@seedingsys/connectors-manual';
 import { FbGraphReadConnector, fbGraphOptionsFromEnv } from '@seedingsys/connectors-fb-graph';
 import { Q } from '@seedingsys/contracts';
@@ -41,6 +41,9 @@ async function main() {
   registry.addReader(new FbPublicReadConnector(fbOpts));
   registry.addReader(new FbPublicReadConnector(fbOpts, 'fb-session'));
   registry.addReader(new FbWebReadConnector(fbOpts)).addPublisher(new FbWebPublishConnector(fbOpts));
+  if (!await db.connectorRelease.findFirst({ where: { connector: 'fb-web' }, select: { id: true } })) {
+    await db.connectorRelease.createMany({ data: { connector: 'fb-web', version: FB_WEB_VERSION, active: true }, skipDuplicates: true });
+  }
 
   const nodeName = `browser:${cfg.WORKER_NAME}`;
   const node = await db.workerNode.upsert({

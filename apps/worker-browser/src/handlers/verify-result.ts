@@ -1,5 +1,5 @@
 import type { CommitSignal, VerifyResult } from '@seedingsys/connectors-core';
-import { Q } from '@seedingsys/contracts';
+import { Q, RECONCILE_EXHAUSTED } from '@seedingsys/contracts';
 import { enqueue, movePublication, openOperatorTask, tx, type Lease } from '@seedingsys/db';
 import type { BrowserCtx } from '../ctx';
 
@@ -13,7 +13,7 @@ export async function applyVerifyResult(
   ctx: BrowserCtx,
   a: {
     publicationId: string; from: 'VERIFYING' | 'RECONCILING'; attemptId: string; result: VerifyResult;
-    committedAt: Date; fence: Lease; reconcileTries?: number; commitSignal?: CommitSignal; targetExternalId?: string;
+    committedAt: Date; fence: Lease; verificationAttempts: number; commitSignal?: CommitSignal; targetExternalId?: string;
   },
 ): Promise<VerifyOutcome> {
   const now = ctx.clock.now();
@@ -38,17 +38,16 @@ export async function applyVerifyResult(
       return 'PUBLISHED_VERIFIED';
     }
 
-    if (r.kind === 'NOT_FOUND' && r.conclusive && age >= ctx.reconcileMinAgeMs) {
+    const giveUp = a.verificationAttempts >= ctx.verifyMaxTries;
+    if (!giveUp && r.kind === 'NOT_FOUND' && r.conclusive && age >= ctx.reconcileMinAgeMs) {
       const ok = await movePublication(t, { id: a.publicationId, from: a.from, to: 'FAILED_CONFIRMED', actor: ctx.actor, now, fence: a.fence, reason: 'CONFIRMED_ABSENT' });
       if (!ok) return 'FENCED';
       await attempt({ outcome: 'FAILED_CONFIRMED', stage: 'VERIFY', evidence: { verify: r } });
       return 'FAILED_CONFIRMED';
     }
 
-    const tries = a.reconcileTries ?? 0;
-    const giveUp = r.kind === 'AMBIGUOUS' || tries >= ctx.reconcileMaxTries;
     if (a.from === 'RECONCILING' && giveUp) {
-      const reason = r.kind === 'AMBIGUOUS' ? `AMBIGUOUS_${r.matches}_MATCHES` : 'RECONCILE_EXHAUSTED';
+      const reason = RECONCILE_EXHAUSTED;
       const ok = await movePublication(t, { id: a.publicationId, from: 'RECONCILING', to: 'NEEDS_OPERATOR', actor: ctx.actor, now, fence: a.fence, reason });
       if (!ok) return 'FENCED';
       await attempt({ outcome: 'NEEDS_OPERATOR', stage: 'RECONCILE', evidence: { verify: r } });

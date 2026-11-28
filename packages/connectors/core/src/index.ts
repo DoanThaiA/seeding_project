@@ -1,4 +1,4 @@
-import type { ContentType, IncompleteFlag, PublishSnapshot } from '@seedingsys/contracts';
+import type { CommentPostSnapshot, ContentType, IncompleteFlag, PublishSnapshot } from '@seedingsys/contracts';
 
 // ─────────────────────────── Errors ───────────────────────────
 
@@ -187,6 +187,7 @@ export interface PublishSession {
   checkIdentity(expectedExternalId: string): Promise<{ ok: boolean; observed?: string }>;
   postComment?(input: { post: URL; parentId?: string; text: string }, beforeSubmit: () => Promise<void>): Promise<{ externalId: string; permalink: string } | null>;
   resolveCommentPost?(share: URL): Promise<URL>;
+  readCommentPost?(link: URL): Promise<CommentPostSnapshot>;
   replaceProfileBio?(input: { externalId: string; bio: string; beforeSave: () => Promise<void> }): Promise<void>;
   /** Build the draft. MUST NOT publish anything. */
   prepare(snapshot: PublishSnapshot, media: MediaFile[]): Promise<DraftHandle>;

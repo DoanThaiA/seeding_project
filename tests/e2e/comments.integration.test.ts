@@ -72,7 +72,7 @@ describe('comment recovery', () => {
     expect(await h.db.publicationComment.count({ where: { status: 'DRAFT' } })).toBe(2);
   });
 
-  it('sends every approved comment of a post at once: parents first, replies wait for their parent', async () => {
+  it('sends scanned comments in one action without approval and keeps replies under their parents', async () => {
     const post = await ingest('fake');
     await h.drain();
     const variant = await h.db.contentVariant.findFirstOrThrow({ where: { sourcePostId: post.id } });
@@ -90,19 +90,21 @@ describe('comment recovery', () => {
     const second = await create('r2');
     const skippedRoot = await create('r3');
     const orphan = await create('o1', 'r3');
-    for (const c of [root, child, grandchild, second, skippedRoot, orphan]) {
-      await library.updateComment(post.id, targetId, c.id, { action: 'approve', text: c.text, authorTargetId: targetId }, actor);
-    }
+    await library.updateComment(post.id, targetId, root.id, { action: 'draft', text: root.text, authorTargetId: targetId }, actor);
     await library.updateComment(post.id, targetId, skippedRoot.id, { action: 'omit' }, actor);
 
-    const result = await library.sendApprovedComments(post.id, targetId, actor);
+    const operator = { ...actor, role: 'operator' } as const;
+    const result = await library.sendComments(post.id, targetId, operator);
     expect(result).toMatchObject({ queued: 4, skipped: [{ commentId: orphan.id, reason: expect.stringContaining('bỏ qua') }] });
+    expect(await library.sendComments(post.id, targetId, operator)).toMatchObject({ queued: 0 });
     const jobs = (await h.db.outboxEvent.findMany({ where: { queue: Q.CommentPublish }, orderBy: { id: 'asc' } }))
       .map(e => e.payload as JobPayload<typeof Q.CommentPublish>);
     const replayOf = async (sourceCommentId: string) => h.db.publicationComment.findUniqueOrThrow({
       where: { destinationId_sourceCommentId: { destinationId: targetId, sourceCommentId } } });
     const ids = await Promise.all([root, second, child, grandchild].map(c => replayOf(c.id).then(r => r.id)));
     expect(jobs.map(j => j.replayId)).toEqual(ids);
+    expect(await replayOf(root.id)).toMatchObject({ authorTargetId: targetId, autoAuthor: false });
+    expect(await replayOf(second.id)).toMatchObject({ authorTargetId: targetId, autoAuthor: true });
 
     let next = 500;
     const sent: Array<{ text: string; parentId?: string; root: string | null }> = [];
@@ -127,7 +129,7 @@ describe('comment recovery', () => {
       { text: 'Nội dung c1', parentId: '500', root: '500' }, { text: 'Nội dung g1', parentId: '502', root: '500' },
     ]);
     expect(await replayOf(grandchild.id)).toMatchObject({ status: 'POSTED', permalink: permalink + '?comment_id=500&reply_comment_id=503' });
-    expect(await replayOf(orphan.id)).toMatchObject({ status: 'APPROVED' });
+    expect(await replayOf(orphan.id)).toMatchObject({ status: 'DRAFT' });
   });
 
   it('replies under a parent recorded from an encoded comment link, and refuses a reply whose parent was skipped', async () => {

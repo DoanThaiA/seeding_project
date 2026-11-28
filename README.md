@@ -12,7 +12,7 @@ Hệ thống điều phối A → B theo đặc tả *SeedingSys Pilot A1–A5 �
 | 4. Album/video: manifest, trạng thái UPLOADING_DRAFT → … → PLATFORM_PROCESSING, khóa dùng chung | 🟡 Luồng trạng thái + manifest xong; **media.prepare (FFprobe/FFmpeg) chưa làm**; NAMED_ALBUM luôn NEEDS_REVIEW |
 | 5. Web vận hành, extension MV3, takeover noVNC, agent.recover | 🟡 **API + web Next.js xong** (đăng nhập, tổng quan, duyệt bài, cần xử lý, bài đã đăng, lịch & backlog, công tắc dừng, báo cáo, cấu hình); extension, noVNC, agent **chưa làm** (agent.recover hiện chuyển thẳng cho người) |
 | 6. Kiểm thử lỗi | ✅ 16 kịch bản tự động (tests/faults) |
-| fb-web connector (Playwright, selector vi-VN) | 🟡 **Đã viết** (phiên, danh tính, soạn nháp, xem trước, đăng, xác minh, đối soát; capability test) và kiểm thử với Facebook giả. **Selector chưa kiểm chứng trên Facebook thật**, mặc định không định dạng nào được đăng — xem [docs/FB-WEB.md](docs/FB-WEB.md). Không có NAMED_ALBUM/REEL |
+| fb-web connector (Playwright, selector vi-VN) | Hỗ trợ đăng chữ, ảnh trích dẫn, một ảnh, nhiều ảnh, video và Reel. Tất cả định dạng đã triển khai được bật mặc định. [Cấu hình Facebook](docs/FB-WEB.md) |
 | Nguồn (A) | Nguồn `fb-public` tự quét bài Facebook xem được ở chế độ khách. Nguồn `manual` dùng trang **Nhập bài** |
 | 7. Soak 7 ngày, load test 50/50 | ⛔ Chưa làm |
 
@@ -41,7 +41,7 @@ pnpm fake timeline fb-B1
 pnpm fake session fb-B1 CHECKPOINT
 ```
 
-Với Facebook thật (sau khi đọc [docs/FB-WEB.md](docs/FB-WEB.md)): `pnpm fb:login B1` (tự đăng nhập), `pnpm fb:capability B1 --yes` (kiểm thử ở “Chỉ mình tôi”).
+Với Facebook thật, đăng nhập phiên B1 bằng `pnpm fb:login B1` hoặc nút **Đăng nhập Facebook** trong **Quản trị luồng → Tài khoản đích**. [Cấu hình Facebook](docs/FB-WEB.md)
 
 Để quét nguồn A1 bằng URL, vào **Quản trị luồng đăng → A1 → B1**, chọn **Facebook công khai**, dán link tại **Nguồn A1** và lưu. Worker tự quét theo chu kỳ. Nút **Quét ngay** gửi một lượt quét cho worker. Nội dung và thông tin bài nằm trong PostgreSQL. Các tệp ảnh và video tải được lưu vào bucket khi dùng `STORAGE_DRIVER=r2`.
 
@@ -100,7 +100,7 @@ tests/             e2e, faults, harness (Postgres nhúng + đồng hồ giả l�
 ## Việc tiếp theo
 
 1. Giai đoạn 0 (vận hành): ma trận quyền đọc A1–A5, văn bản đồng ý chủ tài khoản B1–B5, cố định locale/audience.
-2. Kiểm chứng selector `fb-web` trên giao diện thật + capability test ≥20 ca/định dạng ở chế độ "Chỉ mình tôi".
+2. Duy trì selector `fb-web` khi giao diện Facebook thay đổi.
 3. Extension MV3, takeover qua noVNC.
 4. media.prepare (FFprobe/FFmpeg), agent.recover với 7 công cụ giới hạn.
 5. Soak 7 ngày, load test 50/50.

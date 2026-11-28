@@ -1,6 +1,6 @@
 import type { PublishSnapshot } from '@seedingsys/contracts';
 import type { CommitSignal } from '@seedingsys/connectors-core';
-import { Q } from '@seedingsys/contracts';
+import { Q, RECONCILE_EXHAUSTED } from '@seedingsys/contracts';
 import { accountResource, acquireLease, enqueue, heartbeatLease, movePublication, openOperatorTask, releaseLease, tx } from '@seedingsys/db';
 import { FencedOutError, RetryLaterError, captionFingerprint, hashObject } from '@seedingsys/domain';
 import type { BrowserCtx } from '../ctx';
@@ -24,7 +24,13 @@ export async function handleReconcile(ctx: BrowserCtx, p: { publicationId: strin
       return 'NEEDS_OPERATOR';
     });
   };
-  if (pub.reconcileTries >= ctx.reconcileMaxTries) return reportUnstarted('RECONCILE_EXHAUSTED');
+  // The transition is durable even if the initial worker times out or crashes before saving a result.
+  const initialVerify = pub.committedAt && await ctx.db.auditEvent.findFirst({
+    where: { entityType: 'publication', entityId: pub.id, action: 'transition', toState: 'VERIFYING', at: { gte: pub.committedAt } },
+    select: { id: true },
+  });
+  const verificationAttempts = pub.reconcileTries + (initialVerify ? 1 : 0);
+  if (verificationAttempts >= ctx.verifyMaxTries) return reportUnstarted(RECONCILE_EXHAUSTED);
 
   const ttlMs = ctx.leaseTtlMs.RECONCILE;
   const lease = await acquireLease(ctx.db, {
@@ -132,7 +138,7 @@ export async function handleReconcile(ctx: BrowserCtx, p: { publicationId: strin
         result,
         committedAt: pub.committedAt ?? pub.updatedAt,
         fence: lease,
-        reconcileTries: pub.reconcileTries + 1,
+        verificationAttempts: verificationAttempts + 1,
       });
     } finally {
       await withTimeout(session.close(), ctx.timeouts.stepMs, 'closeSession').catch(() => undefined);
@@ -140,15 +146,16 @@ export async function handleReconcile(ctx: BrowserCtx, p: { publicationId: strin
   } catch (err) {
     if (err instanceof FencedOutError) return 'FENCED';
     if (!attemptId) throw err;
-    // Could not look: stay unresolved and try again later (bounded by reconcileMaxTries).
+    // A failed read consumes the attempt. The cap also applies after a worker restart.
     const message = err instanceof Error ? err.message : String(err);
     const outcome = await tx(ctx.db, async (t) => {
       const now = ctx.clock.now();
-      const giveUp = pub.reconcileTries + 1 >= ctx.reconcileMaxTries;
-      const moved = await movePublication(t, { id: pub.id, from: 'RECONCILING', to: giveUp ? 'NEEDS_OPERATOR' : 'UNKNOWN', actor: ctx.actor, now, fence: lease, reason: 'RECONCILE_ERROR' });
+      const giveUp = verificationAttempts + 1 >= ctx.verifyMaxTries;
+      const reason = giveUp ? RECONCILE_EXHAUSTED : 'RECONCILE_ERROR';
+      const moved = await movePublication(t, { id: pub.id, from: 'RECONCILING', to: giveUp ? 'NEEDS_OPERATOR' : 'UNKNOWN', actor: ctx.actor, now, fence: lease, reason });
       if (!moved) return 'FENCED';
       await t.publicationAttempt.update({ where: { id: attemptId! }, data: { outcome: giveUp ? 'NEEDS_OPERATOR' : 'UNKNOWN', finishedAt: now, errorMessage: message.slice(0, 500) } });
-      if (giveUp) await openOperatorTask(t, { kind: 'CONFIRM_RESULT', reason: 'RECONCILE_ERROR', targetId: pub.targetId, publicationId: pub.id, now });
+      if (giveUp) await openOperatorTask(t, { kind: 'CONFIRM_RESULT', reason, targetId: pub.targetId, publicationId: pub.id, details: { error: message.slice(0, 500) }, now });
       else await enqueue(t, Q.PublishReconcile, { publicationId: pub.id }, { startAfter: new Date(now.getTime() + ctx.reconcileDelaySec * 1000) });
       return giveUp ? 'NEEDS_OPERATOR' : 'UNKNOWN';
     });

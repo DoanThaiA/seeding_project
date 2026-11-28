@@ -1,7 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { betaZodOutputFormat } from '@anthropic-ai/sdk/helpers/beta/zod';
-import { CAPTION_SYSTEM, EXTRACT_SYSTEM, PROMPT_VERSION, renderSource } from './prompts';
-import { CaptionSchema, FactsSchema, LlmRefusalError, type LlmEditor, type RewriteInput, type RewriteOutput, type Usage } from './types';
+import { CAPTION_SYSTEM, COMMENT_PLAN_SYSTEM, EXTRACT_SYSTEM, PERSONA_INSIGHT_SYSTEM, PROMPT_VERSION, renderSource } from './prompts';
+import { CaptionSchema, CommentPlanSchema, FactsSchema, LlmRefusalError, PersonaInsightSchema, type CommentPlan, type CommentPlanInput,
+  type LlmEditor, type PersonaInsight, type PersonaInsightInput, type RewriteInput, type RewriteOutput, type Usage } from './types';
 
 type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -22,7 +23,8 @@ export class ClaudeEditor implements LlmEditor {
     this.client = new Anthropic({ ...(opts.apiKey ? { apiKey: opts.apiKey } : {}), maxRetries: 2, timeout: 120_000 });
   }
 
-  private async call<T>(system: string, user: string, format: ReturnType<typeof betaZodOutputFormat<any>>): Promise<{ parsed: T; usage: Usage }> {
+  private async call<T>(system: string, user: Anthropic.MessageParam['content'],
+    format: ReturnType<typeof betaZodOutputFormat<any>>): Promise<{ parsed: T; usage: Usage }> {
     const res = await this.client.beta.messages.parse({
       model: this.modelId,
       max_tokens: this.opts.maxTokens,
@@ -40,6 +42,23 @@ export class ClaudeEditor implements LlmEditor {
       throw new Error(`LLM output not parseable (stop_reason=${res.stop_reason})`);
     }
     return { parsed: res.parsed_output as T, usage };
+  }
+
+  async planComments(input: CommentPlanInput) {
+    // Ảnh của bài đi kèm dạng khối ảnh; JSON chỉ chứa chữ nên không phình ra vì base64.
+    const { images = [], ...post } = input.post;
+    const content: Anthropic.MessageParam['content'] = [
+      ...images.map(image => ({ type: 'image' as const,
+        source: { type: 'base64' as const, media_type: image.mime, data: image.data } })),
+      { type: 'text' as const, text: JSON.stringify({ ...input, post: { ...post, imageCount: images.length } }) },
+    ];
+    const { parsed, usage } = await this.call<CommentPlan>(COMMENT_PLAN_SYSTEM, content, betaZodOutputFormat(CommentPlanSchema));
+    return { output: parsed, usage: [usage] };
+  }
+
+  async summarizePersona(input: PersonaInsightInput) {
+    const { parsed, usage } = await this.call<PersonaInsight>(PERSONA_INSIGHT_SYSTEM, JSON.stringify(input), betaZodOutputFormat(PersonaInsightSchema));
+    return { output: parsed, usage: [usage] };
   }
 
   async rewrite(input: RewriteInput): Promise<{ output: RewriteOutput; usage: Usage[] }> {

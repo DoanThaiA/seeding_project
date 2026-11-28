@@ -1,4 +1,4 @@
-import { ACTIVE, SUCCESS, UNRESOLVED, FB_WEB_PUBLISH_FORMATS, workflowFor } from '@seedingsys/contracts';
+import { ACTIVE, SUCCESS, UNRESOLVED, FB_WEB_PUBLISH_FORMATS, hasReviewPublishChoice, needsPublishChoice, workflowFor } from '@seedingsys/contracts';
 import { BacklogDispatchError, SnapshotBlockedError, closeVariantReviewTasks, contentHolder, dispatchBacklogItem,
   freezeSnapshot, revisionContentKey, tx } from '@seedingsys/db';
 import type { CoreCtx } from '../ctx';
@@ -46,16 +46,19 @@ async function prepare(ctx: CoreCtx, key: { syncId: string; sourcePostId: string
         return 'WAIT' as const;
       }
     }
-    if (!workflowFor(post.contentType) || (mapping.target.connector === 'fb-web' && !FB_WEB_PUBLISH_FORMATS.includes(post.contentType))) {
+    const approvedSelection = current?.status === 'READY' && hasReviewPublishChoice(current.snapshot, current.reviewedBy);
+    const contentType = approvedSelection ? current.contentType : post.contentType;
+    if (needsPublishChoice(contentType)) return block('REVIEW_REQUIRED');
+    if (!workflowFor(contentType) || (mapping.target.connector === 'fb-web' && !FB_WEB_PUBLISH_FORMATS.includes(contentType))) {
       return block('FORMAT_UNSUPPORTED');
     }
     if ((revision.raw as { sharedPermalink?: string } | null)?.sharedPermalink) return block('NATIVE_SHARE_REQUIRED');
-    if (revision.mediaStatus === 'PENDING') {
+    if (!approvedSelection && revision.mediaStatus === 'PENDING') {
       await record('PENDING', 'MEDIA_PENDING');
       return 'WAIT' as const;
     }
-    if (revision.mediaStatus === 'FAILED') return block('MEDIA_INCOMPLETE');
-    if (!Array.isArray(revision.incomplete) || revision.incomplete.length > 0 || post.identityConfidence !== 'HIGH') {
+    if (!approvedSelection && revision.mediaStatus === 'FAILED') return block('MEDIA_INCOMPLETE');
+    if (!approvedSelection && (!Array.isArray(revision.incomplete) || revision.incomplete.length > 0 || post.identityConfidence !== 'HIGH')) {
       return block('SOURCE_INCOMPLETE');
     }
     if (!current || (current.expiresAt && current.expiresAt <= now)) return block('SOURCE_REVISION_CHANGED');

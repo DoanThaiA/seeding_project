@@ -91,7 +91,8 @@ export async function handleSourcePoll(ctx: BrowserCtx, p: { sourceId: string; c
         LIMIT ${p.collectComments ? 16 : 5}` : [];
       const reading = reader.readSince(
         { id: source.id, code: source.code, externalRef: source.externalRef, retryPermalinks: retry.map(item => item.permalink), readAccount,
-          ...(p.history ? { history: { cursor: p.history.cursor } } : { maxPosts: source.pollPostLimit ?? undefined }) },
+          maxPosts: source.pollPostLimit ?? undefined,
+          ...(p.history && { history: { cursor: p.history.cursor } }) },
         p.history ? null : source.watermark as Record<string, unknown> | null, source.overlapCount,
       );
       // The session reader closes its browser at its own deadline. Await that cleanup before releasing B's lock.

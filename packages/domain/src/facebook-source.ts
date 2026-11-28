@@ -17,6 +17,8 @@ export function facebookPostId(url: URL) {
   if (path === '/story.php' || path === '/permalink.php') return url.searchParams.get('story_fbid');
   if (path === '/photo' || path === '/photo.php') return url.searchParams.get('fbid');
   if (path === '/watch') return url.searchParams.get('v');
+  const composite = path.match(/\/posts\/(\d{1,30})(?::|%3a)(\d{1,30})$/i);
+  if (composite) return composite[1] + ':' + composite[2];
   return path.match(/\/(?:posts|videos|reel)\/([A-Za-z0-9_]+)$/)?.[1];
 }
 
@@ -33,7 +35,8 @@ export function facebookPostLink(value: unknown) {
 /** Accept a direct post link or a Facebook share link that must be resolved in a checked session. */
 export function facebookScriptPost(value: string) {
   const direct = facebookPostLink(value);
-  if (direct && /^[A-Za-z0-9_]{1,160}$/.test(direct.id)) {
+  if (direct && (/^[A-Za-z0-9_]{1,160}$/.test(direct.id) ||
+    (/\/posts\/[^/]+\/?$/.test(direct.url.pathname) && /^\d{1,30}:\d{1,30}$/.test(direct.id)))) {
     const set = /^\/photo(?:\.php)?\/?$/.test(direct.url.pathname) && new URL(value).searchParams.get('set');
     if (set && /^(?:a|pcb)\.\d{1,30}$/.test(set)) direct.url.searchParams.set('set', set);
     return { url: direct.url, id: direct.id };

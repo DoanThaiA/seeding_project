@@ -80,6 +80,8 @@ export class MockProfile {
   guestMode = false;
   latePostsStart?: number;
   profileArtwork?: { avatar: string; cover: string; avatarOwner?: string };
+  profileNameOutsideHeading = false;
+  profileHeaderDelay = 0;
   signedInAs?: string;
   timelineRequests: Array<{ path: string; cookie?: string }> = [];
   private server!: Server;
@@ -277,8 +279,11 @@ export class MockProfile {
     const cards = this.posts.map((p, i) => this.post(p, i + 1));
     const posts = cards.slice(0, this.latePostsStart ?? cards.length).join('') || (this.guestMode ? '<p>Chưa có bài viết nào</p>' : '');
     const late = this.latePostsStart === undefined ? '' : cards.slice(this.latePostsStart).join('');
+    const profile = { __isProfile: 'User', __isRenderedProfile: 'User', id: this.userId, url: this.baseUrl + '/profile.php?id=' + this.userId, name: this.owner };
     return `<!doctype html><html lang="vi"><body>
-      <h1>${esc(this.owner)}</h1>
+      ${this.profileNameOutsideHeading ? `<svg hidden aria-label="${esc(this.owner)}" width="24" height="24"><rect width="24" height="24" /></svg>
+        <script>setTimeout(() => document.querySelector('svg').removeAttribute('hidden'), ${this.profileHeaderDelay})</script>
+        <script type="application/json">${JSON.stringify(profile).replace(/</g, '\\u003c')}</script>` : `<h1>${esc(this.owner)}</h1>`}
       ${this.guestMode && !this.signedInAs ? '<form><input type="password" name="pass"></form>' : ''}
       <div style="height:1500px">Giới thiệu · Bạn bè · Ảnh</div>
       <div id="posts"></div><div style="height:2500px"></div>

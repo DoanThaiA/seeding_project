@@ -1,7 +1,8 @@
 import type { Db } from '@seedingsys/db';
 import { hashObject, vnDay, type Clock } from '@seedingsys/domain';
 import { PROMPT_VERSION } from './prompts';
-import { LlmBudgetExceededError, type LlmEditor, type RewriteInput, type RewriteOutput, type Usage } from './types';
+import { LlmBudgetExceededError, LlmUnavailableError, type CommentPlanInput, type LlmEditor, type PersonaInsightInput,
+  type RewriteInput, type RewriteOutput, type Usage } from './types';
 
 /** USD per million tokens (input, output). Unknown models are priced conservatively. */
 const PRICES: Record<string, [number, number]> = {
@@ -50,6 +51,10 @@ export class LlmGateway {
     this.sem = new Semaphore(opts.maxConcurrency);
   }
 
+  get modelId(): string {
+    return this.editor.modelId;
+  }
+
   cacheKey(revisionId: string, targetStyle: unknown): string {
     return hashObject({ revisionId, targetStyle, prompt: PROMPT_VERSION, model: this.editor.modelId });
   }
@@ -67,29 +72,40 @@ export class LlmGateway {
     const hit = await this.db.llmCache.findUnique({ where: { cacheKey: key } });
     if (hit) return { output: hit.output as unknown as RewriteOutput, cacheKey: key, cached: true };
 
-    const budget = BigInt(Math.round(this.opts.dailyBudgetUsd * 1_000_000));
-    if ((await this.spentTodayMicroUsd()) >= budget) throw new LlmBudgetExceededError('daily LLM budget exhausted');
-
-    const { output, usage } = await this.sem.run(() => this.editor.rewrite(input));
-    const now = this.clock.now();
-    await this.db.llmUsage.createMany({
-      data: usage.map((u) => ({
-        profile: this.opts.profile ?? 'editor',
-        modelId: u.modelId,
-        day: vnDay(now),
-        inputTokens: u.inputTokens,
-        outputTokens: u.outputTokens,
-        costMicroUsd: costMicroUsd(u),
-        refType: 'variant',
-        refId: input.variantId,
-        at: now,
-      })),
-    });
+    const output = await this.generate('variant', input.variantId, () => this.editor.rewrite(input));
     await this.db.llmCache.upsert({
       where: { cacheKey: key },
       create: { cacheKey: key, output: output as object, modelId: output.model_id },
       update: {},
     });
     return { output, cacheKey: key, cached: false };
+  }
+
+  async planComments(input: CommentPlanInput, generationId: string) {
+    const plan = this.editor.planComments?.bind(this.editor);
+    if (!plan) throw new LlmUnavailableError('comment generation requires an LLM provider');
+    return this.generate('comment_script_generation', generationId, () => plan(input));
+  }
+
+  async summarizePersona(input: PersonaInsightInput, runId: string) {
+    const summarize = this.editor.summarizePersona?.bind(this.editor);
+    if (!summarize) throw new LlmUnavailableError('persona summary requires an LLM provider');
+    return this.generate('persona_summary', runId, () => summarize(input));
+  }
+
+  private async generate<T>(refType: string, refId: string, run: () => Promise<{ output: T; usage: Usage[] }>) {
+    return this.sem.run(async () => {
+      const budget = BigInt(Math.round(this.opts.dailyBudgetUsd * 1_000_000));
+      if ((await this.spentTodayMicroUsd()) >= budget) throw new LlmBudgetExceededError('daily LLM budget exhausted');
+      const { output, usage } = await run();
+      const now = this.clock.now();
+      await this.db.llmUsage.createMany({
+        data: usage.map(u => ({
+          profile: this.opts.profile ?? 'editor', modelId: u.modelId, day: vnDay(now), inputTokens: u.inputTokens,
+          outputTokens: u.outputTokens, costMicroUsd: costMicroUsd(u), refType, refId, at: now,
+        })),
+      });
+      return output;
+    });
   }
 }

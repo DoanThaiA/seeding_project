@@ -6,7 +6,7 @@ import { Client } from 'pg';
 import { inject } from 'vitest';
 import { ConnectorRegistry } from '@seedingsys/connectors-core';
 import { FakePlatform, FakePublishConnector, FakeReadConnector } from '@seedingsys/connectors-fake';
-import { CONTENT_TYPES, Q, type QueueName } from '@seedingsys/contracts';
+import { Q, type QueueName } from '@seedingsys/contracts';
 import { createDb, type Db } from '@seedingsys/db';
 import { ManualClock, RetryLaterError } from '@seedingsys/domain';
 import { FakeEditor, LlmGateway } from '@seedingsys/llm';
@@ -86,10 +86,6 @@ export async function createHarness(opts: { codes?: number[]; start?: string } =
     });
     await db.sourceTargetMapping.create({ data: { sourceId: s.id, targetId: t.id } });
     await db.browserProfile.create({ data: { targetId: t.id, workerNodeId: node.id, profileDir: `/profiles/B${i}` } });
-    for (const ct of CONTENT_TYPES) {
-      if (ct === 'UNSUPPORTED' || ct === 'NAMED_ALBUM' || ct === 'REEL') continue;
-      await db.capabilityCheck.create({ data: { targetId: t.id, contentType: ct, connector: 'fake', connectorVersion: 'fake-1.0.0', passed: true, cases: 20 } });
-    }
     platform.ensureSource(`A${i}`);
     platform.ensureAccount(`fb-B${i}`);
     ids.sources[`A${i}`] = s.id;

@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { FB_WEB_VERSION, FbWebPublishConnector } from '@seedingsys/connectors-fb-web';
+import { FB_WEB_VERSION, FbWebPublishConnector, fbWebOptionsFromEnv } from '@seedingsys/connectors-fb-web';
 import { dispatchBacklogItem, editBacklogCaption, listBacklog } from '@seedingsys/db';
 import { createHarness, cycle, MIN, pubsOf, type Harness } from '../helpers/harness';
 import { MockFb } from '../helpers/mock-fb';
@@ -23,24 +23,20 @@ describe.skipIf(!BROWSER)('scheduler + publish handler with the real fb-web conn
     dir = mkdtempSync(join(tmpdir(), 'fbweb-int-'));
     h.browser.registry.addPublisher(
       new FbWebPublishConnector({
+        ...fbWebOptionsFromEnv({}),
         baseUrl: mock.baseUrl,
         profilesRoot: join(dir, 'profiles'),
         headless: true,
         channel: BROWSER!.includes('msedge') ? 'msedge' : undefined,
         executablePath: BROWSER!.includes('msedge') ? undefined : BROWSER,
-        enabledFormats: ['TEXT', 'MULTI_PHOTO'],
         stepTimeoutMs: 6000,
         uploadTimeoutMs: 15_000,
         now: () => h.clock.now(),
       }),
     );
-    // Target B1 now publishes through fb-web, certified for TEXT and MULTI_PHOTO only.
+    // Target B1 uses the default formats of the bundled Facebook release.
     await h.db.targetAccount.updateMany({ data: { connector: 'fb-web', externalId: mock.userId } });
     await h.db.connectorRelease.create({ data: { connector: 'fb-web', version: FB_WEB_VERSION, active: true } });
-    const t = await h.db.targetAccount.findFirstOrThrow();
-    for (const ct of ['TEXT', 'MULTI_PHOTO'] as const) {
-      await h.db.capabilityCheck.create({ data: { targetId: t.id, contentType: ct, connector: 'fb-web', connectorVersion: FB_WEB_VERSION, passed: true, cases: 20 } });
-    }
   });
   afterEach(async () => {
     await mock.stop();
@@ -99,8 +95,7 @@ describe.skipIf(!BROWSER)('scheduler + publish handler with the real fb-web conn
     expect(mock.posts[0].audience).toBe('Công khai');
   });
 
-  it('dispatches an enabled Facebook format without a capability record', async () => {
-    await h.db.capabilityCheck.deleteMany({ where: { contentType: 'TEXT' } });
+  it('dispatches a default Facebook format without a capability record', async () => {
     await readyPost('Bài đăng khi chưa có kết quả kiểm thử');
     expect((await listBacklog(h.db, h.clock.now()))[0].blockReason).toBeNull();
     h.setTime(TEN);
@@ -155,7 +150,7 @@ describe.skipIf(!BROWSER)('scheduler + publish handler with the real fb-web conn
     expect(mock.posts).toHaveLength(0);
   });
 
-  it('UI said "posted" but nothing exists: stays UNKNOWN, becomes FAILED_CONFIRMED only after a conclusive scan, then posts exactly once', async () => {
+  it('leaves the post for manual review after two checks even if Facebook showed a success toast', async () => {
     await readyPost('Bài bị nuốt');
     mock.addPost({ caption: 'Bài cũ trên trang', at: h.clock.now().getTime() - 5 * 3600_000 }); // proves the scan reaches past the window
     mock.postMode = 'drop';
@@ -169,15 +164,15 @@ describe.skipIf(!BROWSER)('scheduler + publish handler with the real fb-web conn
       await h.workerHeartbeat();
       await h.drain();
     }
-    expect((await pubsOf(h, 'B1'))[0].status).toBe('FAILED_CONFIRMED');
+    expect((await pubsOf(h, 'B1'))[0]).toMatchObject({ status: 'NEEDS_OPERATOR', lastReason: 'RECONCILE_EXHAUSTED', reconcileTries: 1 });
 
     mock.postMode = 'normal';
     h.setTime(ELEVEN);
     await cycle(h);
     const [p] = await pubsOf(h, 'B1');
-    expect(p.status).toBe('PUBLISHED_VERIFIED');
-    expect(p.publishTries).toBe(2);
-    expect(mock.posts.filter((x) => x.caption.includes('nuốt'))).toHaveLength(1);
+    expect(p.status).toBe('NEEDS_OPERATOR');
+    expect(p.publishTries).toBe(1);
+    expect(mock.posts.filter((x) => x.caption.includes('nuốt'))).toHaveLength(0);
   }, 120_000);
 
   it('composer that never closes after Post → UNKNOWN → reconcile finds the real post, no duplicate', async () => {

@@ -28,7 +28,8 @@ export interface BrowserCtx {
   commitMarginMs: number;
   /** "Not found" after commit is only conclusive once this much time has passed. */
   reconcileMinAgeMs: number;
-  reconcileMaxTries: number;
+  /** Maximum initial verify and reconcile attempts combined. */
+  verifyMaxTries: number;
   reconcileDelaySec: number;
   verifyWindowMs: number;
   tmpDir: string;
@@ -39,7 +40,7 @@ export const DEFAULT_BROWSER_SETTINGS = {
   leaseTtlMs: { STANDARD: 3 * 60_000, ALBUM: 5 * 60_000, VIDEO: 5 * 60_000, RECONCILE: 3 * 60_000, POLL: 4 * 60_000 },
   commitMarginMs: 60_000,
   reconcileMinAgeMs: 10 * 60_000,
-  reconcileMaxTries: 5,
+  verifyMaxTries: 2,
   reconcileDelaySec: 120,
   verifyWindowMs: 30 * 60_000,
 } satisfies Partial<BrowserCtx>;

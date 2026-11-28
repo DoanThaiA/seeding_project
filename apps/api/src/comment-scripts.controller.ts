@@ -1,6 +1,7 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Param, ParseUUIDPipe, Post, Put } from '@nestjs/common';
 import { z } from 'zod';
-import { activeKillSwitch, audit, lockCommentScript, queueCommentScriptStep, tx, type Db, type Tx } from '@seedingsys/db';
+import { COMMENT_PREVIEW_KIND, CommentPostSnapshot } from '@seedingsys/contracts';
+import { activeKillSwitch, audit, json, lockCommentScript, Prisma, queueCommentScriptStep, tx, type Db, type Tx } from '@seedingsys/db';
 import { facebookScriptComment, facebookScriptPost, type Clock } from '@seedingsys/domain';
 import { Roles, type Principal } from './auth';
 import { CLOCK, DB } from './tokens';
@@ -8,26 +9,37 @@ import { Actor, parse } from './util';
 
 const id = z.string().uuid();
 const fingerprint = z.number().int().positive();
-const scriptInput = z.object({ name: z.string().trim().min(1).max(120), postUrl: z.string().trim().max(2000), steps: z.array(z.object({
+const scriptInput = z.object({ name: z.string().trim().min(1).max(120), postUrl: z.string().trim().max(2000), previewId: id.optional(), steps: z.array(z.object({
   targetId: id, text: z.string().trim().min(1).max(8000).transform(text => text.replace(/\r\n?/g, '\n')),
   replyTo: z.number().int().min(0).nullable().default(null), replyUrl: z.string().trim().max(2000).nullable().default(null),
 })).min(1).max(50) });
 
-function readInput(body: unknown) {
-  const input = parse(scriptInput, body);
+async function readInput(db: Tx, input: z.infer<typeof scriptInput>, previous?: { postUrl: string; postSnapshot: unknown; resolvedUrl: string | null }) {
   const post = facebookScriptPost(input.postUrl);
   if (!post) throw new BadRequestException('Dán liên kết trực tiếp hoặc liên kết chia sẻ đến một bài Facebook.');
+  const run = input.previewId ? await db.targetBrowserRun.findFirst({ where: {
+    id: input.previewId, kind: COMMENT_PREVIEW_KIND, status: 'DONE', profileUrl: post.url.href,
+  }, select: { results: true } }) : null;
+  const kept = previous?.postUrl === post.url.href;
+  const snapshot = CommentPostSnapshot.safeParse(input.previewId ? run?.results : kept ? previous.postSnapshot : null).data;
+  const resolved = snapshot && facebookScriptPost(snapshot.url);
+  if ((input.previewId && !resolved) || (resolved && (!resolved.id || (post.id && resolved.id !== post.id)))) {
+    throw new ConflictException('Hãy lấy lại nội dung từ đúng liên kết bài Facebook.');
+  }
+  const resolvedUrl = resolved?.url.href ?? (post.id ? post.url.href : kept ? previous.resolvedUrl : null);
+  const resolvedId = resolvedUrl ? facebookScriptPost(resolvedUrl)?.id : null;
   const steps = input.steps.map((step, position) => {
     if (step.replyTo !== null && (step.replyTo >= position || step.replyUrl)) {
       throw new BadRequestException(`Bước ${position + 1} cần trả lời một bước đứng trước hoặc một bình luận có sẵn.`);
     }
     const reply = facebookScriptComment(step.replyUrl);
-    if (step.replyUrl && (!reply || (post.id && reply.postId !== post.id))) {
+    if (step.replyUrl && (!reply || (resolvedId && reply.postId !== resolvedId))) {
       throw new BadRequestException(`Liên kết bình luận ở bước ${position + 1} phải thuộc bài đang chọn.`);
     }
     return { ...step, replyUrl: reply?.url.href ?? null, position };
   });
-  return { name: input.name, postUrl: post.url.href, resolvedUrl: post.id ? post.url.href : null, steps };
+  return { name: input.name, postUrl: post.url.href, resolvedUrl,
+    postSnapshot: snapshot ? json({ ...snapshot, previewId: input.previewId ?? snapshot.previewId }) : Prisma.DbNull, steps };
 }
 
 @Controller('comment-scripts')
@@ -52,8 +64,9 @@ export class CommentScriptsController {
   @Post()
   @Roles('operator')
   async create(@Body() body: unknown, @Actor() actor: Principal) {
-    const { steps, ...input } = readInput(body);
+    const values = parse(scriptInput, body);
     return tx(this.db, async t => {
+      const { steps, ...input } = await readInput(t, values);
       await this.assertTargets(t, steps);
       const now = this.clock.now();
       const script = await t.commentScript.create({ data: { ...input, createdAt: now, steps: { createMany: { data: steps } } } });
@@ -66,9 +79,10 @@ export class CommentScriptsController {
   @Roles('operator')
   async edit(@Param('id', ParseUUIDPipe) id: string, @Body() body: unknown, @Actor() actor: Principal) {
     const { version } = parse(z.object({ version: fingerprint }), body);
-    const { steps, ...input } = readInput(body);
+    const values = parse(scriptInput, body);
     return tx(this.db, async t => {
-      await this.lockDraft(t, id, version);
+      const previous = await this.lockDraft(t, id, version);
+      const { steps, ...input } = await readInput(t, values, previous);
       await this.assertTargets(t, steps);
       await t.commentScriptStep.deleteMany({ where: { scriptId: id } });
       const script = await t.commentScript.update({ where: { id }, data: { ...input, version: { increment: 1 }, steps: { createMany: { data: steps } } } });
@@ -142,6 +156,7 @@ export class CommentScriptsController {
     const script = await t.commentScript.findUnique({ where: { id } });
     if (!script) throw new NotFoundException('Không tìm thấy kịch bản.');
     if (script.startedAt || script.version !== version) throw new ConflictException('Kịch bản đã thay đổi hoặc đã được chạy. Hãy tải lại.');
+    return script;
   }
 
   private async assertTargets(t: Tx, steps: { targetId: string }[], checkPause = false) {

@@ -12,7 +12,7 @@ const reasons: Record<string, string> = {
   ACCOUNT_BUSY: 'Đích đang xử lý bài trước', PUBLISH_INTERVAL_NOT_ELAPSED: 'Chờ đến khoảng cách đăng đã cấu hình',
   UNRESOLVED_PUBLICATION: 'Cần đối chiếu kết quả đăng trên Facebook', TARGET_DISABLED: 'Tài khoản đích đang tắt',
   NO_WORKER: 'Đang chờ worker của tài khoản đích', NO_CONNECTOR_RELEASE: 'Chưa có kết nối đăng đang hoạt động',
-  FORMAT_UNSUPPORTED: 'Định dạng chưa hỗ trợ', FORMAT_NOT_CERTIFIED: 'Định dạng chưa được xác nhận cho đích',
+  FORMAT_UNSUPPORTED: 'Cần chuẩn bị bản đăng cho đích', FORMAT_NOT_CERTIFIED: 'Định dạng chưa được xác nhận cho đích',
   SOURCE_INCOMPLETE: 'Bài nguồn chưa đủ dữ liệu để đăng', MEDIA_PENDING: 'Đang tải ảnh hoặc video',
   MEDIA_INCOMPLETE: 'Bài nguồn thiếu ảnh hoặc video', CONTENT_PENDING: 'Đang xử lý nội dung',
   NATIVE_SHARE_REQUIRED: 'Bài cần chia sẻ gốc trên Facebook', REVIEW_REQUIRED: 'Bài này cần duyệt riêng',

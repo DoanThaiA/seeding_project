@@ -1,18 +1,18 @@
 import Link from 'next/link';
 import { AutoRefresh } from '@/components/client';
 import { apiGet, can, getSession } from '@/lib/api';
-import type { ProfileDirectory } from '../profile-groups/ProfileGroups';
+import type { PersonaSummary } from '../personas/types';
 import { ScriptEditor, ScriptRun, type Script, type ScriptSummary } from './CommentScripts';
 
 export default async function CommentScriptsPage({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const session = await getSession();
-  const [query, scripts, directory] = await Promise.all([searchParams, apiGet<ScriptSummary[]>('/comment-scripts', session.token),
-    apiGet<ProfileDirectory>('/profile-groups', session.token)]);
+  const [query, scripts, targets] = await Promise.all([searchParams, apiGet<ScriptSummary[]>('/comment-scripts', session.token),
+    apiGet<PersonaSummary[]>('/personas', session.token)]);
   const canEdit = can.operate(session.role);
   const selected = query.new === '1' && canEdit ? undefined : scripts.find(script => script.id === query.id) ?? scripts[0];
   const script = selected ? await apiGet<Script>(`/comment-scripts/${selected.id}`, session.token) : undefined;
   const active = scripts.some(item => item.steps.some(step => ['QUEUED', 'SENDING'].includes(step.status)));
-  const targets = directory.targets.map(({ id, code, name, canComment }) => ({ id, code, name, canComment }));
+  const defaultTargetId = targets.find(target => target.code === query.profile && target.canComment)?.id;
   return <div className="workflow-stack">
     {active && <AutoRefresh seconds={4} />}
     <header className="workflow-toolbar"><h1>Kịch bản bình luận</h1>
@@ -27,8 +27,8 @@ export default async function CommentScriptsPage({ searchParams }: { searchParam
         </Link>)}
         {!scripts.length && <p className="muted">Chưa lưu kịch bản.</p>}
       </nav>
-      {canEdit && !script?.startedAt ? <ScriptEditor key={script ? `${script.id}:${script.version}` : 'new'} script={script}
-        groups={directory.groups} targets={targets} /> : script ? <ScriptRun script={script} canOperate={canEdit} /> : null}
+      {canEdit && !script?.startedAt ? <ScriptEditor key={script ? `${script.id}:${script.version}` : defaultTargetId ?? 'new'} script={script}
+        defaultTargetId={defaultTargetId} targets={targets} /> : script ? <ScriptRun script={script} canOperate={canEdit} /> : null}
     </div>
   </div>;
 }

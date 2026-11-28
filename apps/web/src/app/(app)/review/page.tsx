@@ -3,6 +3,7 @@ import { AutoRefresh } from '@/components/client';
 import { Badge, Empty, Head } from '@/components/ui';
 import { apiGet, can, getSession } from '@/lib/api';
 import { fmtTime } from '@/lib/format';
+import { needsPublishChoice } from '@seedingsys/contracts';
 import { ReviewCard, type ReviewItem } from './ReviewCard';
 import styles from './review.module.css';
 
@@ -56,7 +57,7 @@ export default async function ReviewPage({ searchParams }: { searchParams: Promi
             {rows.map(item => (
               <Link key={item.id} href={href(page, item.id)} scroll={false}
                 className={styles.item} aria-current={item.id === selected.id ? 'page' : undefined}>
-                <span>{item.revision.post.source.code} → {item.target.code} <Badge s={item.contentType} /></span>
+                <span>{item.revision.post.source.code} → {item.target.code} {!needsPublishChoice(item.contentType) && <Badge s={item.contentType} />}</span>
                 <strong>{item.revision.text || item.caption || 'Bài không có caption'}</strong>
                 <small>{fmtTime(item.createdAt)}</small>
               </Link>

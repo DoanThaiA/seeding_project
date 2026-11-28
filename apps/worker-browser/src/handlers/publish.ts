@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { isConnectorError, type CommitSignal, type DraftHandle, type PublishSession, type TargetRef } from '@seedingsys/connectors-core';
-import { ACTIVE, PRE_COMMIT, PUBLISH_QUEUE_BY_WORKFLOW, Q, type PublishSnapshot } from '@seedingsys/contracts';
+import { ACTIVE, PRE_COMMIT, PUBLISH_QUEUE_BY_WORKFLOW, Q, hasReviewPublishChoice, type PublishSnapshot } from '@seedingsys/contracts';
 import {
   accountResource,
   acquireLease,
@@ -135,12 +135,6 @@ export async function handlePublish(ctx: BrowserCtx, p: { publicationId: string;
       where: { connector: target.connector, active: true }, orderBy: { releasedAt: 'desc' }, select: { version: true },
     });
     if (active?.version !== version) throw new StopPreCommit('CANCELLED', 'CONNECTOR_RELEASE_CHANGED');
-    if (target.connector === 'fb-web') return;
-    const certified = await t.capabilityCheck.findFirst({
-      where: { targetId: target.id, connector: target.connector, connectorVersion: version, contentType: pub0.contentType, passed: true },
-      select: { id: true },
-    });
-    if (!certified) throw new StopPreCommit('CANCELLED', 'FORMAT_NOT_CERTIFIED');
   };
   // Shared with the stop operation's row lock, so a stop and the committing decision have a single order.
   const scheduleIsOpen = async (t: Tx) => {
@@ -258,16 +252,17 @@ export async function handlePublish(ctx: BrowserCtx, p: { publicationId: string;
     const revision = pub0.variant.revision;
     const raw = revision.raw as { sharedPermalink?: string; expectedPhotoCount?: number } | null;
     if (raw?.sharedPermalink) throw new StopPreCommit('CANCELLED', 'NATIVE_SHARE_REQUIRED');
-    if (revision.mediaStatus === 'FAILED' || revision.mediaStatus === 'PENDING' || (Array.isArray(revision.incomplete)
-      && revision.incomplete.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE'))) {
-      throw new StopPreCommit('FAILED_CONFIRMED', 'ALBUM_MANIFEST_INCOMPLETE', true);
-    }
     const snapshot = pub0.variant.snapshot as unknown as PublishSnapshot | null;
-    if (!snapshot || pub0.variant.snapshotHash !== pub0.snapshotHash || hashObject(snapshot) !== pub0.snapshotHash) {
+    if (!snapshot || snapshot.contentType !== pub0.contentType || pub0.variant.snapshotHash !== pub0.snapshotHash || hashObject(snapshot) !== pub0.snapshotHash) {
       throw new StopPreCommit('FAILED_CONFIRMED', 'SNAPSHOT_MISMATCH', true);
     }
+    const approvedSelection = hasReviewPublishChoice(snapshot, pub0.variant.reviewedBy);
+    if (!approvedSelection && (revision.mediaStatus === 'FAILED' || revision.mediaStatus === 'PENDING' || (Array.isArray(revision.incomplete)
+      && revision.incomplete.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE')))) {
+      throw new StopPreCommit('FAILED_CONFIRMED', 'ALBUM_MANIFEST_INCOMPLETE', true);
+    }
     if (snapshot.audience !== target.audience) throw new StopPreCommit('CANCELLED', 'AUDIENCE_CONFIG_CHANGED');
-    if (typeof raw?.expectedPhotoCount === 'number' && snapshot.media.filter(asset => asset.kind === 'image').length !== raw.expectedPhotoCount) {
+    if (!approvedSelection && typeof raw?.expectedPhotoCount === 'number' && snapshot.media.filter(asset => asset.kind === 'image').length !== raw.expectedPhotoCount) {
       throw new StopPreCommit('FAILED_CONFIRMED', 'ALBUM_MANIFEST_INCOMPLETE');
     }
     if (pub0.contentType === 'MULTI_PHOTO' && snapshot.media.length < 2) throw new StopPreCommit('FAILED_CONFIRMED', 'ALBUM_MANIFEST_INCOMPLETE', true);
@@ -341,7 +336,7 @@ export async function handlePublish(ctx: BrowserCtx, p: { publicationId: string;
     );
     const final = await applyVerifyResult(ctx, {
       publicationId: pub0.id, from: 'VERIFYING', attemptId, result, committedAt: committingAt,
-      fence: lease, commitSignal: signal, targetExternalId: target.externalId,
+      fence: lease, verificationAttempts: 1, commitSignal: signal, targetExternalId: target.externalId,
     });
     log.info({ final }, 'publish finished');
     return final;

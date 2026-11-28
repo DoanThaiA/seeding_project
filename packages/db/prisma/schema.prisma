@@ -238,6 +238,7 @@ model TargetBrowserRun {
   results Json @default("[]")
   message String?
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  commentGenerations CommentScriptGeneration[]
   @@index([targetId, kind, createdAt])
   @@map("target_browser_runs")
 }
@@ -299,6 +300,7 @@ model CommentScript {
   name        String
   postUrl     String    @map("post_url")
   resolvedUrl String?   @map("resolved_url")
+  postSnapshot Json?    @map("post_snapshot")
   version     Int       @default(1)
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   startedAt   DateTime? @map("started_at") @db.Timestamptz(3)
@@ -306,6 +308,20 @@ model CommentScript {
 
   @@index([createdAt])
   @@map("comment_scripts")
+}
+
+model CommentScriptGeneration {
+  id        String   @id @default(uuid()) @db.Uuid
+  previewId String   @map("preview_id") @db.Uuid
+  request   String
+  status    String   @default("QUEUED")
+  result    Json?
+  error     String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  preview TargetBrowserRun @relation(fields: [previewId], references: [id], onDelete: Cascade)
+
+  @@index([previewId, createdAt])
+  @@map("comment_script_generations")
 }
 
 enum CommentScriptStepStatus {

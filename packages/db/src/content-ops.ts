@@ -1,6 +1,6 @@
 import { randomInt } from 'node:crypto';
 import { Prisma, type ContentType } from '@prisma/client';
-import { Q as QN, REVIEW_REASONS, SUCCESS, UNRESOLVED, ACTIVE, workflowFor, type IncompleteFlag, type PublishSnapshot } from '@seedingsys/contracts';
+import { Q as QN, REVIEW_REASONS, SUCCESS, UNRESOLVED, ACTIVE, needsPublishChoice, type IncompleteFlag, type PublishSnapshot, type ReviewPublishChoice } from '@seedingsys/contracts';
 import { HOUR, contentKey, hashObject, isFacebookTimelineReader, removeAdvertisingLinks, revisionContentHash } from '@seedingsys/domain';
 import { audit } from './audit';
 import { activeKillSwitch } from './controls';
@@ -10,6 +10,9 @@ import { closeVariantReviewTasks, openOperatorTask } from './operator-tasks';
 import { moveVariant } from './transitions';
 
 type Q = Prisma.TransactionClient;
+
+/** Các dạng bài bắt buộc phải có media mới đăng được. */
+const MEDIA_CONTENT_TYPES: string[] = ['SINGLE_PHOTO', 'MULTI_PHOTO', 'NAMED_ALBUM', 'QUOTE_IMAGE', 'VIDEO', 'REEL'];
 
 export interface IngestPost {
   externalId: string;
@@ -37,7 +40,7 @@ const OPEN_VARIANT: Array<'FETCHING_MEDIA' | 'REWRITING' | 'VALIDATING' | 'READY
   'NEEDS_REVIEW',
 ];
 
-/** Prepare comment drafts for review. Preserve existing edits, omissions and receipts. */
+/** Prepare scanned comments and assign available Facebook profiles before sending. */
 export async function prepareCommentDrafts(t: Q, sourcePostId: string, targetIds: string[], now: Date) {
   if (!targetIds.length) return 0;
   const inserted = await t.$executeRaw`
@@ -60,18 +63,22 @@ export async function prepareCommentDrafts(t: Q, sourcePostId: string, targetIds
       select: { variant: { select: { snapshot: true } } },
     });
     const snapshot = publication?.variant.snapshot as PublishSnapshot | null | undefined;
-    const pool = (snapshot?.audience ?? target.audience) === 'PUBLIC' ? available.filter(account => account.id !== target.id) : [];
+    const pool = (snapshot?.audience ?? target.audience) === 'PUBLIC' ? available : available.filter(account => account.id === target.id);
+    if (!pool.length) continue;
+    const eligible = new Set(pool.map(account => account.id));
     const drafts = await t.publicationComment.findMany({
-      where: { destinationId: target.id, source: { sourcePostId } },
-      select: { id: true, status: true, authorTargetId: true },
+      where: { destinationId: target.id, source: { sourcePostId }, status: { in: ['DRAFT', 'FAILED'] } },
+      select: { id: true, status: true, authorTargetId: true, autoAuthor: true },
       orderBy: [{ source: { position: 'asc' } }, { sourceCommentId: 'asc' }],
     });
-    for (const [position, draft] of drafts.entries()) {
-      if (draft.status !== 'DRAFT' || draft.authorTargetId) continue;
-      const authorTargetId = position === 0 || !pool.length ? target.id : pool[randomInt(pool.length)].id;
+    let remaining = [...pool];
+    for (const draft of drafts) {
+      if (draft.authorTargetId && (!draft.autoAuthor || eligible.has(draft.authorTargetId))) continue;
+      if (!remaining.length) remaining = [...pool];
+      const [author] = remaining.splice(randomInt(remaining.length), 1);
       await t.publicationComment.updateMany({
-        where: { id: draft.id, status: 'DRAFT', authorTargetId: null },
-        data: { authorTargetId, autoAuthor: true, updatedAt: now },
+        where: { id: draft.id, status: draft.status, authorTargetId: draft.authorTargetId, autoAuthor: draft.autoAuthor },
+        data: { authorTargetId: author.id, autoAuthor: true, updatedAt: now },
       });
     }
   }
@@ -372,7 +379,7 @@ export class SnapshotBlockedError extends Error {}
 /** Build and freeze the publication snapshot (caption + ordered media manifest + audience). */
 export async function freezeSnapshot(
   t: Q,
-  args: { variantId: string; from: 'VALIDATING' | 'NEEDS_REVIEW'; now: Date; actor: string; caption?: string; reviewedBy?: string },
+  args: { variantId: string; from: 'VALIDATING' | 'NEEDS_REVIEW'; now: Date; actor: string; caption?: string; reviewedBy?: string; publishAs?: ReviewPublishChoice },
 ): Promise<boolean> {
   const variant = await t.contentVariant.findUnique({ where: { id: args.variantId }, select: { sourcePostId: true } });
   if (!variant) return false;
@@ -385,34 +392,76 @@ export async function freezeSnapshot(
     include: { target: true, revision: { include: { assets: { include: { asset: true }, orderBy: { position: 'asc' } } } } },
   });
   if (!v || v.status !== args.from || v.revisionId !== sourcePost.latest_revision_id || (v.expiresAt && v.expiresAt <= args.now)) return false;
-  if (!workflowFor(v.contentType)) throw new SnapshotBlockedError('Định dạng bài hiện chưa có luồng đăng.');
+  const { publishAs } = args;
+  if (publishAs && (args.from !== 'NEEDS_REVIEW' || !args.reviewedBy || !needsPublishChoice(v.contentType))) {
+    throw new SnapshotBlockedError('Lựa chọn này chỉ dùng khi duyệt bài cần chọn cách đăng.');
+  }
   const flags = v.revision.incomplete;
   const raw = v.revision.raw as { sharedPermalink?: string; expectedPhotoCount?: number } | null;
   if (raw?.sharedPermalink) throw new SnapshotBlockedError('Mở bài gốc để chia sẻ trực tiếp trên Facebook.');
-  if (v.revision.mediaStatus === 'FAILED' || v.revision.mediaStatus === 'PENDING' ||
-    (Array.isArray(flags) && flags.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE'))) {
-    throw new SnapshotBlockedError('Bài nguồn chưa tải đủ ảnh hoặc video. Quét lại nguồn để hoàn tất media trước khi duyệt.');
+  if (!publishAs && needsPublishChoice(v.contentType)) throw new SnapshotBlockedError('Chọn nội dung bản đăng trước khi duyệt.');
+  // Đang tải dở thì chờ; thiếu hẳn thì vẫn duyệt được, miễn còn ít nhất một ảnh hoặc video đã tải.
+  if (!publishAs && v.revision.mediaStatus === 'PENDING') {
+    throw new SnapshotBlockedError('Đang tải ảnh hoặc video của bài. Chờ tải xong rồi duyệt.');
+  }
+  let contentType = v.contentType;
+  let assets = v.revision.assets;
+  let missingMedia = 0;
+  let mediaIncomplete = !publishAs && (v.revision.mediaStatus === 'FAILED'
+    || (Array.isArray(flags) && flags.some(flag => flag === 'MEDIA_COUNT_UNKNOWN' || flag === 'MEDIA_UNAVAILABLE')));
+  if (!publishAs && MEDIA_CONTENT_TYPES.includes(contentType)) {
+    const kind = ['VIDEO', 'REEL'].includes(contentType) ? 'video' : 'image';
+    const usable = assets.filter(({ asset }) => asset.kind === kind && asset.status === 'STORED' && asset.objectKey && asset.checksum);
+    const expected = kind === 'image' && typeof raw?.expectedPhotoCount === 'number'
+      ? Math.max(raw.expectedPhotoCount, assets.length) : assets.length;
+    missingMedia = Math.max(0, expected - usable.length);
+    if (!usable.length) {
+      throw new SnapshotBlockedError(kind === 'video'
+        ? 'Chưa tải được video của bài. Tải lên thủ công hoặc quét lại nguồn trước khi duyệt.'
+        : 'Chưa tải được ảnh nào của bài. Tải lên thủ công hoặc quét lại nguồn trước khi duyệt.');
+    }
+    if (missingMedia > 0) {
+      mediaIncomplete = true;
+      assets = usable;
+      if (kind === 'image') contentType = usable.length === 1 ? 'SINGLE_PHOTO' : 'MULTI_PHOTO';
+    }
+  }
+  if (publishAs) {
+    if (publishAs === 'text') {
+      contentType = 'TEXT';
+      assets = [];
+    } else {
+      const kind = publishAs === 'photos' ? 'image' : 'video';
+      assets = assets.filter(({ asset }) => asset.kind === kind && asset.status === 'STORED' && asset.objectKey && asset.checksum);
+      if (publishAs === 'photos' && !assets.length) throw new SnapshotBlockedError('Chưa có ảnh đã lưu để duyệt.');
+      if (publishAs === 'video' && assets.length !== 1) throw new SnapshotBlockedError('Cần đúng một video đã lưu để duyệt.');
+      contentType = kind === 'video' ? 'VIDEO' : assets.length === 1 ? 'SINGLE_PHOTO' : 'MULTI_PHOTO';
+    }
   }
   const inputCaption = args.caption ?? v.caption ?? (args.from === 'NEEDS_REVIEW' ? v.revision.text : '');
   const caption = removeAdvertisingLinks(inputCaption).trim();
-  if (!caption && (v.contentType !== 'REEL' || inputCaption.trim())) throw new SnapshotBlockedError('Nhập caption hợp lệ trước khi duyệt.');
-  const media = v.revision.assets.map((pa) => {
+  if (!caption && (contentType !== 'REEL' || inputCaption.trim())) throw new SnapshotBlockedError('Nhập caption hợp lệ trước khi duyệt.');
+  const media = assets.map((pa, index) => {
     if (pa.asset.status !== 'STORED' || !pa.asset.checksum || !pa.asset.objectKey) throw new SnapshotBlockedError('Bài chưa lưu đủ ảnh hoặc video.');
-    return { position: pa.position, assetId: pa.assetId, checksum: pa.asset.checksum, objectKey: pa.asset.objectKey, mime: pa.asset.mime ?? 'application/octet-stream', kind: pa.asset.kind };
+    return { position: publishAs ? index : pa.position, assetId: pa.assetId, checksum: pa.asset.checksum, objectKey: pa.asset.objectKey, mime: pa.asset.mime ?? 'application/octet-stream', kind: pa.asset.kind };
   });
-  if (typeof raw?.expectedPhotoCount === 'number' && media.filter(asset => asset.kind === 'image').length !== raw.expectedPhotoCount) {
+  // Thiếu ảnh đã được ghi lại ở trên, nên chỉ chặn khi bản chốt tự mâu thuẫn.
+  if (!publishAs && !mediaIncomplete && typeof raw?.expectedPhotoCount === 'number'
+    && media.filter(asset => asset.kind === 'image').length !== raw.expectedPhotoCount) {
     throw new SnapshotBlockedError('Số ảnh đã lưu chưa khớp số ảnh xác nhận trong bài gốc.');
   }
-  if (['VIDEO', 'REEL'].includes(v.contentType) && (media.length !== 1 || media[0].kind !== 'video')) {
+  if (['VIDEO', 'REEL'].includes(contentType) && (media.length !== 1 || media[0].kind !== 'video')) {
     throw new SnapshotBlockedError('Cần đủ một video đã lưu trước khi duyệt.');
   }
   const snapshot: PublishSnapshot = {
     variantId: v.id,
     targetId: v.targetId,
-    contentType: v.contentType,
+    contentType,
     caption,
-    albumTitle: v.revision.albumTitle,
+    albumTitle: publishAs ? null : v.revision.albumTitle,
     audience: v.target.audience,
+    ...(publishAs && { publishAs }),
+    ...(mediaIncomplete && { mediaIncomplete: true, ...(missingMedia > 0 && { missingMedia }) }),
     media,
   };
   return moveVariant(t, {
@@ -421,8 +470,10 @@ export async function freezeSnapshot(
     to: 'READY',
     actor: args.actor,
     now: args.now,
+    ...(publishAs ? { reason: 'REVIEW_PUBLISH_CHOICE' } : mediaIncomplete ? { reason: 'PARTIAL_MEDIA' } : {}),
     data: {
       caption,
+      contentType,
       snapshot: snapshot as unknown as Prisma.InputJsonValue,
       snapshotHash: hashObject(snapshot),
       readyAt: args.now,

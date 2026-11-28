@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { ActionButton, bff, useSubmit } from '@/components/client';
 import { Badge } from '@/components/ui';
 import { fmtTime, reasonText } from '@/lib/format';
+import { needsPublishChoice, type ReviewPublishChoice } from '@seedingsys/contracts';
 import { ReviewMediaUpload } from './ReviewMediaUpload';
 
 export interface ReviewItem {
@@ -49,21 +50,34 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
   const [caption, setCaption] = useState(v.caption ?? v.revision.text);
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState('');
+  const [selection, setSelection] = useState<ReviewPublishChoice>();
   const s = useSubmit();
   const edited = caption.trim() !== (v.caption ?? v.revision.text).trim();
   const missingMedia = v.revision.incomplete.some(flag => flag === 'MEDIA_UNAVAILABLE' || flag === 'MEDIA_COUNT_UNKNOWN');
-  const mediaOk = !missingMedia && ['READY', 'NOT_REQUIRED'].includes(v.revision.mediaStatus)
-    && (!['VIDEO', 'REEL'].includes(v.contentType) || (v.revision.assets.length === 1 && v.revision.assets[0].asset.kind === 'video'))
-    && v.revision.assets.every((a) => a.asset.status === 'STORED');
   const validCaption = v.contentType === 'REEL' || !!caption.trim();
   const share = v.revision.sharedPermalink;
+  const chooseFormat = !share && needsPublishChoice(v.contentType);
+  const stored = v.revision.assets.filter(({ asset }) => asset.status === 'STORED');
+  const photos = stored.filter(({ asset }) => asset.kind === 'image').length;
+  const videos = stored.filter(({ asset }) => asset.kind === 'video').length;
+  const needsVideo = ['VIDEO', 'REEL'].includes(v.contentType);
+  const needsPhoto = ['SINGLE_PHOTO', 'MULTI_PHOTO', 'NAMED_ALBUM', 'QUOTE_IMAGE'].includes(v.contentType);
+  // Thiếu ảnh vẫn duyệt được, miễn còn ít nhất một ảnh đã tải; video thì phải có đúng video đó.
+  const mediaOk = v.revision.mediaStatus !== 'PENDING' && (needsVideo ? videos === 1 : needsPhoto ? photos > 0 : true);
+  const partialMedia = mediaOk && !share && (missingMedia || v.revision.mediaStatus === 'FAILED'
+    || stored.length < v.revision.assets.length);
+  const choices: { value: ReviewPublishChoice; label: string }[] = [];
+  if (photos > 0) choices.push({ value: 'photos', label: `${photos} ảnh đã tải` });
+  if (videos === 1) choices.push({ value: 'video', label: 'Video đã tải' });
+  choices.push({ value: 'text', label: 'Chỉ đăng chữ' });
+  const publishAs = chooseFormat ? (choices.find(choice => choice.value === selection) ?? choices[0]).value : undefined;
   const failed = v.checks.filter((c) => !c.passed && c.kind !== 'not_verbatim');
 
   return (
     <section className="card">
       <div className="head" style={{ marginBottom: 10 }}>
         <div>
-          <strong>{v.revision.post.source.code} → {v.target.code}</strong> <Badge s={v.contentType} />
+          <strong>{v.revision.post.source.code} → {v.target.code}</strong> {!needsPublishChoice(v.contentType) && <Badge s={v.contentType} />}
           {v.revision.post.isShared && <> <Badge s="DEFERRED" text="Bài chia sẻ" /></>}
           <div className="muted">Vào hàng chờ {fmtTime(v.createdAt)}{v.expiresAt ? ` · hết hiệu lực ${fmtTime(v.expiresAt)}` : ''}</div>
         </div>
@@ -71,7 +85,8 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
       </div>
 
       <div className="chips">
-        {[...new Set([...(v.reviewReasons ?? []), ...v.revision.incomplete])].filter(r => r !== 'NEAR_VERBATIM_COPY').map((r) => (
+        {[...new Set([...(v.reviewReasons ?? []), ...v.revision.incomplete])]
+          .filter(r => !['NEAR_VERBATIM_COPY', 'UNSUPPORTED_FORMAT', 'NAMED_ALBUM_NOT_CERTIFIED'].includes(r)).map((r) => (
           <span key={r} className="badge warn">{reasonText(r)}</span>
         ))}
       </div>
@@ -83,7 +98,11 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
           {v.revision.assets.length > 0 && (
             <div className="media">{v.revision.assets.map((a) => <Thumb key={a.asset.id} a={a} />)}</div>
           )}
-          {!mediaOk && <p className={share ? 'muted' : 'err'}>{share ? 'Bản lưu media chưa tải đủ.' : 'Chưa có đủ media đã tải để duyệt.'}</p>}
+          {!mediaOk && !chooseFormat && <p className={share ? 'muted' : 'err'}>{share ? 'Bản lưu media chưa tải đủ.'
+            : v.revision.mediaStatus === 'PENDING' ? 'Đang tải ảnh hoặc video, chờ tải xong rồi duyệt.'
+            : needsVideo ? 'Chưa tải được video của bài. Tải lên thủ công rồi duyệt.' : 'Chưa tải được ảnh nào của bài. Tải lên thủ công rồi duyệt.'}</p>}
+          {partialMedia && !chooseFormat && <p className="muted"><span className="badge warn">Thiếu ảnh</span>{' '}
+            Bài gốc chưa tải đủ media. Vẫn duyệt và đăng được với {needsVideo ? 'video' : `${photos} ảnh`} đã tải, bản đăng sẽ ghi chú thiếu ảnh.</p>}
           {canAct && !share && (missingMedia || v.revision.mediaStatus === 'FAILED') && ['fb-public', 'fb-session'].includes(v.revision.post.source.connector)
             && ['VIDEO', 'REEL', 'SINGLE_PHOTO', 'MULTI_PHOTO'].includes(v.contentType)
             && <ReviewMediaUpload id={v.id} video={v.contentType === 'VIDEO' || v.contentType === 'REEL'} />}
@@ -91,6 +110,12 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
         <div>
           <label htmlFor={`cap-${v.id}`}>{share ? 'Caption để dùng khi chia sẻ' : `Caption đăng lên ${v.target.code}`} {edited && <span className="badge info">đã sửa</span>}</label>
           <textarea id={`cap-${v.id}`} value={caption} onChange={(e) => setCaption(e.target.value)} disabled={!canAct} maxLength={5000} placeholder={share ? 'Thêm lời chia sẻ nếu cần' : 'Nhập caption hoặc chọn Viết lại bằng AI'} />
+          {canAct && chooseFormat && <label htmlFor={`publish-as-${v.id}`}>Nội dung bản đăng
+            <select id={`publish-as-${v.id}`} value={publishAs} disabled={s.pending}
+              onChange={e => setSelection(choices.find(choice => choice.value === e.target.value)?.value)}>
+              {choices.map(choice => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
+            </select>
+          </label>}
           {!share && failed.length > 0 && (
             <div className="chips">
               {failed.map((c) => (
@@ -125,10 +150,10 @@ export function ReviewCard({ v, canAct }: { v: ReviewItem; canAct: boolean }) {
             <div className="actions">
               {!share && <button
                 className="primary"
-                disabled={s.pending || !mediaOk || v.contentType === 'UNSUPPORTED' || !validCaption}
-                onClick={() => s.run(() => bff('POST', `review/${v.id}/approve`, { caption: caption.trim() }), 'Đã duyệt')}
+                disabled={s.pending || (!chooseFormat && !mediaOk) || !validCaption}
+                onClick={() => s.run(() => bff('POST', `review/${v.id}/approve`, { caption: caption.trim(), publishAs }), 'Đã duyệt')}
               >
-                {edited ? 'Duyệt với caption đã sửa' : 'Duyệt'}
+                {chooseFormat ? 'Duyệt bản đã chọn' : edited ? 'Duyệt với caption đã sửa' : 'Duyệt'}
               </button>}
               <button disabled={s.pending || !edited || (!caption.trim() && (!validCaption || !!share))}
                 onClick={() => s.run(() => bff('PATCH', `review/${v.id}/caption`, { caption }), 'Đã lưu caption')}>Lưu caption</button>

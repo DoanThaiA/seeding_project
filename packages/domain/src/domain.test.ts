@@ -2,7 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { POST_COMMIT_ACTIVE, PRE_COMMIT, PUBLICATION_STATUSES, SUCCESS, canTransition, TRANSITION_TABLES } from '@seedingsys/contracts';
 import { checkFactsPreserved, checkNegationKept, extractNumericTokens, runCaptionChecks } from './caption-checks';
 import { captionFingerprint, hashObject } from './hash';
+import { facebookScriptComment, facebookScriptPost } from './facebook-source';
 import { isPastLaunchWindow, topOfHour, vnDay } from './time';
+
+describe('Facebook script links', () => {
+  it('keeps both parts of a numeric post ID and recognises replies on the same post', () => {
+    const link = 'https://www.facebook.com/example/posts/12345:67890';
+    expect(facebookScriptPost(link + '?mibextid=abc')).toMatchObject({ id: '12345:67890', url: new URL(link) });
+    expect(facebookScriptPost(link.replace(':67890', '%3A67890'))?.id).toBe('12345:67890');
+    expect(facebookScriptComment(link + '?comment_id=11&reply_comment_id=22')).toMatchObject({ postId: '12345:67890', root: '11', reply: '22' });
+    expect(facebookScriptPost(link + '?comment_id=11')).toBeNull();
+    expect(facebookScriptPost(link.replace('67890', 'other'))).toBeNull();
+  });
+});
 
 describe('publication state machine', () => {
   it('never allows a retry path from a post-commit state back to a pre-commit state', () => {

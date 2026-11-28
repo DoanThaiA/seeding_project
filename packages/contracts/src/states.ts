@@ -28,8 +28,9 @@ export const PRE_COMMIT: readonly PublicationStatus[] = ['QUEUED', 'PREPARING', 
 export const POST_COMMIT_ACTIVE: readonly PublicationStatus[] = ['COMMITTING', 'PLATFORM_PROCESSING', 'VERIFYING'];
 /** States where a browser holds the account. */
 export const ACTIVE: readonly PublicationStatus[] = ['PREPARING', 'UPLOADING_DRAFT', 'READY_TO_SUBMIT', ...POST_COMMIT_ACTIVE];
-/** Unresolved: the account must not get new publications until these are settled. */
+/** The publication's result is uncertain and the same content must stay protected from reposts. */
 export const UNRESOLVED: readonly PublicationStatus[] = [...POST_COMMIT_ACTIVE, 'UNKNOWN', 'RECONCILING', 'NEEDS_OPERATOR'];
+export const RECONCILE_EXHAUSTED = 'RECONCILE_EXHAUSTED';
 /** Counted as success. UNKNOWN is never success. */
 export const SUCCESS: readonly PublicationStatus[] = ['PUBLISHED_VERIFIED', 'OPERATOR_CONFIRMED'];
 /** Content may be picked again for the same target (no side effect happened). */

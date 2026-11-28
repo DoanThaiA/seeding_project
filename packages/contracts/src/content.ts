@@ -10,10 +10,12 @@ export const CONTENT_TYPES = [
 ] as const;
 export type ContentType = (typeof CONTENT_TYPES)[number];
 export const FB_WEB_PUBLISH_FORMATS: readonly ContentType[] = ['TEXT', 'QUOTE_IMAGE', 'SINGLE_PHOTO', 'MULTI_PHOTO', 'VIDEO', 'REEL'];
+export const FAKE_PUBLISH_FORMATS: readonly ContentType[] = ['TEXT', 'QUOTE_IMAGE', 'SINGLE_PHOTO', 'MULTI_PHOTO', 'VIDEO'];
 export const COMMENT_READERS: readonly string[] = ['fb-public', 'fb-session', 'fb-graph'];
 export const COMMENT_STALL_MS = 5 * 60_000;
 /** How long a queued comment may wait (behind its parent and other comments) before the send has to be repeated. */
 export const COMMENT_QUEUE_MS = 20 * 60_000;
+export const COMMENT_SENDABLE_STATUSES: readonly string[] = ['DRAFT', 'APPROVED', 'FAILED'];
 export const MAX_POLL_POSTS = 100;
 /** Retries, 30 s apart, while a queued comment waits for its parent or a busy profile: under COMMENT_QUEUE_MS. */
 export const COMMENT_PUBLISH_RETRIES = 30;
@@ -50,6 +52,16 @@ export const INCOMPLETE_FLAGS = [
 export type IncompleteFlag = (typeof INCOMPLETE_FLAGS)[number];
 
 /** Frozen publication snapshot. Its hash is checked again right before publishing. */
+export const REVIEW_PUBLISH_CHOICES = ['text', 'photos', 'video'] as const;
+export type ReviewPublishChoice = (typeof REVIEW_PUBLISH_CHOICES)[number];
+
+export const needsPublishChoice = (contentType: string) => contentType === 'UNSUPPORTED' || contentType === 'NAMED_ALBUM';
+
+export function hasReviewPublishChoice(snapshot: unknown, reviewer: string | null) {
+  const choice = (snapshot as { publishAs?: unknown } | null)?.publishAs;
+  return !!reviewer && REVIEW_PUBLISH_CHOICES.some(value => value === choice);
+}
+
 export interface PublishSnapshot {
   variantId: string;
   targetId: string;
@@ -57,6 +69,11 @@ export interface PublishSnapshot {
   caption: string;
   albumTitle?: string | null;
   audience: string;
+  publishAs?: ReviewPublishChoice;
+  /** Bài gốc không tải đủ ảnh/video nhưng vẫn được duyệt đăng với phần đã tải. */
+  mediaIncomplete?: boolean;
+  /** Số ảnh/video thiếu, khi đếm được. */
+  missingMedia?: number;
   media: Array<{ position: number; assetId: string; checksum: string; objectKey: string; mime: string; kind: string }>;
 }
 

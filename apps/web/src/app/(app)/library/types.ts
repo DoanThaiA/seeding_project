@@ -35,6 +35,7 @@ export interface Destination {
   target: Profile & { audience: string };
   publication: { id: string; status: PublicationStatus; permalink: string | null; directLink: boolean; verifiedAt: string | null; lastReason: string | null } | null;
   variant: { id: string; caption: string | null; contentType: string; status: string; expiresAt: string | null; reviewReasons: string[];
+    mediaIncomplete?: boolean; missingMedia?: number;
     audience: string; snapshotHash: string | null; revision: Revision } | null;
 }
 

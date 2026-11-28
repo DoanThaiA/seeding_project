@@ -1,6 +1,6 @@
 'use client';
 
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { useEffect, useState, useTransition, type ReactNode } from 'react';
 
@@ -45,14 +45,66 @@ export function AutoRefresh({ seconds = 15 }: { seconds?: number }) {
   return null;
 }
 
+/** One entry of the sidebar: a path, optionally with the query that identifies it. */
+export interface NavItem {
+  href: string;
+  label: string;
+  count?: number;
+  warn?: boolean;
+}
+
+/** True when `href` (path plus any query it carries) describes the page being shown. */
+function navActive(href: string, path: string, search: URLSearchParams): boolean {
+  const [base, query] = href.split('?');
+  const target = base || '/';
+  const samePath = target === '/' ? path === '/' : path === target || path.startsWith(target + '/');
+  if (!samePath) return false;
+  for (const [key, value] of new URLSearchParams(query ?? '')) if (search.get(key) !== value) return false;
+  return true;
+}
+
 export function NavLink({ href, children, count, warn }: { href: string; children: ReactNode; count?: number; warn?: boolean }) {
   const path = usePathname();
-  const active = href === '/' ? path === '/' : path.startsWith(href);
+  const search = useSearchParams();
+  const active = navActive(href, path, search);
   return (
     <Link href={href} aria-current={active ? 'page' : undefined}>
       <span>{children}</span>
       {count ? <span className={`count ${warn ? 'warn' : ''}`}>{count}</span> : null}
     </Link>
+  );
+}
+
+/** Collapsible sidebar group: opens itself whenever one of its entries is the current page. */
+export function NavGroup({ label, items }: { label: string; items: NavItem[] }) {
+  const path = usePathname();
+  const search = useSearchParams();
+  const holdsCurrent = items.some(item => navActive(item.href, path, search));
+  const [open, setOpen] = useState(holdsCurrent);
+  const [known, setKnown] = useState(holdsCurrent);
+  if (known !== holdsCurrent) {
+    setKnown(holdsCurrent);
+    if (holdsCurrent) setOpen(true);
+  }
+  const pending = items.reduce((sum, item) => sum + (item.count ?? 0), 0);
+  return (
+    <details className="nav-group" open={open}>
+      <summary
+        aria-current={holdsCurrent ? 'true' : undefined}
+        onClick={event => {
+          event.preventDefault();
+          setOpen(value => !value);
+        }}
+      >
+        <span>{label}</span>
+        {!open && pending ? <span className="count warn">{pending}</span> : null}
+      </summary>
+      {items.map(item => (
+        <NavLink key={item.href} href={item.href} count={item.count} warn={item.warn}>
+          {item.label}
+        </NavLink>
+      ))}
+    </details>
   );
 }
 

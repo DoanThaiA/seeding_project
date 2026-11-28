@@ -1,5 +1,5 @@
 import { Prisma, type ContentType, type SlotStatus } from '@prisma/client';
-import { ACTIVE, COMMENT_READERS, FB_WEB_PUBLISH_FORMATS, PUBLISH_QUEUE_BY_WORKFLOW, UNRESOLVED, workflowFor } from '@seedingsys/contracts';
+import { ACTIVE, COMMENT_READERS, FAKE_PUBLISH_FORMATS, FB_WEB_PUBLISH_FORMATS, PUBLISH_QUEUE_BY_WORKFLOW, RECONCILE_EXHAUSTED, REVIEW_PUBLISH_CHOICES, workflowFor } from '@seedingsys/contracts';
 import { MIN, isPastLaunchWindow, sourceScheduleOpen, type Clock } from '@seedingsys/domain';
 import { accountResource, activeLease } from './lease';
 import { activeKillSwitch } from './controls';
@@ -68,6 +68,15 @@ const reservedForProfileSync = Prisma.sql`EXISTS (
   WHERE i.source_post_id=sp.id AND ps.mapping_id=m.id AND ps.publish
     AND ps.phase IN ('PREPARING','PREPARED') AND i.publish_status='PENDING')`;
 
+const supportedFormat = Prisma.sql`(CASE ta.connector
+  WHEN 'fb-web' THEN v.content_type::text = ANY(${[...FB_WEB_PUBLISH_FORMATS]}::text[])
+  WHEN 'fake' THEN v.content_type::text = ANY(${[...FAKE_PUBLISH_FORMATS]}::text[])
+  ELSE false END)`;
+
+const sourceMediaBlocked = Prisma.sql`((r.media_status IN ('FAILED','PENDING')
+  OR r.incomplete ?| ARRAY['MEDIA_COUNT_UNKNOWN','MEDIA_UNAVAILABLE'])
+  AND NOT (v.reviewed_by IS NOT NULL AND coalesce(v.snapshot->>'publishAs','') = ANY(${[...REVIEW_PUBLISH_CHOICES]}::text[])))`;
+
 function reservedForSchedule(ownSlotId?: string) {
   return Prisma.sql`EXISTS (
     SELECT 1 FROM publication_slots reserved
@@ -90,17 +99,11 @@ function backlogBlocker(now: Date, ownSlotId?: string) {
     WHEN ${reservedForSchedule(ownSlotId)} THEN 'SCHEDULE_RESERVED'
     WHEN ${reservedForProfileSync} AND ${ownSlotId !== undefined} THEN 'PROFILE_SYNC_RESERVED'
     WHEN r.raw->>'sharedPermalink' IS NOT NULL OR latest.raw->>'sharedPermalink' IS NOT NULL THEN 'NATIVE_SHARE_REQUIRED'
-    WHEN r.media_status IN ('FAILED','PENDING')
-      OR r.incomplete ?| ARRAY['MEDIA_COUNT_UNKNOWN','MEDIA_UNAVAILABLE']
-      THEN 'MEDIA_INCOMPLETE'
+    WHEN ${sourceMediaBlocked} THEN 'MEDIA_INCOMPLETE'
     WHEN p.id IS NOT NULL AND p.status NOT IN ('FAILED_CONFIRMED','CANCELLED') THEN 'ITEM_UNAVAILABLE'
     WHEN p.id IS NOT NULL AND p.publish_tries >= m.max_publish_tries THEN 'RETRY_LIMIT_REACHED'
     WHEN rel.version IS NULL THEN 'NO_CONNECTOR_RELEASE'
-    WHEN ta.connector = 'fb-web' AND v.content_type::text <> ALL(${[...FB_WEB_PUBLISH_FORMATS]}::text[]) THEN 'FORMAT_UNSUPPORTED'
-    WHEN ta.connector <> 'fb-web' AND NOT EXISTS (
-      SELECT 1 FROM capability_checks cc WHERE cc.target_id = v.target_id AND cc.content_type = v.content_type
-        AND cc.connector = ta.connector AND cc.connector_version = rel.version AND cc.passed
-    ) THEN 'FORMAT_NOT_CERTIFIED'
+    WHEN NOT ${supportedFormat} THEN 'FORMAT_UNSUPPORTED'
     WHEN EXISTS (SELECT 1 FROM controls c WHERE c.paused AND (c.scope = 'SOURCE' AND c.scope_key = sp.source_id::text
       OR c.scope = 'FORMAT' AND c.scope_key = v.content_type::text)) THEN 'KILL_SWITCH_CONTENT'
     ELSE NULL END`;
@@ -123,7 +126,7 @@ export function listBacklog(db: Db, now: Date) {
  * Oldest READY content for the target that is still valid, not yet published to it (or whose
  * earlier attempt failed without side effects), supported by the active connector and not paused.
  */
-async function selectCandidate(t: Tx, targetId: string, connector: string, version: string, now: Date,
+async function selectCandidate(t: Tx, targetId: string, now: Date,
   { variantId, sourceIds, restrictedSources, requestedVariants, scheduleSlot }: {
     variantId?: string; sourceIds?: string[]; restrictedSources: string[]; requestedVariants: string[]; scheduleSlot?: string;
   }): Promise<Candidate | null> {
@@ -149,11 +152,10 @@ async function selectCandidate(t: Tx, targetId: string, connector: string, versi
       AND v.snapshot->>'audience' = ta.audience
       AND r.raw->>'sharedPermalink' IS NULL
       AND latest.raw->>'sharedPermalink' IS NULL
-      AND r.media_status NOT IN ('FAILED','PENDING')
+      AND NOT ${sourceMediaBlocked}
       AND (${variantId ?? null}::uuid IS NULL OR v.id = ${variantId ?? null}::uuid)
       ${variantId && !scheduleSlot ? Prisma.empty : Prisma.sql`AND NOT ${reservedForProfileSync}`}
       AND NOT ${reservedForSchedule(scheduleSlot)}
-      AND NOT (r.incomplete ?| ARRAY['MEDIA_COUNT_UNKNOWN','MEDIA_UNAVAILABLE'])
       AND (v.expires_at IS NULL OR v.expires_at > ${now})
       AND (p.id IS NULL OR (p.status IN ('FAILED_CONFIRMED','CANCELLED') AND p.publish_tries < m.max_publish_tries))
       -- An explicit source reset lets the new collection publish content from retired collections.
@@ -167,11 +169,7 @@ async function selectCandidate(t: Tx, targetId: string, connector: string, versi
           AND dp.status NOT IN ('FAILED_CONFIRMED','CANCELLED')
           AND (sp.reset_generation = 0 OR prior_post.reset_generation >= prior_source.reset_generation)
           AND r.content_key <> '' AND dr.content_key = r.content_key)
-      AND ((${connector} = 'fb-web' AND v.content_type::text = ANY(${[...FB_WEB_PUBLISH_FORMATS]}::text[]))
-        OR (${connector} <> 'fb-web' AND EXISTS (
-        SELECT 1 FROM capability_checks cc
-        WHERE cc.target_id = v.target_id AND cc.content_type = v.content_type
-          AND cc.connector = ${connector} AND cc.connector_version = ${version} AND cc.passed)))
+      AND ${supportedFormat}
       AND NOT EXISTS (
         SELECT 1 FROM controls c WHERE c.paused AND (
           (c.scope = 'FORMAT' AND c.scope_key = v.content_type::text) OR
@@ -306,8 +304,11 @@ async function dispatch(t: Tx, ctx: DispatchContext, slotId: string, variantId?:
   const release = await t.connectorRelease.findFirst({ where: { connector: target.connector, active: true }, orderBy: { releasedAt: 'desc' } });
   if (!release) return wait('NO_CONNECTOR_RELEASE');
 
-  // One thing at a time per account, and nothing new while a previous result is unresolved.
-  const blocking = await t.publication.findFirst({ where: { targetId: target.id, status: { in: ['QUEUED', ...ACTIVE, ...UNRESOLVED] } }, select: { status: true } });
+  // An exhausted check stops holding the account while its own content stays protected from reposts.
+  const blocking = await t.publication.findFirst({ where: { targetId: target.id, OR: [
+    { status: { in: ['QUEUED', ...ACTIVE, 'UNKNOWN', 'RECONCILING'] } },
+    { status: 'NEEDS_OPERATOR', OR: [{ lastReason: null }, { lastReason: { not: RECONCILE_EXHAUSTED } }] },
+  ] }, select: { status: true } });
   if (blocking) return wait(blocking.status === 'QUEUED' || ACTIVE.includes(blocking.status) ? 'ACCOUNT_BUSY' : 'UNRESOLVED_PUBLICATION');
   if (await activeLease(t, accountResource(target.id), now)) return wait('ACCOUNT_BUSY');
   const readySourceIds: string[] = [];
@@ -340,7 +341,7 @@ async function dispatch(t: Tx, ctx: DispatchContext, slotId: string, variantId?:
 
   const restricted = explicit ? [] : eligibleSources.filter(source => source.runNowUntil && source.runNowUntil > now && source.runNowVariantIds.length);
   const selected = variantId ?? scheduledVariant;
-  const cand = await selectCandidate(t, target.id, target.connector, release.version, now, { variantId: selected, sourceIds,
+  const cand = await selectCandidate(t, target.id, now, { variantId: selected, sourceIds,
     restrictedSources: restricted.map(source => source.id), requestedVariants: restricted.flatMap(source => source.runNowVariantIds),
     scheduleSlot: explicit ? slot.id : undefined });
   if (!cand && selected) {

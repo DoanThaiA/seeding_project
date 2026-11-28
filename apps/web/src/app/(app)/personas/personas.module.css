@@ -1,0 +1,5 @@
+.people { max-height: min(70vh, 640px); overflow: auto; }
+.post { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.post p { margin: 0; }
+.caption { white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 740px) { .people { max-height: 220px; } }

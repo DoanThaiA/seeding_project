@@ -1,6 +1,6 @@
 # Worker image with Chromium for the fb-web connector (worker-browser). Build context = repo root.
 # NOT TESTED in this repository's CI (no Docker on the dev machine): build it once on the worker host
-# and run `pnpm fb:login` / `pnpm fb:capability` from inside it before relying on it.
+# and use `pnpm fb:login` to set up the account session.
 FROM node:20.19-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates fonts-noto fonts-noto-color-emoji && rm -rf /var/lib/apt/lists/*
 RUN corepack enable && corepack prepare pnpm@9.15.9 --activate

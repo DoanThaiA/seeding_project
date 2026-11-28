@@ -1,5 +1,5 @@
-import type { PublishSession } from '@seedingsys/connectors-core';
-import { PROFILE_SCAN_TIMEOUT_MS, ProfileDetailsSnapshot, Q, type JobPayload } from '@seedingsys/contracts';
+import { isConnectorError, type PublishSession } from '@seedingsys/connectors-core';
+import { PROFILE_SCAN_TIMEOUT_MS, ProfileDetailsSnapshot, Q, type JobPayload, type SyncedProfileDetails } from '@seedingsys/contracts';
 import { accountResource, acquireLease, activeKillSwitch, assertLeaseHeld, audit, releaseLease, tx, type Prisma, type Tx } from '@seedingsys/db';
 import { RetryLaterError } from '@seedingsys/domain';
 import type { BrowserCtx } from '../ctx';
@@ -34,30 +34,48 @@ export async function handleProfileDetails(ctx: BrowserCtx, key: JobPayload<type
   const scan = await ctx.db.profileDetailsScan.findFirst({ where: { ...key, status: 'QUEUED' }, include });
   if (!scan) return;
   const { source, target } = scan.mapping;
-  const withSession = source.connector === 'fb-session';
-  const mapping = matchingMapping(scan, withSession);
   let lease: Awaited<ReturnType<typeof acquireLease>> = null;
   try {
     if (+scan.updatedAt + PROFILE_SCAN_TIMEOUT_MS <= +ctx.clock.now()) throw new Error('Hết thời gian chờ quét.');
-    if (await activeKillSwitch(ctx.db, { ...scope(scan), connector: source.connector })
-      || await activeKillSwitch(ctx.db, { ...scope(scan), connector: target.connector })) throw new Error('Luồng hồ sơ đang tạm dừng.');
-    const reader = ctx.registry.reader(source.connector);
-    if (!reader.readProfileDetails) throw new Error('Kết nối nguồn chưa hỗ trợ quét thông tin hồ sơ.');
+    if (await activeKillSwitch(ctx.db, { sourceId: source.id, connector: source.connector })) throw new Error('Nguồn hồ sơ đang tạm dừng.');
+    const profile = target.profile;
+    let withSession = source.connector === 'fb-session' && target.enabled && !!profile
+      && !await activeKillSwitch(ctx.db, { ...scope(scan), connector: target.connector });
     if (withSession) lease = await claimAccount(ctx, scan, 'profile-details');
-    const started = await ctx.db.profileDetailsScan.updateMany({ where: { ...key, status: 'QUEUED', mapping },
+    const started = await ctx.db.profileDetailsScan.updateMany({ where: { ...key, status: 'QUEUED', mapping: matchingMapping(scan, withSession) },
       data: { status: 'READING', updatedAt: ctx.clock.now() } });
     if (!started.count) throw new Error('Lượt quét hoặc cấu hình hồ sơ đã thay đổi.');
-    const data = await reader.readProfileDetails({ id: source.id, code: source.code, externalRef: scan.sourceRef,
-      readAccount: withSession && target.profile ? { code: target.code, externalId: target.externalId, profileDir: target.profile.profileDir } : undefined });
-    const now = ctx.clock.now();
-    const snapshot = ProfileDetailsSnapshot.parse({ ...data, capturedAt: now.toISOString() });
+    const read = async () => {
+      const connector = withSession ? source.connector : 'fb-public';
+      if (await activeKillSwitch(ctx.db, { sourceId: source.id, connector })) throw new Error('Kết nối quét nguồn đang tạm dừng.');
+      const reader = ctx.registry.reader(connector);
+      if (!reader.readProfileDetails) throw new Error('Kết nối nguồn chưa hỗ trợ quét thông tin hồ sơ.');
+      return reader.readProfileDetails({ id: source.id, code: source.code, externalRef: scan.sourceRef,
+        readAccount: withSession && profile ? { code: target.code, externalId: target.externalId, profileDir: profile.profileDir } : undefined });
+    };
+    let data;
+    try {
+      data = await read();
+    } catch (error) {
+      if (!withSession || !isConnectorError(error) || !['CHECKPOINT', 'SESSION_LOGGED_OUT', 'WRONG_IDENTITY'].includes(error.kind)) throw error;
+      withSession = false;
+      try { data = await read(); }
+      catch { throw new Error(`${detailOf(error)} Trang A cũng chưa đọc được ở chế độ công khai.`); }
+    }
+    const snapshot = ProfileDetailsSnapshot.parse({ ...data, capturedAt: ctx.clock.now().toISOString() });
     await tx(ctx.db, async t => {
+      await t.$queryRaw`SELECT id FROM target_accounts WHERE id=${target.id}::uuid FOR UPDATE`;
+      const now = ctx.clock.now();
       if (lease && !await assertLeaseHeld(t, lease, now)) throw new Error('Phiên quét đã hết hiệu lực.');
-      const saved = await t.profileDetailsScan.updateMany({ where: { ...key, status: 'READING', mapping },
+      const saved = await t.profileDetailsScan.updateMany({ where: { ...key, status: 'READING', mapping: matchingMapping(scan, withSession),
+        updatedAt: { gt: new Date(+now - PROFILE_SCAN_TIMEOUT_MS) } },
         data: { status: 'READY', snapshot, error: null, updatedAt: now } });
-      if (!saved.count) throw new Error('Hồ sơ đã đổi cấu hình trong lúc quét.');
+      if (!saved.count) throw new Error('Lượt quét hết hiệu lực hoặc hồ sơ đã đổi cấu hình.');
+      const details: SyncedProfileDetails = { sourceCode: source.code, targetExternalId: scan.targetExternalId,
+        requestId: key.requestId, syncedAt: now.toISOString(), snapshot };
+      await t.targetAccount.update({ where: { id: target.id }, data: { profileDetails: details } });
       await audit(t, { entityType: 'profile_details', entityId: key.mappingId, action: 'profile_scan_saved', actor: ctx.actor, at: now,
-        data: { requestId: key.requestId, sections: snapshot.sections.map(({ key, status }) => ({ key, status })) } });
+        data: { requestId: key.requestId, targetId: target.id, sections: snapshot.sections.map(({ key, status }) => ({ key, status })) } });
     });
   } catch (error) {
     if (error instanceof RetryLaterError && !lease && retryCount < 3) throw error;

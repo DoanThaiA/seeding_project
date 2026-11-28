@@ -1,6 +1,6 @@
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core';
 import { ConnectorError, isConnectorError, type ReadCommentsResult, type ReadConnector, type ReadMedia, type ReadPost, type ReadResult, type SourceRef } from '@seedingsys/connectors-core';
-import type { IncompleteFlag } from '@seedingsys/contracts';
+import type { IncompleteFlag, ProfileDetailsSnapshot } from '@seedingsys/contracts';
 import { facebookSourceUrl, isAdvertisingLink, removeAdvertisingLinks, sha256 } from '@seedingsys/domain';
 import { fbTargetProfilePath, type FbWebOptions } from './config';
 import { CHECKPOINT_TEXT, sel, URLS } from './selectors';
@@ -439,8 +439,9 @@ export class FbPublicReadConnector implements ReadConnector {
       const page = await context.newPage();
       page.setDefaultTimeout(2500);
       const accountIdentity = account ? await this.verifyReadAccount(page, account) : null;
-      const maxPosts = source.history || source.exactPermalinks ? undefined : source.maxPosts;
-      const limit = source.history ? 150 : maxPosts ?? Math.min(100, Math.max(account ? 30 : 10, overlap));
+      // Lịch sử cũng dừng ở giới hạn mỗi lượt quét của nguồn; không đặt giới hạn thì tối đa 150 bài một trang.
+      const maxPosts = source.exactPermalinks ? undefined : source.maxPosts;
+      const limit = source.history ? Math.min(150, maxPosts ?? 150) : maxPosts ?? Math.min(100, Math.max(account ? 30 : 10, overlap));
       const aliases = new Set([profileIdentity(profile)]);
       const { posts: result, partial } = source.exactPermalinks ? { posts: [], partial: false }
         : await this.readTimeline(page, profile, accountIdentity, account?.code, aliases, limit, deadline, !!source.history);
@@ -467,7 +468,10 @@ export class FbPublicReadConnector implements ReadConnector {
       }
       const newest = posts.reduce((max, p) => Math.max(max, p.postedAt?.getTime() ?? 0), typeof watermark?.newest === 'number' ? watermark.newest : 0);
       return { posts, nextWatermark: { newest }, incomplete: timelineIncomplete || Date.now() >= deadline ? ['PAGINATION_INCOMPLETE'] : [],
-        ...(source.history && { history: { complete: false, detail: 'Đã lấy các bài trình duyệt đọc được. Facebook không xác nhận đã hiển thị hết lịch sử profile.' } }),
+        ...(source.history && { history: { complete: false,
+          detail: maxPosts !== undefined && result.length >= maxPosts
+            ? `Đã dừng ở ${result.length} bài theo giới hạn mỗi lượt quét của nguồn. Tăng giới hạn trong Quản trị luồng nếu muốn lấy thêm lịch sử.`
+            : 'Đã lấy các bài trình duyệt đọc được. Facebook không xác nhận đã hiển thị hết lịch sử profile.' } }),
       };
     } catch (error) {
       if (isConnectorError(error)) throw error;
@@ -531,52 +535,66 @@ export class FbPublicReadConnector implements ReadConnector {
     if (!profile || (this.key === 'fb-session' && !account)) {
       throw new ConnectorError('SOURCE_UNREADABLE', 'Thiếu URL hồ sơ Facebook hoặc phiên đăng nhập để đọc.');
     }
+    return this.withProfilePage(account, async page => {
+      const excluded = account ? await this.verifyReadAccount(page, account) : null;
+      return this.captureProfile(page, profile, account?.code, excluded);
+    });
+  }
+
+  private async withProfilePage<T>(account: SourceRef['readAccount'], read: (page: Page) => Promise<T>) {
     const launch = { headless: true, channel: this.opts.channel, executablePath: this.opts.executablePath, timeout: 15_000 };
     const locale = { locale: 'vi-VN', timezoneId: 'Asia/Ho_Chi_Minh' };
     const browser = account ? undefined : await chromium.launch(launch);
     let context: BrowserContext | undefined;
+    let closing: Promise<void> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const close = () => closing ??= (browser?.close() ?? context?.close() ?? Promise.resolve()).catch(() => undefined);
     try {
       context = account
         ? await chromium.launchPersistentContext(fbTargetProfilePath(this.opts.profilesRoot, account), { ...launch, ...locale })
         : await browser!.newContext(locale);
+      timer = setTimeout(() => { void close(); }, 165_000);
       const page = await context.newPage();
       page.setDefaultTimeout(3000);
-      const identity = account ? await this.verifyReadAccount(page, account) : null;
-      const assertSession = async () => {
-        if (account) await this.assertReadSession(page, account.code);
-        else await this.dismissOptionalLogin(page);
-      };
-      const response = await page.goto(new URL(profile.pathname + profile.search, this.base).href,
-        { waitUntil: 'domcontentloaded', timeout: 15_000 });
-      await assertSession();
-      const observedUrl = new URL(page.url());
-      const observed = this.profileAt(observedUrl.href);
-      if (!response?.ok() || observedUrl.origin !== this.base.origin || !observed) {
-        throw new ConnectorError('SOURCE_UNREADABLE', 'Không mở được đúng trang hồ sơ nguồn.');
-      }
-      const expected = profileIdentity(profile);
-      const observedId = profileIdentity(observed);
-      const header = await readArtworkHeader(page, expected, false);
-      if (expected !== observedId && (!header || ![expected, header.owner].includes(observedId))) {
-        throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook chuyển hướng khỏi hồ sơ nguồn đã chọn.');
-      }
-      const aliases = new Set([expected, observedId, ...(header ? [header.owner] : [])]);
-      if (identity && aliases.has(identity) || await page.getByText(LOGIN_WALL).first().isVisible()) {
-        throw new ConnectorError('SOURCE_UNREADABLE', 'Không xem được hồ sơ nguồn độc lập bằng phiên này.');
-      }
-      const name = await readProfileName(page, aliases);
-      if (!name) {
-        throw new ConnectorError('SOURCE_UNREADABLE', 'Không xác nhận được tên hiển thị của hồ sơ nguồn.');
-      }
-      const { bio, intro } = await readProfileIntro(page);
-      const canonical = new URL(observed.pathname + observed.search, this.base);
-      const sections = await readProfileSections(page, canonical, aliases, assertSession);
-      return { name, url: observed.href, facebookId: [...aliases].find(id => /^\d+$/.test(id)),
-        bio: bio && bio.length <= 2000 ? bio : undefined, intro, sections, capturedAt: new Date().toISOString() };
+      return await read(page);
     } finally {
-      if (browser) await browser.close().catch(() => undefined);
-      else await context?.close().catch(() => undefined);
+      clearTimeout(timer);
+      await close();
     }
+  }
+
+  private async captureProfile(page: Page, profile: URL, accountCode?: string, excluded?: string | null): Promise<ProfileDetailsSnapshot> {
+    const assertSession = () => accountCode ? this.assertReadSession(page, accountCode) : this.dismissOptionalLogin(page);
+    const response = await page.goto(new URL(profile.pathname + profile.search, this.base).href,
+      { waitUntil: 'domcontentloaded', timeout: 15_000 });
+    await assertSession();
+    const observedUrl = new URL(page.url());
+    const observed = this.profileAt(observedUrl.href);
+    if (!response?.ok() || observedUrl.origin !== this.base.origin || !observed) {
+      throw new ConnectorError('SOURCE_UNREADABLE', 'Không mở được đúng trang hồ sơ.');
+    }
+    const expected = profileIdentity(profile);
+    const observedId = profileIdentity(observed);
+    const header = await readArtworkHeader(page, expected, false);
+    if (expected !== observedId && header?.owner !== observedId) {
+      throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook chuyển hướng khỏi hồ sơ đã chọn.');
+    }
+    const aliases = new Set([expected, observedId, ...(header ? [header.owner] : [])]);
+    if ((excluded && aliases.has(excluded)) || await page.getByText(LOGIN_WALL).first().isVisible()) {
+      throw new ConnectorError('SOURCE_UNREADABLE', 'Không xem được hồ sơ nguồn độc lập bằng phiên này.');
+    }
+    const name = await readProfileName(page, aliases);
+    if (!name) throw new ConnectorError('SOURCE_UNREADABLE', 'Không xác nhận được tên hiển thị của hồ sơ.');
+    if (!header) {
+      const hydratedHeader = await readArtworkHeader(page, expected, false);
+      if (hydratedHeader) aliases.add(hydratedHeader.owner);
+      if (excluded && aliases.has(excluded)) throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn trùng với tài khoản đích.');
+    }
+    const { bio, intro } = await readProfileIntro(page);
+    const canonical = new URL(observed.pathname + observed.search, this.base);
+    const sections = await readProfileSections(page, canonical, aliases, assertSession);
+    return { name, url: observed.href, facebookId: [...aliases].find(id => /^\d+$/.test(id)),
+      bio: bio && bio.length <= 2000 ? bio : undefined, intro, sections, capturedAt: new Date().toISOString() };
   }
 
   async readProfileArtwork(source: SourceRef) {

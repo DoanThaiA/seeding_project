@@ -40,7 +40,7 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     await h.close();
   });
 
-  it('caps a timeline poll and its comment tasks, while keeping profile history separate', async () => {
+  it('caps a timeline poll, its comment tasks and the profile history read', async () => {
     const sourceId = h.ids.sources.A1;
     await h.db.source.update({ where: { id: sourceId }, data: { pollPostLimit: 2 } });
     mock.posts = ['ONE', 'TWO', 'THREE', 'FOUR'].map(word => ({ id: `pfbid${word}`, text: `Bài số ${word}` }));
@@ -49,9 +49,14 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
       watermark: { lastReadCount: 2 }, lastIncomplete: [],
     });
     expect(await h.db.commentScan.count()).toBe(2);
+    // Lượt đọc lịch sử cũng dừng ở giới hạn 2 bài, nên không kéo thêm bài cũ về.
+    expect(await handleSourcePoll(h.browser, { sourceId, history: { targetId: h.ids.targets.B1 } })).toMatchObject({ outcome: 'OK' });
+    expect(await h.db.sourcePost.count({ where: { sourceId } })).toBe(2);
+    expect(await h.db.commentScan.count()).toBe(2);
+    // Bỏ giới hạn thì lịch sử lấy hết phần còn lại.
+    await h.db.source.update({ where: { id: sourceId }, data: { pollPostLimit: null } });
     expect(await handleSourcePoll(h.browser, { sourceId, history: { targetId: h.ids.targets.B1 } })).toMatchObject({ outcome: 'OK' });
     expect(await h.db.sourcePost.count({ where: { sourceId } })).toBe(4);
-    expect(await h.db.commentScan.count()).toBe(2);
   }, 45_000);
 
   it('keeps scrolling to reach the configured limit after a card without a permalink pulls the page back', async () => {
@@ -94,7 +99,12 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     expect(assets.every(a => a.status === 'STORED' && a.checksum && a.objectKey)).toBe(true);
     for (const a of assets) expect((await h.media.store.get(a.objectKey!)).length).toBeGreaterThan(0);
     const partial = await h.db.contentVariant.findFirstOrThrow({ where: { status: 'NEEDS_REVIEW' } });
-    await expect(h.db.$transaction(t => freezeSnapshot(t, { variantId: partial.id, from: 'NEEDS_REVIEW', now: h.clock.now(), actor: 'fixture', caption: 'Duyệt thử bài thiếu ảnh' }))).rejects.toThrow('chưa tải đủ ảnh hoặc video');
+    // Thiếu ảnh vẫn duyệt được, miễn còn ảnh đã tải; bản chốt ghi lại là thiếu.
+    expect(await h.db.$transaction(t => freezeSnapshot(t, { variantId: partial.id, from: 'NEEDS_REVIEW', now: h.clock.now(), actor: 'fixture', caption: 'Duyệt thử bài thiếu ảnh' }))).toBe(true);
+    const frozen = await h.db.contentVariant.findUniqueOrThrow({ where: { id: partial.id } });
+    expect(frozen.status).toBe('READY');
+    expect(frozen.snapshot).toMatchObject({ mediaIncomplete: true });
+    expect((frozen.snapshot as { media: unknown[] }).media.length).toBeGreaterThan(0);
     expect(mock.timelineRequests.every(r => !r.cookie && r.path !== '/me')).toBe(true);
     h.advance(MIN);
     await h.workerHeartbeat();
@@ -405,4 +415,13 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 70_000);
+
+  it('waits for the verified avatar label when the source name has no heading', async () => {
+    mock.profileNameOutsideHeading = true;
+    mock.profileHeaderDelay = 3200;
+    const source = await h.db.source.findUniqueOrThrow({ where: { id: h.ids.sources.A1 } });
+    const result = await h.browser.registry.reader(source.connector).readProfileDetails!(source);
+    expect(result).toMatchObject({ name: mock.owner, facebookId: mock.userId });
+    expect((await h.db.targetBrowserRun.count())).toBe(0);
+  }, 45_000);
 });

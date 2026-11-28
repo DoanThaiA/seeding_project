@@ -16,6 +16,50 @@ export const CaptionSchema = z.object({
 });
 export type Caption = z.infer<typeof CaptionSchema>;
 
+export const CommentPlanSchema = z.object({
+  name: z.string(),
+  steps: z.array(z.object({
+    persona: z.string().describe('One of the supplied persona codes'),
+    text: z.string(),
+    replyTo: z.number().int().nullable().describe('Zero-based index of an earlier step, or null for a top-level comment'),
+  })),
+});
+export type CommentPlan = z.infer<typeof CommentPlanSchema>;
+
+export const PersonaInsightSchema = z.object({
+  occupation: z.string().nullable().describe('Main job or role in Vietnamese, null when the material does not show it'),
+  gender: z.enum(['MALE', 'FEMALE', 'UNKNOWN']),
+  ageRange: z.string().nullable().describe('Age band such as "25-35", null when unclear'),
+  location: z.string().nullable().describe('Where they live or work, null when unclear'),
+  interests: z.array(z.string()).describe('Observable interests in Vietnamese, a few words each'),
+  traits: z.array(z.string()).describe('Observable personality traits in Vietnamese, a few words each'),
+  voice: z.string().nullable().describe('How this account writes: tone, emoji, sentence length'),
+  topics: z.array(z.string()).describe('What this account can credibly comment on'),
+  avoid: z.array(z.string()).describe('What it must not claim as its own experience'),
+  summary: z.string().describe('2 to 3 Vietnamese sentences about this person'),
+  confidence: z.enum(['LOW', 'MEDIUM', 'HIGH']),
+});
+export type PersonaInsight = z.infer<typeof PersonaInsightSchema>;
+
+export interface PersonaInsightInput {
+  code: string;
+  name: string;
+  bio: string | null;
+  intro: string[];
+  about: { label: string; values: string[] }[];
+  posts: { caption: string; postedAt: string | null; contentType: string }[];
+}
+
+/** Kiểu ảnh Claude nhận trực tiếp. */
+export type PostImageMime = 'image/jpeg' | 'image/png' | 'image/webp' | 'image/gif';
+
+export interface CommentPlanInput {
+  request: string;
+  post: { caption: string; author: string | null; images?: Array<{ mime: PostImageMime; data: string }> };
+  personas: { code: string; name: string; bio: string | null; intro: string[]; posts: string[];
+    profile: PersonaInsight | null }[];
+}
+
 export interface RewriteInput {
   sourceText: string;
   albumTitle?: string | null;
@@ -42,7 +86,10 @@ export interface Usage {
 export interface LlmEditor {
   readonly modelId: string;
   rewrite(input: RewriteInput): Promise<{ output: RewriteOutput; usage: Usage[] }>;
+  planComments?(input: CommentPlanInput): Promise<{ output: CommentPlan; usage: Usage[] }>;
+  summarizePersona?(input: PersonaInsightInput): Promise<{ output: PersonaInsight; usage: Usage[] }>;
 }
 
 export class LlmRefusalError extends Error {}
 export class LlmBudgetExceededError extends Error {}
+export class LlmUnavailableError extends Error {}

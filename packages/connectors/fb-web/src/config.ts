@@ -54,7 +54,7 @@ export function fbWebOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): FbWeb
     headless: !['0', 'false', 'no'].includes((env.FB_HEADLESS ?? 'true').toLowerCase()),
     channel: env.FB_BROWSER_CHANNEL || undefined,
     executablePath: env.FB_BROWSER_PATH || undefined,
-    enabledFormats: formats,
+    enabledFormats: formats.length ? formats : [...IMPLEMENTED_FORMATS],
     stepTimeoutMs: Number(env.FB_STEP_TIMEOUT_MS ?? 20_000),
     uploadTimeoutMs: Number(env.FB_UPLOAD_TIMEOUT_MS ?? 10 * 60_000),
     screenshotDir: env.FB_SCREENSHOT_DIR || undefined,

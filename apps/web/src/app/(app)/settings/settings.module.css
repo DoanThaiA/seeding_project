@@ -23,7 +23,7 @@
 .flowTitle { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .flowTitle h2 { font-size: 20px; margin: 0; }
 .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
-.panel, .capability { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 15px; }
+.panel { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 15px; }
 .panelHeader { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: flex-start; gap: 8px; margin-bottom: 13px; }
 .panelHeader h2 { margin: 0; font-size: 16px; }
 .panelHeader p { font-size: 13px; }
@@ -33,7 +33,7 @@
 .checkbox { display: flex; align-items: center; gap: 8px; min-height: 36px; margin: 0; color: var(--text); font-size: 13px; }
 .checkbox input { width: 16px; height: 16px; flex: none; accent-color: var(--accent); }
 .advanced { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
-.advanced summary, .capability summary { cursor: pointer; font-weight: 600; }
+.advanced summary { cursor: pointer; font-weight: 600; }
 .advanced[open] summary { margin-bottom: 8px; }
 .formActions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
 .scanStatus { margin-top: 12px; padding: 9px 10px; border-radius: 8px; background: var(--panel-2); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }

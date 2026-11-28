@@ -18,27 +18,70 @@ function evaluateProfilePage<T, A>(page: Page, read: (arg: A) => T, arg: A) {
 /** Some Facebook profiles omit the main heading and show the name as a link to the verified profile. */
 export async function readProfileName(page: Page, aliases: ReadonlySet<string>) {
   const title = page.locator('h1:visible,[role="heading"][aria-level="1"]:visible');
-  await title.first().waitFor({ timeout: 2500 }).catch(() => undefined);
-  const names = [...new Set((await title.allInnerTexts()).map(name => name.trim()).filter(Boolean))];
-  if (names.length === 1 && names[0].length <= 250) return names[0];
-  return evaluateProfilePage(page, ({ headingSelector, expected }) => {
+  const readLinkedName = () => evaluateProfilePage(page, ({ headingSelector, expected }) => {
+    const keyOf = (href: string) => {
+      try {
+        const url = new URL(href, location.href);
+        if (url.origin !== location.origin) return null;
+        const path = url.pathname.replace(/\/$/, '');
+        return path === '/profile.php' ? url.searchParams.get('id') :
+          (path.match(/^\/people\/[^/]+\/(\d+)$/)?.[1] ?? path.match(/^\/([\w.]+)$/)?.[1])?.toLowerCase();
+      } catch { return null; }
+    };
     const names = new Set<string>();
     for (const heading of Array.from(document.querySelectorAll<HTMLElement>(headingSelector))) {
       if (!heading.getClientRects().length || heading.closest('[aria-hidden="true"],nav,[role="navigation"]')) continue;
       const links = [heading.closest<HTMLAnchorElement>('a[href]'), ...Array.from(heading.querySelectorAll<HTMLAnchorElement>('a[href]'))];
       for (const link of links) {
         if (!link) continue;
-        const url = new URL(link.href);
-        if (url.origin !== location.origin) continue;
-        const path = url.pathname.replace(/\/$/, '');
-        const key = path === '/profile.php' ? url.searchParams.get('id') :
-          (path.match(/^\/people\/[^/]+\/(\d+)$/)?.[1] ?? path.match(/^\/([\w.]+)$/)?.[1])?.toLowerCase();
+        const key = keyOf(link.href);
         const name = link.innerText.trim();
         if (key && expected.includes(key) && name && name.length <= 250 && heading.innerText.trim() === name) names.add(name);
       }
     }
-    return names.size === 1 ? [...names][0] : undefined;
+    if (names.size === 1) return [...names][0];
+    // Some profile pages render the name outside a heading. Confirm a profile record against a visible owner link.
+    const visibleOwnerNames = new Set<string>();
+    for (const link of Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))) {
+      const key = keyOf(link.href);
+      if (!key || !expected.includes(key) || !link.getClientRects().length || link.closest('[aria-hidden="true"],[hidden]')) continue;
+      for (const value of [link.innerText, link.getAttribute('aria-label')]) if (value?.trim()) visibleOwnerNames.add(value.trim());
+    }
+    const avatarLabels = new Set(Array.from(document.querySelectorAll('svg[aria-label]'))
+      .filter(avatar => avatar.getClientRects().length && !avatar.closest('[aria-hidden="true"],[hidden]'))
+      .map(avatar => avatar.getAttribute('aria-label')?.trim()));
+    const verified = new Set<string>();
+    const hasNumericOwner = expected.some(key => /^\d+$/.test(key));
+    for (const script of Array.from(document.querySelectorAll('script[type="application/json"]'))) {
+      if (!script.textContent?.includes('"__isProfile"')) continue;
+      let data;
+      try { data = JSON.parse(script.textContent); } catch { continue; }
+      const pending = [data];
+      while (pending.length) {
+        const node = pending.pop();
+        if (!node || typeof node !== 'object') continue;
+        for (const child of Object.values(node)) if (child && typeof child === 'object') pending.push(child);
+        if (!node.__isProfile || typeof node.name !== 'string' || typeof node.url !== 'string') continue;
+        const key = keyOf(node.url);
+        const id = String(node.id ?? '');
+        const name = node.name.trim();
+        if (!key || (!expected.includes(key) && !expected.includes(id)) || !name || name.length > 250) continue;
+        if (hasNumericOwner && /^\d+$/.test(id) && !expected.includes(id)) continue;
+        // The header avatar points to a photo, so its label needs confirmation from the active profile record.
+        const renderedOwner = node.__isRenderedProfile && expected.includes(key) && avatarLabels.has(name);
+        if (visibleOwnerNames.has(name) || renderedOwner) verified.add(name);
+      }
+    }
+    return verified.size === 1 ? [...verified][0] : undefined;
   }, { headingSelector: displayedHeading, expected: [...aliases] });
+  const deadline = Date.now() + 8500;
+  do {
+    const names = [...new Set((await title.allInnerTexts()).map(name => name.trim()).filter(Boolean))];
+    if (names.length === 1 && names[0].length <= 250) return names[0];
+    const linked = await readLinkedName();
+    if (linked) return linked;
+    await page.waitForTimeout(350);
+  } while (Date.now() < deadline);
 }
 
 /** Pick the profile's Intro card and the bio block immediately before its Add/Edit control or details list. */

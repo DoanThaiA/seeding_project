@@ -105,10 +105,6 @@ describe('profile sync and source trash', () => {
     expect(await dispatchSlot(h.core, scheduled.id)).toBe('SKIPPED_NO_CONTENT');
     h.advance(MIN);
     await h.workerHeartbeat();
-    await h.db.capabilityCheck.updateMany({ where: { targetId, contentType: 'TEXT' }, data: { passed: false } });
-    expect(await listBacklog(h.db, h.clock.now())).toContainEqual(expect.objectContaining({ id: variant.id, blockReason: 'FORMAT_NOT_CERTIFIED' }));
-    await expect(dispatchBacklogItem(h.core, variant.id)).rejects.toMatchObject({ reason: 'FORMAT_NOT_CERTIFIED' });
-    await h.db.capabilityCheck.updateMany({ where: { targetId, contentType: 'TEXT' }, data: { passed: true } });
     expect(await listBacklog(h.db, h.clock.now())).toContainEqual(expect.objectContaining({ id: variant.id, blockReason: null }));
     const pubId = await dispatchBacklogItem(h.core, variant.id);
     await library.archive(post.id, { archived: true }, actor);

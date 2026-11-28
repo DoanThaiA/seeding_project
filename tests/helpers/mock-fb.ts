@@ -13,6 +13,8 @@ export interface MockPost {
   media: number;
   video: boolean;
   photoId?: string;
+  previewFixture?: boolean;
+  timelineCaptionHtml?: string;
   omitPhotoAttachment?: boolean;
   photoReceiptAfterReload?: boolean;
   storyAlias?: string;
@@ -216,7 +218,16 @@ export class MockFb {
       : this.rotatingPfbid ? JSON.stringify(`/permalink.php?story_fbid=pfbid0Rot${post.id}&id=${this.userId}`)
       : this.pfbidCommentLinks ? JSON.stringify(alternatePath) : 'location.pathname';
     const authorPath = this.commentReceiptMode === 'wrong-author' ? '/profile.php?id=999' : this.vanity ? `/${this.vanity}` : `/profile.php?id=${this.userId}`;
-    return `<main><p>${esc(post.caption)}</p>${post.video ? '<video style="width:120px;height:160px"></video>' : ''}
+    const preview = post.previewFixture && (photoViewer
+      ? `<script type="application/json">${JSON.stringify({ result: { data: {
+        id: post.photoId, __typename: 'Photo', owner: { name: 'Hồ sơ thử nghiệm' }, message: post.caption ? { text: post.caption } : null,
+      } } })}</script>`
+      : post.storyAlias ? `<script type="application/json">${JSON.stringify({ result: { data: { node_v2: {
+        __typename: 'Story', post_id: post.id, permalink_url: `/permalink.php?story_fbid=${post.storyAlias}&id=${this.userId}`,
+        actors: [{ name: 'Hồ sơ thử nghiệm' }], message: { text: post.caption },
+      } } } })}</script>` : `<article data-post="${post.id}"><h2><a href="${authorPath}">Hồ sơ thử nghiệm</a></h2>
+        <p data-testid="post_message" style="white-space:pre-wrap">${esc(post.caption)}</p></article><article data-post="related"><p data-testid="post_message">Bài gợi ý</p></article>`);
+    return `<main>${preview || `<p>${esc(post.caption)}</p>`}${post.video ? '<video style="width:120px;height:160px"></video>' : ''}
       ${!photoViewer && post.photoId && !post.omitPhotoAttachment ? `<a href="/photo/?fbid=${post.photoId}">Ảnh của bài viết</a>` : ''}
       ${post.albumPhotos?.map(id => `<a href="/photo/?fbid=${id}&amp;set=pcb.${post.id}">Ảnh album</a>`).join('') ?? ''}
       ${post.albumPhotos ? `<a href="/photo/?fbid=${alternateStory ? '991' : '992'}">Ảnh đề xuất</a>` : ''}
@@ -278,7 +289,8 @@ export class MockFb {
       .map((p) => {
         const player = '<video src="data:video/mp4;base64,AAAA"></video>';
         const media = p.video ? (p.videoHref ? `<a href="${p.videoHref}?__cft__[0]=x">${player}</a>` : player) : Array.from({ length: p.media }, (_, i) => `<a href="/photo?fbid=${p.id}_${i}"><img alt="" style="width:80px;height:80px" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></a>`).join('');
-        return `<div data-post="1"><h3>Tester</h3>${p.hiddenTime ? '<a href="#"></a>' : p.lazyHref ? `<a href="?__cft__[0]=x" onmouseover="this.setAttribute('href','/posts/${p.id}?__cft__[0]=x')">dSnoprteos</a>` : `<a href="/${p.reel ? 'reel' : 'posts'}/${p.id}">${this.rel(p)}</a>`}<div>${esc(p.caption)}</div>${p.processing ? '<div>Video đang được xử lý</div>' : ''}${media}</div>`;
+        const message = p.timelineCaptionHtml ? `<div data-ad-preview="message">${p.timelineCaptionHtml}</div>` : `<div>${esc(p.caption)}</div>`;
+        return `<div data-post="1"><h3>Tester</h3>${p.hiddenTime ? '<a href="#"></a>' : p.lazyHref ? `<a href="?__cft__[0]=x" onmouseover="this.setAttribute('href','/posts/${p.id}?__cft__[0]=x')">dSnoprteos</a>` : `<a href="/${p.reel ? 'reel' : 'posts'}/${p.id}">${this.rel(p)}</a>`}${message}${p.processing ? '<div>Video đang được xử lý</div>' : ''}${media}</div>`;
       })
       .join('');
     // Like the real profile page: empty placeholder articles first, a long intro section, and the

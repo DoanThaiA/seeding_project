@@ -28,11 +28,18 @@ export async function handleProfileSync(ctx: BrowserCtx, { syncId, step }: { syn
       await tx(ctx.db, async t => {
         const now = ctx.clock.now();
         if (!await assertLeaseHeld(t, lease, now)) throw new RetryLaterError('Khóa lượt đồng bộ đã hết hiệu lực.');
-        const next = result.history?.nextCursor;
+        // Lượt quét lịch sử dừng khi đã lấy đủ số bài tối đa mỗi lượt của nguồn.
+        const limit = source.pollPostLimit;
+        const captured = limit === null ? 0
+          : await t.sourcePost.count({ where: { sourceId: source.id, firstSeenAt: { gte: run.createdAt } } });
+        const reachedLimit = limit !== null && captured >= limit;
+        const next = reachedLimit ? undefined : result.history?.nextCursor;
         const changed = await t.profileSync.updateMany({ where: { id: syncId, step, phase: 'DISCOVERING' }, data: {
           ...(next ? { historyCursor: next } : {
             phase: 'PREPARING', historyDone: !!result.history?.complete, capturedUntil: now,
-            detail: result.history?.detail ?? (result.outcome !== 'OK'
+            detail: (reachedLimit
+              ? `Đã dừng ở ${captured} bài theo giới hạn ${limit} bài mỗi lượt quét của ${source.code}.`
+              : result.history?.detail) ?? (result.outcome !== 'OK'
               ? result.error ?? 'Nguồn chưa khả dụng để đọc lịch sử. Tiếp tục với dữ liệu đã lưu.' : null),
           }),
           step: { increment: 1 },

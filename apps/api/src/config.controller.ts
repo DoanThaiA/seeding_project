@@ -1,6 +1,6 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
 import { z } from 'zod';
-import { MAX_POLL_POSTS, Q } from '@seedingsys/contracts';
+import { MAX_POLL_POSTS, Q, TARGET_HEALTH_KIND, TARGET_HEALTH_MS, TargetHealthResult } from '@seedingsys/contracts';
 import { activeKillSwitch, activeLease, audit, enqueue, Prisma, sourceResource, tx, type Db } from '@seedingsys/db';
 import { facebookSourceUrl, isFacebookTimelineReader, type Clock } from '@seedingsys/domain';
 import { Roles, type Principal } from './auth';
@@ -38,7 +38,7 @@ function publicSourceRef(ref: string): string {
 const TargetIn = z.object({
   code: z.string().regex(/^B\d+$/),
   name: z.string().min(1),
-  externalId: z.string().min(1),
+  externalId: z.string().trim().min(1),
   connector: z.enum(['fake', 'fb-web']),
   audience: z.enum(['ONLY_ME', 'FRIENDS', 'PUBLIC']).optional(),
   uiLocale: z.string().optional(),
@@ -231,11 +231,80 @@ export class ConfigController {
       const target = await t.targetAccount.findUnique({ where: { id } });
       if (!target || target.connector !== 'fb-web') throw new BadRequestException('Chọn tài khoản Facebook đã lưu.');
       const busy = await t.targetBrowserRun.findFirst({ where: { targetId: id, status: { in: ['QUEUED', 'RUNNING', 'OPEN'] },
+        kind: { in: ['login', 'scan'] },
         createdAt: { gt: new Date(this.clock.now().getTime() - 60 * 60_000) } } });
       if (busy) throw new ConflictException('Tài khoản đang bận. Đóng cửa sổ đăng nhập hoặc chờ lượt quét hoàn tất.');
       const run = await t.targetBrowserRun.create({ data: { targetId: id, kind: input.kind, profileUrl, limit: input.kind === 'scan' ? input.limit : 0 } });
       await enqueue(t, Q.TargetBrowser, { runId: run.id });
       return out(run);
+    });
+  }
+
+  /** Kết quả kiểm tra gần nhất của từng tài khoản B, kèm việc nguồn B còn bật hay đã bị tắt. */
+  @Get('targets/health')
+  @Roles('admin')
+  async targetHealth() {
+    const [targets, runs] = await Promise.all([
+      this.db.targetAccount.findMany({ orderBy: { code: 'asc' },
+        select: { id: true, code: true, name: true, enabled: true, connector: true, profile: { select: { id: true } } } }),
+      this.db.targetBrowserRun.findMany({ where: { kind: TARGET_HEALTH_KIND }, orderBy: { createdAt: 'desc' }, take: 500,
+        select: { targetId: true, status: true, message: true, results: true, createdAt: true } }),
+    ]);
+    const latest = new Map<string, (typeof runs)[number]>();
+    for (const run of runs) if (!latest.has(run.targetId)) latest.set(run.targetId, run);
+    const now = this.clock.now().getTime();
+    return out(targets.map(target => {
+      const run = latest.get(target.id);
+      const stuck = !!run && ['QUEUED', 'RUNNING', 'OPEN'].includes(run.status) && now - run.createdAt.getTime() >= TARGET_HEALTH_MS;
+      return {
+        id: target.id, code: target.code, name: target.name, enabled: target.enabled, connector: target.connector,
+        checkable: target.connector === 'fb-web' && !!target.profile,
+        status: stuck ? 'FAILED' : run?.status ?? null,
+        message: stuck ? 'Lượt kiểm tra đã hết thời gian. Bạn có thể chạy lại.' : run?.message ?? null,
+        checkedAt: run?.createdAt ?? null,
+        result: run ? TargetHealthResult.safeParse(run.results).data ?? null : null,
+      };
+    }));
+  }
+
+  /** Mở phiên trình duyệt của từng B để xem còn hoạt động không; worker tự tắt nguồn B hỏng. */
+  @Post('targets/health-check')
+  @Roles('admin')
+  async checkTargetHealth(@Body() body: unknown, @Actor() a: Principal) {
+    const input = parse(z.object({ targetId: z.string().uuid().optional() }), body ?? {});
+    const now = this.clock.now();
+    return tx(this.db, async t => {
+      const targets = await t.targetAccount.findMany({ orderBy: { code: 'asc' },
+        where: { connector: 'fb-web', ...(input.targetId ? { id: input.targetId } : { enabled: true }) },
+        select: { id: true, code: true, profile: { select: { id: true } } } });
+      if (!targets.length) throw new BadRequestException('Không có tài khoản B nào để kiểm tra.');
+      const started: string[] = [];
+      const skipped: Array<{ code: string; reason: string }> = [];
+      for (const target of targets) {
+        if (!target.profile) {
+          skipped.push({ code: target.code, reason: 'chưa đăng nhập trình duyệt' });
+          continue;
+        }
+        if (await activeKillSwitch(t, { targetId: target.id, connector: 'fb-web' })) {
+          skipped.push({ code: target.code, reason: 'đang bật công tắc dừng' });
+          continue;
+        }
+        const busy = await t.targetBrowserRun.findFirst({ where: { targetId: target.id, status: { in: ['QUEUED', 'RUNNING', 'OPEN'] },
+          createdAt: { gt: new Date(now.getTime() - 60 * 60_000) } } });
+        if (busy) {
+          skipped.push({ code: target.code, reason: 'tài khoản đang bận' });
+          continue;
+        }
+        const run = await t.targetBrowserRun.create({ data: { targetId: target.id, kind: TARGET_HEALTH_KIND, createdAt: now } });
+        await enqueue(t, Q.TargetBrowser, { runId: run.id });
+        started.push(target.code);
+      }
+      if (!started.length) {
+        throw new ConflictException('Chưa kiểm tra được: ' + skipped.map(item => `${item.code} (${item.reason})`).join(', '));
+      }
+      await audit(t, { entityType: 'target', entityId: input.targetId ?? 'all', action: 'health-check', actor: a.actor,
+        data: { started, skipped }, at: now });
+      return out({ started, skipped });
     });
   }
 

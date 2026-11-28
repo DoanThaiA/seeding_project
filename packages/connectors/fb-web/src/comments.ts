@@ -1,6 +1,6 @@
 import type { Page } from 'playwright-core';
 import type { ReadComment, ReadCommentsResult } from '@seedingsys/connectors-core';
-import { removeAdvertisingLinks } from '@seedingsys/domain';
+import { facebookPostId, removeAdvertisingLinks } from '@seedingsys/domain';
 
 const ALL_COMMENTS = /^(?:tất cả bình luận|all comments)$/i;
 const SORT_COMMENTS = /^(?:phù hợp nhất|liên quan nhất|mới nhất|most relevant|newest|top comments)$/i;
@@ -21,13 +21,14 @@ interface PrimaryThread {
   comments: Observation['comments'];
 }
 
-function evaluateCommentPage<T, A>(page: Page, read: (arg: A) => T, arg: A): Promise<T> {
+function evaluateCommentPage<T, A>(page: Page, read: (arg: A, postIdFromUrl: typeof facebookPostId) => T, arg: A): Promise<T> {
   // tsx can emit its keep-names helper for local functions. The browser has its own scope.
-  return page.evaluate<T>('((__name) => (' + read.toString() + ')(' + JSON.stringify(arg) + '))((value) => value)');
+  return page.evaluate<T>('((__name) => (' + read.toString() + ')(' + JSON.stringify(arg) + ', ' +
+    facebookPostId.toString() + '))((value) => value)');
 }
 
 async function primaryThread(page: Page, postId: string, knownPostIds: string[] = []): Promise<PrimaryThread> {
-  return evaluateCommentPage<PrimaryThread, { id: string; knownPostIds: string[] }>(page, ({ id, knownPostIds }) => {
+  return evaluateCommentPage<PrimaryThread, { id: string; knownPostIds: string[] }>(page, ({ id, knownPostIds }, postIdFromUrl) => {
     const aliases = new Set([id, ...knownPostIds]);
     const hasNumericAlias = [...aliases].some(key => /^\d+$/.test(key));
     const roots = new Map<string, any[]>();
@@ -36,11 +37,7 @@ async function primaryThread(page: Page, postId: string, knownPostIds: string[] 
       try {
         const url = new URL(value, location.href);
         if (url.origin !== location.origin && !/^(?:www\.|m\.|web\.)?facebook\.com$/i.test(url.hostname)) return undefined;
-        const path = url.pathname.replace(/\/$/, '');
-        if (path === '/story.php' || path === '/permalink.php') return url.searchParams.get('story_fbid');
-        if (path === '/photo' || path === '/photo.php') return url.searchParams.get('fbid');
-        if (path === '/watch') return url.searchParams.get('v');
-        return path.match(/\/(?:posts|videos|reel)\/([A-Za-z0-9_]+)$/)?.[1];
+        return postIdFromUrl(url);
       } catch { return undefined; }
     };
     for (const script of Array.from(document.querySelectorAll('script[type="application/json"]'))) {
@@ -145,15 +142,12 @@ export async function collectVisibleComments(
   };
   primary.comments.forEach(store);
   for (let step = 0; step < 100 && Date.now() < deadline; step++) {
-    const found = await evaluateCommentPage<Observation, { aliases: string[]; seedIds: string[]; author?: string }>(page, ({ aliases, seedIds, author }) => {
+    const found = await evaluateCommentPage<Observation, { aliases: string[]; seedIds: string[]; author?: string }>(page, ({ aliases, seedIds, author }, postIdFromUrl) => {
       const article = 'article,[role="article"],[data-commentid],[data-comment-id],[aria-label^="Bình luận dưới "],[aria-label^="Phản hồi bình luận "],[aria-label^="Bình luận của "],[aria-label^="Comment by "],[aria-label^="Reply by "]';
       const anchorSelector = 'a[href*="comment_id="]';
       const postLinkMatches = (url: URL) => {
         if (url.origin !== location.origin && !/^(?:www\.|m\.|web\.)?facebook\.com$/i.test(url.hostname)) return false;
-        const path = url.pathname.replace(/\/$/, '');
-        const post = (path === '/story.php' || path === '/permalink.php') ? url.searchParams.get('story_fbid')
-          : (path === '/photo' || path === '/photo.php') ? url.searchParams.get('fbid')
-          : path === '/watch' ? url.searchParams.get('v') : path.match(/\/(?:posts|videos|reel)\/([A-Za-z0-9_]+)$/)?.[1];
+        const post = postIdFromUrl(url);
         return !!post && aliases.includes(post);
       };
       const decodedComment = (value: string | null) => {

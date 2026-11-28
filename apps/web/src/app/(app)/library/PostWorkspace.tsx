@@ -1,15 +1,16 @@
 'use client';
 
 import { useMemo, useState } from 'react';
+import Link from 'next/link';
 import { ActionButton, bff, useSubmit } from '@/components/client';
 import { Badge } from '@/components/ui';
 import { fmtTime, reasonText } from '@/lib/format';
-import { SUCCESS } from '@seedingsys/contracts';
+import { COMMENT_SENDABLE_STATUSES, SUCCESS, needsPublishChoice } from '@seedingsys/contracts';
 import type { Destination, PostDetail, Revision, SourceComment } from './types';
 import styles from './library.module.css';
 
 const SCAN_LABEL = { QUEUED: 'Chờ quét', RUNNING: 'Đang quét bình luận', COMPLETE: 'Đã đọc hết phần truy cập được', PARTIAL: 'Đã lưu một phần', FAILED: 'Quét gián đoạn' };
-const REPLAY_LABEL = { DRAFT: 'Nháp bình luận', APPROVED: 'Đã duyệt', QUEUED: 'Chờ worker', SENDING: 'Đang gửi', FAILED: 'Gửi thất bại',
+const REPLAY_LABEL = { DRAFT: 'Chờ đăng', APPROVED: 'Chờ đăng', QUEUED: 'Chờ worker', SENDING: 'Đang gửi', FAILED: 'Gửi thất bại',
   UNKNOWN: 'Chờ đối chiếu', POSTED: 'Đã ghi nhận đăng', OMITTED: 'Đã bỏ qua' };
 const AUDIENCE: Record<string, string> = { ONLY_ME: 'Chỉ mình tôi', FRIENDS: 'Bạn bè', PUBLIC: 'Công khai' };
 
@@ -61,6 +62,7 @@ function DraftPreview({ postId, destination, canReview, canOperate }: { postId: 
     && (!['VIDEO', 'REEL'].includes(v.contentType) || (v.revision.assets.length === 1 && v.revision.assets[0].asset.kind === 'video'))
     && v.revision.assets.every(({ asset }) => asset.status === 'STORED');
   const validCaption = v.contentType === 'REEL' || !!caption.trim();
+  const chooseFormat = needsPublishChoice(v.contentType);
   const approval = () => submit.run(() => bff('POST', `review/${v.id}/approve`, { caption: caption.trim() }), 'Đã duyệt để đăng');
   const save = () => submit.run(async () => {
     const result = v.status === 'READY'
@@ -75,7 +77,8 @@ function DraftPreview({ postId, destination, canReview, canOperate }: { postId: 
         caption={caption} revision={v.revision} link={p?.permalink ?? null} type={v.contentType}
         footer={`${AUDIENCE[v.audience] ?? v.audience}${p?.verifiedAt ? ' · ' + fmtTime(p.verifiedAt) : ''}`} />
       <div className={styles.actionPanel}>
-        <div><Badge s={busy ? p.status : v.status} />{!target.enabled && <> <Badge s="PAUSED" text="Đích đang tắt" /></>}</div>
+        <div><Badge s={busy ? p.status : v.status} />{!target.enabled && <> <Badge s="PAUSED" text="Đích đang tắt" /></>}
+          {v.mediaIncomplete && <> <Badge s="DEFERRED" text={v.missingMedia ? `Thiếu ${v.missingMedia} ảnh` : 'Thiếu ảnh'} /></>}</div>
         {p && !busy && p.lastReason && <p className="muted">Lượt đăng trước · {reasonText(p.lastReason)}</p>}
         {postExists && !p?.directLink && canOperate && <details>
           <summary>Thêm liên kết bài đã đăng trên {target.code}</summary>
@@ -106,8 +109,9 @@ function DraftPreview({ postId, destination, canReview, canOperate }: { postId: 
           <textarea id={`preview-caption-${v.id}`} value={caption} maxLength={5000} onChange={e => setCaption(e.target.value)} rows={4} />
           <div className={styles.actions}>
             <button type="button" disabled={submit.pending || !changed || !validCaption} onClick={save}>Lưu caption</button>
-            {v.status === 'NEEDS_REVIEW' && !share && <button type="button" className="primary"
-              disabled={submit.pending || !validCaption || !mediaOk || v.contentType === 'UNSUPPORTED'} onClick={approval}>Duyệt bài</button>}
+            {v.status === 'NEEDS_REVIEW' && !share && (chooseFormat
+              ? <Link href={{ pathname: '/review', query: { variant: v.id } }}>Chọn nội dung để duyệt</Link>
+              : <button type="button" className="primary" disabled={submit.pending || !validCaption || !mediaOk} onClick={approval}>Duyệt bài</button>)}
           </div>
         </>}
         {canOperate && target.enabled && editing && v.status === 'READY' && !share &&
@@ -167,8 +171,9 @@ function CommentDraft({ detail, comment, parent, target, canReview, canOperate }
   const parentOnItsWay = parentReplay?.status === 'QUEUED' || parentReplay?.status === 'SENDING';
   const destinationLink = comment.parentExternalId ? parentReplay?.permalink ?? (parentOnItsWay ? publication?.permalink : undefined) : publication?.permalink;
   const inFlight = replay?.status === 'QUEUED' || replay?.status === 'SENDING';
+  const canSend = !!replay && COMMENT_SENDABLE_STATUSES.includes(replay.status);
   const canHandoff = !!replay && ['APPROVED', 'FAILED', 'UNKNOWN'].includes(replay.status);
-  const canPost = canHandoff && !!destinationLink && !!publication?.directLink && SUCCESS.includes(publication.status);
+  const canPost = !!destinationLink && !!publication?.directLink && SUCCESS.includes(publication.status);
   const privatePost = (target.variant?.audience ?? target.target.audience) === 'ONLY_ME' && replay?.authorTargetId !== target.target.id;
   const dirty = author !== replay?.authorTargetId || text.trim() !== replay?.text;
   if (replay?.status === 'POSTED') return <p><a href={replay.permalink ?? '#'} target="_blank" rel="noreferrer">Xem bình luận đã ghi nhận trên {target.target.code} ↗</a></p>;
@@ -185,22 +190,22 @@ function CommentDraft({ detail, comment, parent, target, canReview, canOperate }
         <label>Nội dung bình luận<textarea rows={3} maxLength={4000} value={text}
           onChange={e => setEdit({ savedAuthor, savedText, author, text: e.target.value })} /></label>
         <div className={styles.actions}>
-          <button type="button" disabled={submit.pending || !author || !text.trim() || !dirty}
-            onClick={() => submit.run(() => bff('PATCH', path, { action: 'draft', text, authorTargetId: author }))}>Lưu nháp</button>
-          <button type="button" className="primary" disabled={submit.pending || !author || !text.trim() || (replay?.status === 'APPROVED' && !dirty)}
-            onClick={() => submit.run(() => bff('PATCH', path, { action: 'approve', text, authorTargetId: author }), 'Đã duyệt bình luận')}>Duyệt bình luận</button>
+          <button type="button" disabled={submit.pending || !author || !text.trim() || (!dirty && replay?.status !== 'OMITTED')}
+            onClick={() => submit.run(() => bff('PATCH', path, { action: 'draft', text, authorTargetId: author }))}>
+            {replay?.status === 'OMITTED' ? 'Đưa vào danh sách đăng' : 'Lưu thay đổi'}
+          </button>
           <ActionButton method="PATCH" path={path} body={{ action: 'omit' }} disabled={replay?.status === 'OMITTED'}>Bỏ qua</ActionButton>
         </div>
       </>}
       {replay?.sendDetail && <p className="muted" role="status">{replay.sendDetail}</p>}
+      {canSend && canPost && canOperate && !privatePost && <ActionButton className="primary" method="PATCH" path={path} body={{ action: 'send' }}
+        disabled={!replay.authorTargetId || dirty || submit.pending}>
+        {replay.status === 'FAILED' ? 'Gửi lại bình luận' : 'Đăng bình luận này'}
+      </ActionButton>}
       {canHandoff && (canReview || canOperate) && (canPost ? <div className={styles.commentHandoff}>
         {privatePost && <p className="muted">Bài đích ở chế độ Chỉ mình tôi. Hồ sơ khác không thể bình luận.</p>}
-        {canOperate && !privatePost && replay.status !== 'UNKNOWN' && <ActionButton className="primary" method="PATCH" path={path} body={{ action: 'send' }}
-          disabled={dirty || submit.pending} confirm={`Gửi bình luận bằng ${replay.author?.code ?? 'hồ sơ đã chọn'}?`}>
-          {replay.status === 'FAILED' ? 'Gửi lại bình luận' : 'Gửi bình luận'}
-        </ActionButton>}
         <p>Đối chiếu trên Facebook và dán liên kết bình luận để ghi nhận.</p>
-        <textarea aria-label="Nội dung bình luận đã duyệt" value={replay.text} readOnly rows={3} />
+        <textarea aria-label="Nội dung bình luận đã lưu" value={replay.text} readOnly rows={3} />
         <div className={styles.actions}>
           <button type="button" onClick={() => void navigator.clipboard.writeText(replay.text).then(() => setCopied(true)).catch(() => setCopied(false))}>{copied ? 'Đã sao chép' : 'Sao chép nội dung'}</button>
           <a href={destinationLink!} target="_blank" rel="noreferrer">{parentReplay?.permalink ? 'Mở bình luận cha' : 'Mở bài đích'} ↗</a>
@@ -236,12 +241,12 @@ export function PostWorkspace({ detail, requestedTarget, canReview, canOperate, 
   const running = scan?.status === 'RUNNING' || scan?.status === 'QUEUED';
   const totals = dest ? comments.reduce((result, comment) => {
     const replay = comment.replays.find(r => r.destinationId === dest.target.id);
-    if (replay && ['APPROVED', 'QUEUED', 'SENDING'].includes(replay.status)) result.approved++;
+    if (replay && ['DRAFT', 'APPROVED', 'QUEUED', 'SENDING'].includes(replay.status)) result.waiting++;
+    if ((!replay || COMMENT_SENDABLE_STATUSES.includes(replay.status)) && (replay?.text ?? comment.text).trim()) result.sendable++;
     if (replay?.status === 'POSTED') result.posted++;
     return result;
-  }, { approved: 0, posted: 0 }) : null;
-  const sendable = dest ? comments.filter(c => ['APPROVED', 'FAILED'].includes(c.replays.find(r => r.destinationId === dest.target.id)?.status ?? '')).length : 0;
-  const canSendAll = !!dest?.publication?.directLink && SUCCESS.includes(dest.publication.status) && sendable > 0;
+  }, { waiting: 0, posted: 0, sendable: 0 }) : null;
+  const canSendAll = !post.archivedAt && !!dest?.publication?.directLink && SUCCESS.includes(dest.publication.status) && !!totals?.sendable;
   const sendAll = useSubmit();
   return (
     <>
@@ -266,16 +271,15 @@ export function PostWorkspace({ detail, requestedTarget, canReview, canOperate, 
       </div>
       <section className={styles.thread}>
         <div className={styles.comparisonHeading}>
-          <div><h2>Bình luận</h2><p className="muted">{comments.length} đã lưu{totals && dest && ` · ${totals.approved} chờ đăng · ${totals.posted} đã ghi nhận ở ${dest.target.code}`}</p></div>
+          <div><h2>Bình luận</h2><p className="muted">{comments.length} đã lưu{totals && dest && ` · ${totals.waiting} chờ đăng · ${totals.posted} đã ghi nhận ở ${dest.target.code}`}</p></div>
           <div className={styles.actions}>
-            {canOperate && dest && canSendAll && <button type="button" className="primary" disabled={sendAll.pending}
-              onClick={() => {
-                if (!window.confirm(`Gửi ${sendable} bình luận đã duyệt hoặc gửi lỗi lên bài của ${dest.target.code}? Bình luận gốc đi trước, phản hồi tự chờ bình luận cha.`)) return;
-                sendAll.run(() => bff<{ queued: number; skipped: Array<{ text: string; reason: string }> }>('POST',
+            {canOperate && dest && canSendAll && <button type="button" className="primary" disabled={sendAll.pending || running}
+              onClick={() => sendAll.run(() => bff<{ queued: number; skipped: Array<{ text: string; reason: string }> }>('POST',
                   `library/posts/${post.id}/destinations/${dest.target.id}/comments/send`),
                   data => `Đã xếp ${data?.queued ?? 0} bình luận vào hàng gửi.` + (data?.skipped.length
-                    ? ` Chưa gửi ${data.skipped.length}: ` + data.skipped.map(s => `"${s.text}" (${s.reason})`).join('; ') : ''));
-              }}>Gửi tất cả đã duyệt ({sendable})</button>}
+                    ? ` ${data.skipped.length} bình luận chưa thể gửi. ` + data.skipped.map(s => `"${s.text}" (${s.reason})`).join(' · ') : ''))}>
+              {sendAll.pending ? 'Đang xếp hàng…' : `Đăng bình luận (${totals?.sendable})`}
+            </button>}
             {(canOperate || canReview) && detail.canScan && <ActionButton path={`library/posts/${post.id}/comments/scan`} disabled={running}>
               {scan ? 'Quét lại bình luận' : 'Quét bình luận'}
             </ActionButton>}
