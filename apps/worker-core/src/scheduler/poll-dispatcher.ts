@@ -1,5 +1,5 @@
 import { Q } from '@seedingsys/contracts';
-import { activeKillSwitch, enqueue, tx } from '@seedingsys/db';
+import { activeKillSwitch, enqueue, profileScanBlocksPoll, tx } from '@seedingsys/db';
 import { sourceScheduleOpen } from '@seedingsys/domain';
 import type { CoreCtx } from '../ctx';
 
@@ -18,13 +18,14 @@ export async function dispatchDuePolls(ctx: CoreCtx): Promise<number> {
     const kill = await activeKillSwitch(ctx.db, { sourceId: s.id, connector: s.connector });
     if (kill) continue;
     await tx(ctx.db, async (t) => {
+      if (s.connector === 'fb-session' && await profileScanBlocksPoll(t, s.id, now)) return;
       const r = await t.source.updateMany({
         where: { id: s.id, enabled: true, connector: s.connector, lastPollAt: s.lastPollAt,
           runStartMinute: s.runStartMinute, runEndMinute: s.runEndMinute, runNowUntil: s.runNowUntil },
         data: { lastPollAt: now },
       });
       if (r.count === 1) {
-        await enqueue(t, Q.SourcePoll, { sourceId: s.id, scheduled: true }, { singletonKey: s.id });
+        await enqueue(t, Q.SourcePoll, { sourceId: s.id, scheduled: true, requestedAt: now.toISOString() }, { singletonKey: s.id });
         n++;
       }
     });

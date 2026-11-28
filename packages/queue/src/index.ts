@@ -1,5 +1,5 @@
 import PgBoss from 'pg-boss';
-import { COMMENT_PUBLISH_RETRIES, Q, parseJob, type JobPayload, type QueueName } from '@seedingsys/contracts';
+import { COMMENT_PUBLISH_RETRIES, FB_COMMENT_READ_MS, Q, SOURCE_POLL_BUSY_RETRIES, parseJob, type JobPayload, type QueueName } from '@seedingsys/contracts';
 import { claimOutbox, markOutboxPublished, tx, type Db } from '@seedingsys/db';
 import { captureError, type Logger } from '@seedingsys/observability';
 
@@ -12,14 +12,15 @@ export { PgBoss };
 export const QUEUE_SETTINGS: Record<QueueName, Omit<PgBoss.Queue, 'name'>> = {
   // stately + singletonKey=sourceId → at most one queued and one running poll per source.
   [Q.TargetBrowser]: { policy: 'standard', retryLimit: 1, retryDelay: 10, expireInSeconds: 60 * 60 },
-  [Q.SourcePoll]: { policy: 'stately', retryLimit: 0, expireInSeconds: 4 * 60 },
+  [Q.SourcePoll]: { policy: 'stately', retryLimit: SOURCE_POLL_BUSY_RETRIES, retryDelay: 30, expireInSeconds: 4 * 60 },
+  [Q.SourceProfileScan]: { policy: 'stately', retryLimit: 8, retryDelay: 25, expireInSeconds: 5 * 60 },
   [Q.ProfileSync]: { policy: 'standard', retryLimit: 8, retryDelay: 25, expireInSeconds: 5 * 60 },
   [Q.ProfileSyncPublish]: { policy: 'standard', retryLimit: 3, retryDelay: 10, expireInSeconds: 2 * 60 },
   [Q.ProfileArtwork]: { policy: 'standard', retryLimit: 3, retryDelay: 15, expireInSeconds: 3 * 60 },
   [Q.ApplyProfileArtwork]: { policy: 'standard', retryLimit: 3, retryDelay: 20, expireInSeconds: 8 * 60 },
   [Q.ProfileDetails]: { policy: 'standard', retryLimit: 3, retryDelay: 20, expireInSeconds: 4 * 60 },
   [Q.ApplyProfileBio]: { policy: 'standard', retryLimit: 3, retryDelay: 20, expireInSeconds: 4 * 60 },
-  [Q.CommentScan]: { policy: 'standard', retryLimit: 6, retryDelay: 30, expireInSeconds: 4 * 60 },
+  [Q.CommentScan]: { policy: 'standard', retryLimit: 6, retryDelay: 30, expireInSeconds: FB_COMMENT_READ_MS / 1000 + 120 },
   // A reply waits for its parent through retries: the handler gives up after COMMENT_PUBLISH_RETRIES.
   [Q.CommentPublish]: { policy: 'standard', retryLimit: COMMENT_PUBLISH_RETRIES, retryDelay: 30, expireInSeconds: 4 * 60 },
   [Q.CommentScriptStep]: { policy: 'standard', retryLimit: COMMENT_PUBLISH_RETRIES, retryDelay: 30, expireInSeconds: 5 * 60 },

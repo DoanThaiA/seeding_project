@@ -5,6 +5,7 @@ interface ArtworkHeader {
   owner: string;
   avatar: string | null;
   cover: string | null;
+  displayedAvatar?: OwnedImage;
 }
 
 interface OwnedImage {
@@ -45,11 +46,17 @@ const ARTWORK_HEADER = String.raw`({ profile, requireBoth }) => {
       if (profile !== owner && profile !== subject) continue;
       const avatarFile = file(node.profilePicLarge?.uri ?? node.profile_picture?.uri);
       const linked = new Set();
-      if (avatarFile) for (const image of document.querySelectorAll('main svg image,[role="main"] svg image')) {
-        if (file(image.getAttribute('href') ?? image.getAttribute('xlink:href')) !== avatarFile) continue;
+      let displayedAvatar;
+      if (avatarFile) for (const image of document.querySelectorAll('main svg image,[role="main"] svg image,main img,[role="main"] img')) {
+        const uri = image.getAttribute('href') ?? image.getAttribute('xlink:href') ?? image.currentSrc ?? image.src;
+        if (file(uri) !== avatarFile) continue;
         const href = image.closest('a[href]')?.getAttribute('href');
         const id = href && photoId(href);
         if (id && /^\d+$/.test(id)) linked.add(id);
+        const { width, height } = image.getBoundingClientRect();
+        if (!image.closest('[aria-hidden="true"],[hidden]') && width >= 80 && height >= 80 && width > (displayedAvatar?.width ?? 0)) {
+          displayedAvatar = { url: new URL(uri, location.href).href, width: Math.round(width), height: Math.round(height) };
+        }
       }
       const structured = String(node.profilePhoto?.id ?? '');
       if (/^\d+$/.test(structured)) linked.add(structured);
@@ -58,7 +65,9 @@ const ARTWORK_HEADER = String.raw`({ profile, requireBoth }) => {
       if (node.cover_photo && !cover || linked.size > 1) continue;
       const avatar = [...linked][0] ?? null;
       if (requireBoth && (!avatar || !cover || avatar === cover)) continue;
-      headers.set([owner, avatar, cover].join(':'), { owner, avatar, cover });
+      const key = [owner, avatar, cover].join(':');
+      const previous = headers.get(key);
+      headers.set(key, { owner, avatar, cover, displayedAvatar: displayedAvatar ?? previous?.displayedAvatar });
     }
   }
   return headers.size === 1 ? [...headers.values()][0] : null;

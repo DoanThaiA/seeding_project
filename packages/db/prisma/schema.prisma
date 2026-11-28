@@ -191,11 +191,36 @@ model Source {
   updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   posts    SourcePost[]
+  profileScans SourceProfileScan[]
   mappings SourceTargetMapping[]
   postAliases SourcePostAlias[]
   groups ProfileGroup[] @relation("ProfileGroupSources")
 
   @@map("sources")
+}
+
+model SourceProfileScan {
+  id              String   @id @default(uuid()) @db.Uuid
+  sourceId        String   @map("source_id") @db.Uuid
+  sourceRef       String   @map("source_ref")
+  connector       String
+  resetGeneration Int      @map("reset_generation")
+  phase           String   @default("PROFILE")
+  snapshot        Json?
+  artwork         Json?
+  profileIssue    String?  @map("profile_issue")
+  artworkIssue    String?  @map("artwork_issue")
+  historyComplete Boolean  @default(false) @map("history_complete")
+  historyIssue    String?  @map("history_issue")
+  requestedBy     String   @map("requested_by")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  source Source @relation(fields: [sourceId], references: [id])
+  commentScans CommentScan[]
+
+  @@index([sourceId, createdAt])
+  @@map("source_profile_scans")
 }
 
 model TargetAccount {
@@ -533,6 +558,7 @@ model ProfileSyncItem {
 model CommentScan {
   id           String            @id @default(uuid()) @db.Uuid
   sourcePostId String            @map("source_post_id") @db.Uuid
+  sourceProfileScanId String?    @map("source_profile_scan_id") @db.Uuid
   status       CommentScanStatus @default(QUEUED)
   readCount    Int               @default(0) @map("read_count")
   expectedCount Int?             @map("expected_count")
@@ -542,7 +568,9 @@ model CommentScan {
   updatedAt    DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   post SourcePost @relation(fields: [sourcePostId], references: [id])
+  sourceProfileScan SourceProfileScan? @relation(fields: [sourceProfileScanId], references: [id])
   syncItems ProfileSyncItem[]
+  @@unique([sourceProfileScanId, sourcePostId])
   @@index([sourcePostId, createdAt])
   @@map("comment_scans")
 }
@@ -558,6 +586,7 @@ model SourceComment {
   postedAt         DateTime? @map("posted_at") @db.Timestamptz(3)
   position         Int
   lastSeenAt       DateTime  @map("last_seen_at") @db.Timestamptz(3)
+  archiveOnly      Boolean   @default(false) @map("archive_only")
 
   post    SourcePost           @relation(fields: [sourcePostId], references: [id])
   replays PublicationComment[]

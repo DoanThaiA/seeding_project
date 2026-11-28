@@ -15,6 +15,7 @@ import { LocalStore } from '@seedingsys/storage';
 import { handleContentRewrite, handleContentValidate, schedulerTick, type CoreCtx } from '../../apps/worker-core/src';
 import { DEFAULT_BROWSER_SETTINGS, handleAgentRecover, handlePublish, handleReconcile, handleSourcePoll, type BrowserCtx } from '../../apps/worker-browser/src';
 import { handleCommentScan } from '../../apps/worker-browser/src/handlers/comment-scan';
+import { handleSourceProfileScan } from '../../apps/worker-browser/src/handlers/source-profile-scan';
 import { handleAssetFetch, type MediaCtx } from '../../apps/worker-media/src';
 
 export const MIN = 60_000;
@@ -98,6 +99,7 @@ export async function createHarness(opts: { codes?: number[]; start?: string } =
   const handlers: Record<string, (p: any) => Promise<unknown>> = {
     [Q.SchedulerTick]: () => schedulerTick(core),
     [Q.SourcePoll]: (p) => handleSourcePoll(browser, p),
+    [Q.SourceProfileScan]: (p) => handleSourceProfileScan(browser, p),
     [Q.CommentScan]: (p) => handleCommentScan(browser, p),
     [Q.AssetFetch]: (p) => handleAssetFetch(media, p),
     [Q.ContentRewrite]: (p) => handleContentRewrite(core, p),

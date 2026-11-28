@@ -112,60 +112,123 @@ export async function readProfileIntro(page: Page) {
       const bioRows = Array.from(card.querySelectorAll(explicit)).filter(visible);
       const edit = Array.from(card.querySelectorAll(controls)).find(el => visible(el) && new RegExp(editPattern, 'i').test(text(el)));
       const items = Array.from(card.querySelectorAll('li,[role="listitem"],[data-profile-intro-item]')).filter(visible).map(text).filter(Boolean);
-      const firstDetails = Array.from(card.querySelectorAll('ul,[role="list"],li,[role="listitem"],[data-profile-intro-item]')).find(visible);
+      // Some profiles render the Intro rows without list roles. The first
+      // detail icon also bounds the standalone bio above the rows.
+      const firstDetails = Array.from(card.querySelectorAll('ul,[role="list"],li,[role="listitem"],[data-profile-intro-item],svg,img,i[style]'))
+        .find(el => visible(el) && !heading.contains(el)
+          && !!(heading.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
       const before = edit ?? firstDetails;
       const preceding = Array.from(card.querySelectorAll('div[dir="auto"],span[dir="auto"]')).filter(el =>
         visible(el) && !el.contains(heading) && !heading.contains(el) && !el.closest('a,button,[role="button"],li,[role="listitem"]') &&
         !!before && !!(el.compareDocumentPosition(before) & Node.DOCUMENT_POSITION_FOLLOWING) && !el.contains(before) && !!text(el));
       const leaves = preceding.filter(el => !preceding.some(other => el !== other && el.contains(other)));
       const bio = bioRows.length === 1 ? text(bioRows[0]) : (intro.length || edit) && leaves.length === 1 ? text(leaves[0]) : undefined;
-      const fallback = !intro.length && !items.length ? text(card).split(/\n+/).map(value => value.trim()).filter(value => value &&
-        value !== text(heading) && value !== bio && !/^(?:xem thêm|see more|chỉnh sửa|edit)$/i.test(value)) : [];
+      const bioLines = new Set(bio?.split(/\n+/).map(line => line.trim()));
+      const fallback = !items.length ? text(card).split(/\n+/).map(value => value.trim()).filter(value => value &&
+        value !== text(heading) && !bioLines.has(value)
+        && !/^(?:xem thêm|see more|thu gọn|see less|chỉnh sửa|edit)$/i.test(value)) : [];
       return { bio: bio || undefined, intro: [...new Set([...items, ...fallback])].filter(value => value.length <= 2000).slice(0, 40) };
     }, { headingSelector: displayedHeading, introPattern: INTRO.source, personalPattern: PERSONAL.source, editPattern: BIO_EDIT.source });
 }
 
 const SECTION_HEADINGS: Record<Section['key'], RegExp> = {
   overview: /^(?:Giới thiệu|Tổng quan|Thông tin cá nhân|Công việc|Học vấn|Giáo dục|Nơi từng sống|Thông tin liên hệ|Trang web|Danh mục|About|Overview|Personal information|Work|Education|Places lived|Contact info|Website|Category)$/i,
-  work_and_education: /^(?:Công việc và học vấn|Công việc|Học vấn|Giáo dục|Trường trung học|Đại học|Work and education|Work|Education|High school|College|University)$/i,
-  places: /^(?:Nơi từng sống|Nơi đã sống|Tỉnh\/Thành phố hiện tại và quê quán|Places lived|Places you've lived|Current city and hometown)$/i,
-  contact_and_basic_info: /^(?:Thông tin liên hệ và cơ bản|Thông tin liên hệ|Thông tin cơ bản|Trang web và liên kết xã hội|Contact and basic info|Contact info|Basic info|Websites and social links)$/i,
+  work_and_education: /^(?:Công việc và học vấn|Công việc|Học vấn|Học tập|Giáo dục|Trường trung học|Trung học|Đại học|Work and education|Work|Education|High school|College|University)$/i,
+  places: /^(?:(?:Các )?Nơi (?:(?:từng|đã) )?sống|(?:Tỉnh\/)?Thành phố hiện tại và quê quán|Places lived|Places you've lived|Current city and hometown)$/i,
+  contact_and_basic_info: /^(?:Thông tin liên hệ và cơ bản|Thông tin liên hệ|Thông tin cơ bản|Thông tin cá nhân|Giới tính|Ngày sinh|Trang web và liên kết (?:mạng )?xã hội|Contact and basic info|Contact info|Basic info|Personal details|Gender|Birthday|Websites and social links)$/i,
   family_and_relationships: /^(?:Gia đình và các mối quan hệ|Gia đình|Thành viên gia đình|Mối quan hệ|Family and relationships|Family members|Relationship)$/i,
   details: /^(?:Chi tiết về .+|Giới thiệu về .+|Cách phát âm tên|Tên khác|Trích dẫn yêu thích|Details about .+|About .+|Name pronunciation|Other names|Favorite quotes)$/i,
   life_events: /^(?:Sự kiện trong đời|Sự kiện cuộc đời|Life events)$/i,
 };
 
-async function readSection(page: Page, key: Section['key']): Promise<Section['categories']> {
-  const headings = page.locator(`main :is(${displayedHeading}),[role="main"] :is(${displayedHeading})`).filter({ hasText: SECTION_HEADINGS[key] });
-  await headings.filter({ visible: true }).first().waitFor({ timeout: 2500 }).catch(() => undefined);
-  return evaluateProfilePage(page, ({ headingSelector, pattern }) => {
+async function readSection(page: Page, key: Section['key'], directoryHref?: string, activeTabHref?: string): Promise<Section['categories']> {
+  const headings = page.locator(`main :is(${displayedHeading}),[role="main"] :is(${displayedHeading})`);
+  const ready = directoryHref ? headings.and(page.locator('section *')) : headings.filter({ hasText: SECTION_HEADINGS[key] });
+  await ready.filter({ visible: true }).first().waitFor({ timeout: 3000 }).catch(() => undefined);
+  const read = () => evaluateProfilePage(page, ({ headingSelector, pattern, directoryHref, activeTabHref }) => {
     const nodes = [...new Set(Array.from(document.querySelectorAll('main,[role="main"]')).flatMap(main => Array.from(main.querySelectorAll(headingSelector))))];
     const visible = (element: Element) => element.getClientRects().length && !element.closest('[aria-hidden="true"],[hidden],nav,[role="navigation"]');
     const read = (element: Element) => (element as HTMLElement).innerText.trim();
     const known = new RegExp(pattern, 'i');
-    const matching = nodes.filter(el => visible(el) && known.test(read(el)) && !el.closest('a,button,[role="tab"],[role="button"]'));
+    const directoryTab = directoryHref && Array.from(document.querySelectorAll<HTMLAnchorElement>('a[role="tab"][href]'))
+      .find(tab => tab.href === directoryHref && visible(tab));
+    let directoryPanel: Element | undefined;
+    if (directoryTab) {
+      for (let el = directoryTab.parentElement; el && !el.matches('main,[role="main"],body'); el = el.parentElement) {
+        if (nodes.some(heading => visible(heading) && el.contains(heading) && heading.closest('section'))) {
+          directoryPanel = el;
+          break;
+        }
+      }
+    }
+    const matching = nodes.filter(el => visible(el) && !el.closest('a,button,[role="tab"],[role="button"]')
+      && (directoryPanel ? directoryPanel.contains(el) && !!el.closest('section') : known.test(read(el))));
     const categories = new Map<string, Set<string>>();
+    document.querySelectorAll('[data-ss-profile-more]').forEach(element => element.removeAttribute('data-ss-profile-more'));
+    const markMore = (field?: Element) => {
+      for (const button of Array.from(field?.querySelectorAll('button,[role="button"]') ?? [])) {
+        const label = button.getAttribute('aria-label') || read(button);
+        if (visible(button) && !button.closest('form,a,[role="dialog"]') && button.getAttribute('aria-expanded') !== 'true'
+          && !button.hasAttribute('data-ss-profile-more-tried')
+          && /^(?:xem thêm|hiển thị thêm|see more|show more)$/i.test(label.trim())) button.setAttribute('data-ss-profile-more', '1');
+      }
+    };
+    const fieldLines = (field: Element, label: string) => read(field).split(/\n+/).map(line => line.trim()).filter(line =>
+      line && line !== label && line.length <= 2000
+      && !/^(?:công khai|chỉ mình tôi|bạn bè|public|only me|friends|xem thêm|hiển thị thêm|see more|show more|thu gọn|see less|thêm|add|chỉnh sửa|edit)$/i.test(line));
+    const store = (label: string, values: string[]) => {
+      if (!label || label.length > 250 || !values.length) return;
+      const prior = categories.get(label) ?? new Set<string>();
+      for (const value of values) {
+        if (!/^(?:không có|chưa có|no ).*(?:để hiển thị|to show)[.!]?$/i.test(value)) prior.add(value);
+      }
+      categories.set(label, prior);
+    };
     for (const heading of matching.filter(el => !matching.some(other => el !== other && el.contains(other)))) {
       const label = read(heading);
       let scope = heading.parentElement;
+      let field: Element | undefined;
       let values: string[] = [];
       while (scope && !scope.matches('main,[role="main"],body')) {
-        if (scope.querySelector('article,[role="article"],nav,[role="navigation"]')) break;
+        if (scope.querySelector('article,[role="article"],nav,[role="navigation"],[role="tab"]')) break;
         const otherHeading = Array.from(scope.querySelectorAll(headingSelector)).some(other => visible(other) && !other.contains(heading) && !heading.contains(other));
         if (otherHeading) break;
-        const content = read(scope).split(/\n+/).map(line => line.trim()).filter(line => line && line !== label && line.length <= 2000
-          && !/^(?:công khai|chỉ mình tôi|bạn bè|public|only me|friends|xem thêm|see more|thêm|add|chỉnh sửa|edit)$/i.test(line));
+        field = scope;
+        const content = fieldLines(scope, label);
         if (content.length) values = content;
         if (scope.matches('section,[role="region"],[data-profile-category]')) break;
         scope = scope.parentElement;
       }
-      if (label.length > 250) continue;
-      const prior = categories.get(label) ?? new Set<string>();
-      for (const value of values) prior.add(value);
-      categories.set(label, prior);
+      markMore(field);
+      store(label, values);
+    }
+    if (!categories.size && activeTabHref) {
+      const active = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[role="tab"][href]')).find(tab => tab.href === activeTabHref
+        && visible(tab) && (tab.getAttribute('aria-selected') === 'true' || ['true', 'page'].includes(tab.getAttribute('aria-current') ?? '')));
+      const sidebar = active?.closest('[role="tablist"][aria-orientation="vertical"]')?.parentElement;
+      const companions = Array.from(sidebar?.parentElement?.children ?? []).filter(el =>
+        el !== sidebar && visible(el) && !el.querySelector('[role="tab"],nav,article,[role="article"]'));
+      if (active && companions.length === 1) {
+        const label = read(active);
+        markMore(companions[0]);
+        store(label, fieldLines(companions[0], label));
+      }
     }
     return [...categories].slice(0, 30).map(([label, values]) => ({ label, values: [...values].slice(0, 100) }));
-  }, { headingSelector: displayedHeading, pattern: SECTION_HEADINGS[key].source });
+  }, { headingSelector: displayedHeading, pattern: SECTION_HEADINGS[key].source, directoryHref, activeTabHref });
+  let categories = await read();
+  const location = page.url();
+  for (let pass = 0; pass < 5; pass++) {
+    const more = page.locator('[data-ss-profile-more]:visible').first();
+    if (!await more.count()) break;
+    await more.evaluate(element => element.setAttribute('data-ss-profile-more-tried', '1'), undefined, { timeout: 900 }).catch(() => undefined);
+    if (!await more.click({ timeout: 900 }).then(() => true, () => false)) break;
+    await page.waitForTimeout(350);
+    if (page.url() !== location) break;
+    const expanded = await read();
+    if (expanded.length) categories = expanded;
+  }
+  return categories;
 }
 
 function aboutUrl(profile: URL, key: Section['key']) {
@@ -182,20 +245,52 @@ export function profilePageKey(url: URL) {
   return (path.match(/^\/people\/[^/]+\/(\d+)$/)?.[1] ?? path.match(/^\/([\w.]+)$/)?.[1] ?? '').toLowerCase();
 }
 
+function aboutRoute(value: string, profile: URL, aliases: ReadonlySet<string>) {
+  const url = new URL(value);
+  if (url.origin !== profile.origin) return;
+  const path = url.pathname.replace(/\/$/, '');
+  const route = url.searchParams.get('sk') ?? path.split('/').at(-1);
+  if (!route || !/^(?:about(?:_[a-z_]+)?|directory_personal_details)$/.test(route)) return;
+  if (path.endsWith('/' + route)) url.pathname = path.slice(0, -route.length - 1) || '/';
+  if (aliases.has(profilePageKey(url))) return route;
+}
+
 /** Confirm that navigation kept the same profile and landed on the requested About tab. */
 export async function readProfileSections(page: Page, profile: URL, aliases: ReadonlySet<string>, assertSession: () => Promise<void>) {
+  const open = async (href: string) => {
+    const response = await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => null);
+    await assertSession();
+    return response?.ok() ? aboutRoute(page.url(), profile, aliases) : undefined;
+  };
+  const links = () => page.locator('a[role="tab"][href]:visible').evaluateAll(elements =>
+    elements.map(element => ({ href: (element as HTMLAnchorElement).href,
+      selected: element.getAttribute('aria-selected') === 'true' || ['true', 'page'].includes(element.getAttribute('aria-current') ?? '') })));
+  const homeAbout = (await links()).find(link => aboutRoute(link.href, profile, aliases) === 'about');
+  const firstRoute = await open(homeAbout?.href ?? aboutUrl(profile, 'overview').href);
+  const firstUrl = page.url();
+  if (firstRoute) {
+    await page.locator('a[role="tab"][href*="about_"],a[role="tab"][href*="directory_personal_details"]')
+      .filter({ visible: true }).first().waitFor({ timeout: 2500 }).catch(() => undefined);
+  }
+  const tabs = new Map((await links()).flatMap(link => {
+    const route = aboutRoute(link.href, profile, aliases);
+    return route ? [[route, link] as const] : [];
+  }));
+  const directory = tabs.get('directory_personal_details');
+  const discoverable = [...tabs.keys()].some(route => route !== 'about');
   const sections: Section[] = [];
   for (const key of PROFILE_ABOUT_SECTIONS) {
-    const expected = aboutUrl(profile, key);
-    const response = await page.goto(expected.href, { waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => null);
-    await assertSession();
-    const opened = new URL(page.url());
-    const path = opened.pathname.replace(/\/$/, '');
-    const tab = key === 'overview' ? 'about' : 'about_' + key;
-    const isTab = opened.searchParams.get('sk') === tab || path.endsWith('/' + tab);
-    if (isTab) opened.pathname = path.replace(new RegExp('/' + tab + '$'), '');
-    const categories = response?.ok() && opened.origin === profile.origin && isTab && aliases.has(profilePageKey(opened))
-      ? await readSection(page, key) : [];
+    let categories: Section['categories'] = [];
+    const tab = 'about_' + key;
+    if (key === 'overview' && (firstRoute === 'about' || firstRoute === 'about_overview') && !directory) {
+      categories = await readSection(page, key, undefined, tabs.get('about_overview')?.href);
+    } else if (key === 'contact_and_basic_info' && directory) {
+      const route = directory.selected && page.url() === firstUrl && firstRoute ? firstRoute : await open(directory.href);
+      if (route === 'about' || route === 'directory_personal_details') categories = await readSection(page, key, directory.href);
+    } else if (key !== 'overview' && (tabs.has(tab) || !discoverable)) {
+      const route = await open(tabs.get(tab)?.href ?? aboutUrl(profile, key).href);
+      if (route === tab) categories = await readSection(page, key, undefined, tabs.get(tab)?.href);
+    }
     sections.push({ key, status: categories.length ? 'VISIBLE' : 'UNAVAILABLE', categories });
   }
   return sections;

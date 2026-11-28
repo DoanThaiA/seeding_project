@@ -1,7 +1,7 @@
 import { FbWebPublishConnector, fbWebOptionsFromEnv } from '@seedingsys/connectors-fb-web';
-import { COMMENT_PREVIEW_KIND, COMMENT_PREVIEW_MS, CommentPostSnapshot, TARGET_HEALTH_KIND, TARGET_HEALTH_TEXT,
+import { COMMENT_PREVIEW_KIND, COMMENT_PREVIEW_MS, CommentPostSnapshot, Q, TARGET_HEALTH_KIND, TARGET_HEALTH_TEXT,
   type TargetHealthResult, type TargetHealthState } from '@seedingsys/contracts';
-import { accountResource, acquireLease, activeKillSwitch, audit, json, releaseLease } from '@seedingsys/db';
+import { accountResource, acquireLease, activeKillSwitch, audit, enqueue, json, releaseLease, tx } from '@seedingsys/db';
 import { facebookScriptPost } from '@seedingsys/domain';
 import type { BrowserCtx } from '../ctx';
 import { withTimeout } from '../runtime/timeout';
@@ -23,7 +23,14 @@ export async function handleTargetBrowser(ctx: BrowserCtx, runId: string, nodeId
     ttlMs: preview ? COMMENT_PREVIEW_MS : 55 * 60_000 });
   try {
     if (+clock.now() - +run.createdAt >= (preview ? COMMENT_PREVIEW_MS : 60 * 60_000)) throw new Error('Yêu cầu đã hết thời gian.');
-    if (!lease) throw new Error('Hồ sơ trình duyệt đang được sử dụng. Thử lại sau.');
+    if (!lease) {
+      await tx(db, async t => {
+        const queued = await t.targetBrowserRun.updateMany({ where: { ...where, status: 'RUNNING' },
+          data: { status: 'QUEUED', message: 'Đang chờ phiên trình duyệt xử lý xong lượt trước.' } });
+        if (queued.count) await enqueue(t, Q.TargetBrowser, { runId }, { startAfter: new Date(+clock.now() + 30_000) });
+      });
+      return;
+    }
     if (target.connector !== 'fb-web' || (target.profile?.workerNodeId && target.profile.workerNodeId !== nodeId))
       throw new Error('Cần chạy trên máy worker đang giữ hồ sơ Facebook của tài khoản này.');
     if (preview) {

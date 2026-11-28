@@ -13,6 +13,7 @@ export const FB_WEB_PUBLISH_FORMATS: readonly ContentType[] = ['TEXT', 'QUOTE_IM
 export const FAKE_PUBLISH_FORMATS: readonly ContentType[] = ['TEXT', 'QUOTE_IMAGE', 'SINGLE_PHOTO', 'MULTI_PHOTO', 'VIDEO'];
 export const COMMENT_READERS: readonly string[] = ['fb-public', 'fb-session', 'fb-graph'];
 export const COMMENT_STALL_MS = 5 * 60_000;
+export const FB_COMMENT_READ_MS = 6 * 60_000;
 /** How long a queued comment may wait (behind its parent and other comments) before the send has to be repeated. */
 export const COMMENT_QUEUE_MS = 20 * 60_000;
 export const COMMENT_SENDABLE_STATUSES: readonly string[] = ['DRAFT', 'APPROVED', 'FAILED'];

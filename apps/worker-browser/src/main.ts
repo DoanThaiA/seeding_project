@@ -18,6 +18,7 @@ import { handleCommentPublish } from './handlers/comment-publish';
 import { handleTargetBrowser } from './handlers/target-browser';
 import { handleCommentScriptStep } from './handlers/comment-script';
 import { handleProfileSync } from './handlers/profile-sync';
+import { handleSourceProfileScan } from './handlers/source-profile-scan';
 import { handleProfileArtwork } from './handlers/profile-artwork';
 import { handleApplyProfileArtwork } from './handlers/apply-profile-artwork';
 import { handleApplyProfileBio, handleProfileDetails } from './handlers/profile-details';
@@ -79,7 +80,8 @@ async function main() {
   };
 
   await work(boss, Q.TargetBrowser, cfg.COLLECTOR_CONCURRENCY, log, (p, job) => collectors.run(() => handleTargetBrowser(ctx, p.runId, node.id, job.retryCount)));
-  await work(boss, Q.SourcePoll, cfg.COLLECTOR_CONCURRENCY, log, (p) => retryable(() => collectors.run(() => handleSourcePoll(ctx, p))));
+  await work(boss, Q.SourcePoll, cfg.COLLECTOR_CONCURRENCY, log, (p, job) => retryable(() => collectors.run(() => handleSourcePoll(ctx, p, job.retryCount))));
+  await work(boss, Q.SourceProfileScan, 1, log, (p, job) => retryable(() => collectors.run(() => handleSourceProfileScan(ctx, p, job.retryCount))));
   await work(boss, Q.CommentScan, 1, log, (p, job) => retryable(() => collectors.run(() => handleCommentScan(ctx, p, job.retryCount))));
   await work(boss, Q.CommentPublish, 1, log, (p, job) => retryable(() => publishers.run(() => handleCommentPublish(ctx, p, job.retryCount))));
   await work(boss, Q.CommentScriptStep, 1, log, (p, job) => retryable(() => publishers.run(() => handleCommentScriptStep(ctx, p, job.retryCount))));

@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FbPublicReadConnector } from '@seedingsys/connectors-fb-web';
+import { SOURCE_POLL_BUSY_RETRIES } from '@seedingsys/contracts';
 import { accountResource, acquireLease, dispatchBacklogItem, editBacklogCaption, freezeSnapshot, ingestPost, releaseLease } from '@seedingsys/db';
 import { handleSourcePoll } from '../../apps/worker-browser/src/handlers/source-poll';
 import { handleCommentScan } from '../../apps/worker-browser/src/handlers/comment-scan';
 import { LibraryController } from '../../apps/api/src/library.controller';
 import { ProfileArtworkController } from '../../apps/api/src/profile-artwork.controller';
+import { SourceProfileScanController } from '../../apps/api/src/source-profile-scan.controller';
 import { handleProfileArtwork } from '../../apps/worker-browser/src/handlers/profile-artwork';
 import { handleApplyProfileArtwork } from '../../apps/worker-browser/src/handlers/apply-profile-artwork';
 import { createHarness, cycle, MIN, pubsOf, type Harness } from '../helpers/harness';
@@ -40,6 +42,37 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     await h.close();
   });
 
+  it.each(['complete', 'blocked', 'rotated'] as const)('opens every comment page and nested reply in a %s thread', async mode => {
+    const archived = mode === 'rotated';
+    const text = 'Bài có nhiều trang bình luận';
+    mock.posts = [{ id: 'pfbidPAGINATED', text, commentPagination: mode === 'blocked' ? 'blocked' : 'complete', archivedCommentThread: archived }];
+    const reader = h.browser.registry.reader('fb-public');
+    const result = await reader.readComments!(
+      { id: h.ids.sources.A1, code: 'A1', externalRef: 'https://www.facebook.com/profile.php?id=' + mock.userId },
+      { externalId: 'pfbidPAGINATED', permalink: 'https://www.facebook.com/' + mock.userId + '/posts/pfbidPAGINATED',
+        identity: archived ? { text, mediaRefs: ['fb-public:pfbidPAGINATED:image:234567'] } : undefined },
+      async () => {},
+    );
+    expect(result.comments.map(c => [c.externalId, c.parentExternalId ?? null]).sort()).toEqual([
+      ['201', null], ['202', null], ['203', null], ['204', '201'], ['205', '201'], ['206', '204'], ['207', null],
+    ]);
+    expect(result).toMatchObject({ expectedCount: 7, complete: mode !== 'blocked' });
+    if (mode === 'blocked') expect(result.detail).toContain('còn nút tải thêm');
+  }, 65_000);
+
+  it('follows the archived video’s comment panel outside the player and skips the suggested video', async () => {
+    mock.posts = [{ id: 'pfbidVIDEO', playbackVideoId: '6600', text: 'Video cũ', comments: true, archivedCommentThread: true }];
+    const result = await h.browser.registry.reader('fb-public').readComments!(
+      { id: h.ids.sources.A1, code: 'A1', externalRef: 'https://www.facebook.com/profile.php?id=' + mock.userId },
+      { externalId: '6600', permalink: 'https://www.facebook.com/reel/6600/', contentType: 'VIDEO' },
+      async () => {},
+    );
+    expect(result).toMatchObject({ expectedCount: 4, complete: true });
+    expect(result.comments.map(c => [c.externalId, c.parentExternalId ?? null]).sort()).toEqual([
+      ['105', null], ['106', '105'], ['107', null], ['108', null],
+    ]);
+  }, 40_000);
+
   it('caps a timeline poll, its comment tasks and the profile history read', async () => {
     const sourceId = h.ids.sources.A1;
     await h.db.source.update({ where: { id: sourceId }, data: { pollPostLimit: 2 } });
@@ -58,6 +91,85 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     expect(await handleSourcePoll(h.browser, { sourceId, history: { targetId: h.ids.targets.B1 } })).toMatchObject({ outcome: 'OK' });
     expect(await h.db.sourcePost.count({ where: { sourceId } })).toBe(4);
   }, 45_000);
+
+  it('limits a one-post poll to that post’s comments while leaving comment catch-up to uncapped polls', async () => {
+    const sourceId = h.ids.sources.A1;
+    await h.db.$transaction(t => ingestPost(t, {
+      sourceId, connector: 'fb-public', baseline: false, archiveOnly: true, actor: 'test', now: h.clock.now(),
+      post: { externalId: 'pfbidOLDER', permalink: `https://www.facebook.com/${mock.userId}/posts/pfbidOLDER`,
+        text: 'Bài cũ chưa quét bình luận', identityConfidence: 'HIGH', contentType: 'TEXT',
+        isPinned: false, isShared: false, incomplete: [], media: [] },
+    }));
+    await h.db.source.update({ where: { id: sourceId }, data: { pollPostLimit: 1, collectComments: true } });
+    mock.posts = [{ id: 'pfbidNEWEST', text: 'Bài thuộc lượt quét này' }];
+
+    expect(await handleSourcePoll(h.browser, { sourceId, collectComments: true })).toMatchObject({ outcome: 'OK', counts: { NEW_POST: 1 } });
+    const scans = () => h.db.commentScan.findMany({ select: { post: { select: { externalId: true } } } });
+    expect(await scans()).toEqual([{ post: { externalId: 'pfbidNEWEST' } }]);
+
+    await h.db.source.update({ where: { id: sourceId }, data: { pollPostLimit: null } });
+    await handleSourcePoll(h.browser, { sourceId, scheduled: true });
+    expect((await scans()).map(x => x.post.externalId).sort()).toEqual(['pfbidNEWEST', 'pfbidOLDER']);
+  }, 45_000);
+
+  it('archives one profile with its artwork, full album, video and threaded comments under the chosen A', async () => {
+    const sourceId = h.ids.sources.A1;
+    await h.db.source.update({ where: { id: sourceId }, data: { enabled: false, collectComments: false, pollPostLimit: 1 } });
+    const other = await h.db.source.create({ data: { code: 'A2', name: 'Nguồn khác', connector: 'manual', externalRef: 'other' } });
+    mock.archiveFixture = true;
+    mock.directoryAbout = true;
+    mock.profileArtwork = { avatar: '111', cover: '222' };
+    mock.latePostsStart = 1;
+    mock.posts = [
+      { id: 'pfbidALBUM', text: 'Album của A1', photos: 2, more: 2, gallery: true, emptyComments: true },
+      { id: 'pfbidVIDEO', text: 'Video của A1', video: true, playable: true, emptyComments: true },
+      { id: 'pfbidTHREAD', text: 'Bài có nhiều cấp phản hồi', comments: true, structuredComments: true, nestedReply: true, lazyCommentPage: true },
+      { id: 'pfbidREEL', text: 'Reel của A1', playbackVideoId: '6600', video: true, comments: true },
+      { id: 'pfbidOTHER', text: 'Bài người khác đăng trên tường', author: 'Người khác' },
+    ];
+    const controller = new SourceProfileScanController(h.db, h.clock);
+    const actor = { actor: 'fixture', role: 'admin' as const };
+    expect(await controller.get(sourceId)).toEqual({ scan: null });
+    const [first, duplicate] = await Promise.all([controller.start(sourceId, actor), controller.start(sourceId, actor)]);
+    expect(first.scanId).toBe(duplicate.scanId);
+    expect([first.queued, duplicate.queued].sort()).toEqual([false, true]);
+    expect(await controller.get(sourceId)).toMatchObject({ scan: { active: true, status: 'PROFILE', snapshot: null } });
+    await h.drain();
+    expect(h.failures).toEqual([]);
+    const { scan } = await controller.get(sourceId);
+    expect(scan).toMatchObject({ status: 'PARTIAL', active: false, snapshot: { name: mock.owner, facebookId: mock.userId },
+      artwork: { avatar: expect.any(String), cover: expect.any(String) },
+      stats: { posts: 4, comments: 6, commentsComplete: 4, commentsPending: 0, mediaPending: 0, mediaMissing: 0, captionsMissing: 0 } });
+    expect(scan?.snapshot?.sections.find(section => section.key === 'contact_and_basic_info')).toEqual({
+      key: 'contact_and_basic_info', status: 'VISIBLE', categories: [
+        { label: 'Giới tính', values: ['Giá trị hiển thị', 'Chi tiết mở rộng'] }, { label: 'Nơi từng sống', values: [] },
+      ],
+    });
+    expect(await h.db.sourceProfileScan.findUniqueOrThrow({ where: { id: first.scanId } })).toMatchObject({ historyComplete: true });
+    expect(await controller.get(other.id)).toEqual({ scan: null });
+    expect(await h.db.sourcePost.count({ where: { sourceId: other.id } })).toBe(0);
+    expect(await h.db.targetAccount.findUniqueOrThrow({ where: { id: h.ids.targets.B1 } })).toMatchObject({ profileDetails: null });
+    expect(await h.db.contentVariant.count()).toBe(0);
+    expect(await h.db.publication.count()).toBe(0);
+    expect(await h.db.publicationComment.count()).toBe(0);
+    const assets = await h.db.asset.findMany();
+    expect(assets.filter(asset => asset.mime === 'image/png')).toHaveLength(6);
+    expect(assets.filter(asset => asset.mime === 'video/mp4')).toHaveLength(2);
+    for (const a of assets) expect((await h.media.store.get(a.objectKey!)).length).toBeGreaterThan(0);
+    const comments = await h.db.sourceComment.findMany({ orderBy: { externalId: 'asc' } });
+    expect(comments.map(c => [c.externalId, c.parentExternalId])).toEqual(
+      [['101', null], ['102', '101'], ['103', '102'], ['104', null], ['105', null], ['106', '105']]);
+    expect(comments.every(c => c.archiveOnly)).toBe(true);
+
+    // A rerun that loses access to portions of the profile keeps the archive already stored.
+    h.advance(MIN);
+    await controller.start(sourceId, actor);
+    expect(await controller.get(sourceId)).toMatchObject({ scan: { active: true, snapshot: { name: mock.owner }, artwork: scan!.artwork } });
+    mock.session = 'LOGGED_OUT';
+    await h.drain();
+    expect(await controller.get(sourceId)).toMatchObject({ scan: { active: false, status: 'FAILED', snapshot: { name: mock.owner }, artwork: scan!.artwork } });
+    expect(await h.db.sourcePost.count({ where: { sourceId } })).toBe(4);
+  }, 90_000);
 
   it('keeps scrolling to reach the configured limit after a card without a permalink pulls the page back', async () => {
     const sourceId = h.ids.sources.A1;
@@ -320,10 +432,13 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
     const post = await h.db.sourcePost.findFirstOrThrow({ where: { externalId: 'pfbidCURRENT' } });
     await h.db.sourcePostAlias.create({ data: { sourceId: h.ids.sources.A1, sourcePostId: post.id, externalId: 'pfbidKNOWN' } });
     const library = new LibraryController(h.db, h.clock);
-    await handleCommentScan(h.browser, await library.queueComments(post.id, { role: 'admin', actor: 'test-library' }));
+    await library.queueComments(post.id, { role: 'admin', actor: 'test-library' }, { archiveOnly: true });
+    await h.drain();
     const detail = await library.detail(post.id);
     expect(detail.scan).toMatchObject({ status: 'COMPLETE', readCount: 2 });
     expect(detail.comments.map(c => c.externalId)).toEqual(['101', '102']);
+    expect(await h.db.sourceComment.count({ where: { sourcePostId: post.id, archiveOnly: true } })).toBe(2);
+    expect(await h.db.publicationComment.count({ where: { source: { sourcePostId: post.id } } })).toBe(0);
   });
 
   it('shows posts by profile, archives a deduplicated comment tree, and requires a parent on the destination', async () => {
@@ -396,10 +511,23 @@ describe.skipIf(!browser)('guest Facebook source → B1', () => {
       await h.db.browserProfile.update({ where: { targetId }, data: { workerNodeId: null } });
       const lock = await acquireLease(h.db, { resource: accountResource(targetId), holder: 'publishing', ttlMs: MIN, now: h.clock.now() });
       expect(lock).toBeTruthy();
-      expect((await handleSourcePoll(h.browser, { sourceId })).outcome).toBe('READ_ERROR');
+      const requestedAt = h.clock.now();
+      await h.db.source.update({ where: { id: sourceId }, data: { lastPollAt: requestedAt } });
+      const job = { sourceId, scheduled: true, requestedAt: requestedAt.toISOString() };
+      expect((await handleSourcePoll(h.browser, job)).outcome).toBe('WAITING_FOR_ACCOUNT');
+      await expect(handleSourcePoll(h.browser, job, 0)).rejects.toThrow('Phiên B1 đang bận');
+      expect(await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).toMatchObject({
+        lastPollAt: requestedAt, lastError: null, lastErrorAt: null,
+      });
+      const newer = new Date(+requestedAt + 1);
+      await h.db.source.update({ where: { id: sourceId }, data: { lastPollAt: newer } });
+      await handleSourcePoll(h.browser, job, SOURCE_POLL_BUSY_RETRIES);
+      expect((await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).lastPollAt).toEqual(newer);
+      await handleSourcePoll(h.browser, { ...job, requestedAt: newer.toISOString() }, SOURCE_POLL_BUSY_RETRIES);
+      expect((await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).lastPollAt).toBeNull();
       expect(mock.timelineRequests).toHaveLength(0);
       await releaseLease(h.db, lock!, h.clock.now());
-      const scanned = await handleSourcePoll(h.browser, { sourceId });
+      const scanned = await handleSourcePoll(h.browser, job, 1);
       expect(scanned.outcome, (await h.db.source.findUniqueOrThrow({ where: { id: sourceId } })).lastError ?? '').toBe('OK');
       await h.drain();
       expect(await h.db.sourcePost.findMany({ select: { externalId: true } })).toEqual([{ externalId: 'pfbidOWNER' }]);

@@ -40,7 +40,7 @@ export interface SourceRef {
   externalRef: string;
   retryPermalinks?: string[];
   exactPermalinks?: string[];
-  history?: { cursor?: string };
+  history?: { cursor?: string; archive?: boolean };
   /** Maximum posts returned by a regular poll, including any re-reads. */
   maxPosts?: number;
   readAccount?: Pick<TargetRef, 'code' | 'externalId' | 'profileDir'>;
@@ -109,9 +109,13 @@ export interface ReadConnector {
   readonly version: string;
   /** Read new posts plus a bounded overlap before the watermark. Throws ConnectorError when the source cannot be read. */
   readSince(source: SourceRef, watermark: Record<string, unknown> | null, overlap: number): Promise<ReadResult>;
-  readComments?(source: SourceRef, post: { externalId: string; permalink?: string; aliases?: string[] },
+  readComments?(source: SourceRef, post: {
+    externalId: string; permalink?: string; aliases?: string[]; contentType?: ContentType; knownCommentIds?: string[];
+    identity?: { text: string; mediaRefs: string[]; postedAt?: Date };
+  },
     onProgress: (readCount: number, expectedCount?: number) => Promise<void>): Promise<ReadCommentsResult>;
   readProfileArtwork?(source: SourceRef): Promise<{ avatar: ProfileImage; cover: ProfileImage }>;
+  readArchiveProfileArtwork?(source: SourceRef): Promise<Partial<Record<'avatar' | 'cover', ProfileImage>>>;
   readProfileDetails?(source: SourceRef): Promise<import('@seedingsys/contracts').ProfileDetailsSnapshot>;
   /** Fetch media bytes the organisation is permitted to store. */
   fetchMedia(media: { ref: string; sourceUrl?: string | null }): Promise<{ bytes: Buffer; mime: string }>;

@@ -1,6 +1,10 @@
 import { z } from 'zod';
 
 export const PROFILE_SCAN_TIMEOUT_MS = 5 * 60_000;
+export const SOURCE_PROFILE_SCAN_STEP_MS = 12 * 60_000;
+export const SOURCE_PROFILE_SCAN_SETTLE_MS = 30 * 60_000;
+
+export const SourceProfileArtwork = z.object({ avatar: z.string().uuid().optional(), cover: z.string().uuid().optional() });
 export const PROFILE_ABOUT_SECTIONS = [
   'overview', 'work_and_education', 'places', 'contact_and_basic_info', 'family_and_relationships', 'details', 'life_events',
 ] as const;

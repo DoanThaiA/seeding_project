@@ -14,14 +14,14 @@ export async function dispatchAutomaticComments(ctx: CoreCtx): Promise<number> {
     LEFT JOIN publication_slots slot ON slot.id=p.slot_id
     LEFT JOIN publication_schedules calendar ON calendar.id=slot.schedule_id
     LEFT JOIN LATERAL (
-      SELECT status FROM comment_scans WHERE source_post_id=sp.id ORDER BY created_at DESC,id DESC LIMIT 1
+      SELECT status FROM comment_scans WHERE source_post_id=sp.id AND source_profile_scan_id IS NULL ORDER BY created_at DESC,id DESC LIMIT 1
     ) scan ON true
     WHERE p.status='PUBLISHED_VERIFIED' AND p.auto_replay_comments AND p.permalink IS NOT NULL
       AND calendar.stopped_at IS NULL AND (s.enabled OR (calendar.id IS NOT NULL AND scan.status='COMPLETE'))
       AND ((scan.status IS NULL AND s.collect_comments) OR (scan.status='COMPLETE' AND EXISTS (
         SELECT 1 FROM source_comments c
         LEFT JOIN publication_comments r ON r.source_comment_id=c.id AND r.destination_id=p.target_id
-        WHERE c.source_post_id=sp.id AND length(trim(c.text))>0
+        WHERE c.source_post_id=sp.id AND NOT c.archive_only AND length(trim(c.text))>0
           AND (r.id IS NULL OR (r.status='DRAFT' AND (r.author_target_id IS NULL OR r.auto_author) AND r.text=c.text))
           AND (c.parent_external_id IS NULL OR EXISTS (
             SELECT 1 FROM source_comments parent
@@ -55,7 +55,8 @@ export async function dispatchAutomaticComments(ctx: CoreCtx): Promise<number> {
       if (!source || await activeKillSwitch(t, { sourceId: source.id, targetId: p.targetId, connector: 'fb-web' })) return 0;
       const current = await t.sourcePost.findUnique({ where: { id: p.sourcePostId }, select: { archivedAt: true, permalink: true } });
       if (!current || current.archivedAt || (!current.permalink && source.connector !== 'fb-graph')) return 0;
-      const scan = await t.commentScan.findFirst({ where: { sourcePostId: p.sourcePostId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] });
+      const scan = await t.commentScan.findFirst({ where: { sourcePostId: p.sourcePostId, sourceProfileScanId: null },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] });
       if (!source.enabled && (!calendar || scan?.status !== 'COMPLETE')) return 0;
       const now = ctx.clock.now();
       if (!scan) {
@@ -65,9 +66,9 @@ export async function dispatchAutomaticComments(ctx: CoreCtx): Promise<number> {
         return 1;
       }
       if (scan.status !== 'COMPLETE') return 0;
-      await prepareCommentDrafts(t, p.sourcePostId, [p.targetId], now);
+      await prepareCommentDrafts(t, p.sourcePostId, [p.targetId], now, { automatic: true });
       const rows = await t.publicationComment.findMany({
-        where: { destinationId: p.targetId, source: { sourcePostId: p.sourcePostId } },
+        where: { destinationId: p.targetId, source: { sourcePostId: p.sourcePostId, archiveOnly: false } },
         include: { source: true }, orderBy: [{ source: { position: 'asc' } }, { id: 'asc' }],
       });
       if (rows.some(r => r.status === 'QUEUED' || r.status === 'SENDING' || r.status === 'UNKNOWN')) return 0;

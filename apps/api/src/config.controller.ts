@@ -1,7 +1,7 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, Inject, NotFoundException, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
 import { z } from 'zod';
 import { MAX_POLL_POSTS, Q, TARGET_HEALTH_KIND, TARGET_HEALTH_MS, TargetHealthResult } from '@seedingsys/contracts';
-import { activeKillSwitch, activeLease, audit, enqueue, Prisma, sourceResource, tx, type Db } from '@seedingsys/db';
+import { activeKillSwitch, activeLease, audit, enqueue, Prisma, profileScanBlocksPoll, sourceResource, tx, type Db } from '@seedingsys/db';
 import { facebookSourceUrl, isFacebookTimelineReader, type Clock } from '@seedingsys/domain';
 import { Roles, type Principal } from './auth';
 import { CLOCK, DB } from './tokens';
@@ -177,9 +177,13 @@ export class ConfigController {
       }
       const pending = await t.outboxEvent.findFirst({ where: { queue: Q.SourcePoll, singletonKey: id, publishedAt: null }, select: { id: true } });
       if (pending || await activeLease(t, sourceResource(id), now)) return { queued: false };
+      if (source.connector === 'fb-session' && +(source.lastPollAt ?? 0) > Math.max(+(source.lastSuccessAt ?? 0), +(source.lastErrorAt ?? 0))
+        && await profileScanBlocksPoll(t, id, now)) return { queued: false };
 
       await t.source.update({ where: { id }, data: { lastPollAt: now } });
-      await enqueue(t, Q.SourcePoll, { sourceId: id, collectComments: source.collectComments }, { singletonKey: id });
+      await enqueue(t, Q.SourcePoll, {
+        sourceId: id, collectComments: source.collectComments, requestedAt: now.toISOString(),
+      }, { singletonKey: id });
       await audit(t, { entityType: 'source', entityId: id, action: 'poll_requested', actor: a.actor, at: now });
       return { queued: true };
     });

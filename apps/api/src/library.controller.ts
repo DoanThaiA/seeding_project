@@ -349,7 +349,8 @@ export class LibraryController {
 
   @Post('posts/:id/comments/scan')
   @Roles('operator', 'reviewer')
-  async queueComments(@Param('id', ParseUUIDPipe) id: string, @Actor() actor: Principal) {
+  async queueComments(@Param('id', ParseUUIDPipe) id: string, @Actor() actor: Principal, @Body() body?: unknown) {
+    const { archiveOnly } = parse(z.object({ archiveOnly: z.boolean().optional() }), body ?? {});
     const now = this.clock.now();
     return tx(this.db, async t => {
       await t.$queryRaw`SELECT id FROM source_posts WHERE id=${id}::uuid FOR UPDATE`;
@@ -368,8 +369,9 @@ export class LibraryController {
       await t.commentScan.updateMany({ where: { sourcePostId: id, status: 'RUNNING', updatedAt: { lte: new Date(+now - COMMENT_STALL_MS) } },
         data: { status: 'FAILED', detail: 'Lượt quét trước đã hết thời gian.', updatedAt: now } });
       const scan = await t.commentScan.create({ data: { sourcePostId: id, requestedBy: actor.actor, updatedAt: now } });
-      await enqueue(t, Q.CommentScan, { scanId: scan.id, manual: true });
-      await audit(t, { entityType: 'source_post', entityId: id, action: 'comments_scan_requested', actor: actor.actor, at: now, data: { scanId: scan.id } });
+      await enqueue(t, Q.CommentScan, { scanId: scan.id, manual: true, archiveOnly });
+      await audit(t, { entityType: 'source_post', entityId: id, action: 'comments_scan_requested', actor: actor.actor, at: now,
+        data: { scanId: scan.id, ...(archiveOnly && { archiveOnly }) } });
       return { scanId: scan.id, queued: true };
     });
   }

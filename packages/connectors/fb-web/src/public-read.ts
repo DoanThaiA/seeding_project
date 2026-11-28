@@ -1,6 +1,6 @@
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core';
 import { ConnectorError, isConnectorError, type ReadCommentsResult, type ReadConnector, type ReadMedia, type ReadPost, type ReadResult, type SourceRef } from '@seedingsys/connectors-core';
-import type { IncompleteFlag, ProfileDetailsSnapshot } from '@seedingsys/contracts';
+import { FB_COMMENT_READ_MS, type IncompleteFlag, type ProfileDetailsSnapshot } from '@seedingsys/contracts';
 import { facebookSourceUrl, isAdvertisingLink, removeAdvertisingLinks, sha256 } from '@seedingsys/domain';
 import { fbTargetProfilePath, type FbWebOptions } from './config';
 import { CHECKPOINT_TEXT, sel, URLS } from './selectors';
@@ -18,6 +18,7 @@ const captionKey = (value: string) => value.normalize('NFKC')
   .replace(/[\p{Default_Ignorable_Code_Point}\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}\s…]/gu, '')
   .replace(/\.{3}$/, '').toLowerCase();
 const NO_POSTS = /^(?:no posts(?: to show| yet)?|không có bài viết(?: nào)?|chưa có bài viết(?: nào)?)[.!]?$/im;
+const END_OF_POSTS = /^(?:no more posts(?: to show)?|you(?:'ve| have) reached the end of (?:the )?(?:feed|timeline)|không còn bài viết(?: nào)?|bạn đã xem hết bài viết)[.!]?$/i;
 const MIME = /^(?:image\/(?:jpeg|png|gif|webp)|video\/mp4)$/;
 
 interface Card {
@@ -419,7 +420,8 @@ export class FbPublicReadConnector implements ReadConnector {
   async readSince(source: SourceRef, watermark: Record<string, unknown> | null, overlap: number): Promise<ReadResult> {
     const profile = facebookSourceUrl(source.externalRef);
     if (!profile) throw new ConnectorError('SOURCE_UNREADABLE', 'Nhập URL trang cá nhân hoặc fanpage trên facebook.com.');
-    const deadline = Date.now() + 105_000;
+    const archive = !!source.history?.archive;
+    const deadline = Date.now() + (archive ? 175_000 : 105_000);
     const account = this.key === 'fb-session' ? source.readAccount : undefined;
     if (this.key === 'fb-session' && !account) throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn chưa có tài khoản đích Facebook để đọc.');
     let browser: Browser | undefined;
@@ -441,10 +443,11 @@ export class FbPublicReadConnector implements ReadConnector {
       const accountIdentity = account ? await this.verifyReadAccount(page, account) : null;
       // Lịch sử cũng dừng ở giới hạn mỗi lượt quét của nguồn; không đặt giới hạn thì tối đa 150 bài một trang.
       const maxPosts = source.exactPermalinks ? undefined : source.maxPosts;
-      const limit = source.history ? Math.min(150, maxPosts ?? 150) : maxPosts ?? Math.min(100, Math.max(account ? 30 : 10, overlap));
+      const limit = archive ? Infinity
+        : source.history ? Math.min(150, maxPosts ?? 150) : maxPosts ?? Math.min(100, Math.max(account ? 30 : 10, overlap));
       const aliases = new Set([profileIdentity(profile)]);
-      const { posts: result, partial } = source.exactPermalinks ? { posts: [], partial: false }
-        : await this.readTimeline(page, profile, accountIdentity, account?.code, aliases, limit, deadline, !!source.history);
+      const { posts: result, partial, complete } = source.exactPermalinks ? { posts: [], partial: false, complete: false }
+        : await this.readTimeline(page, profile, accountIdentity, account?.code, aliases, limit, deadline, !!source.history, archive);
       const timelineIncomplete = partial && (maxPosts === undefined || result.length < maxPosts);
       const reread = source.exactPermalinks ?? source.retryPermalinks ?? [];
       const foundIds = new Set(result.map(item => item.post.externalId));
@@ -468,8 +471,8 @@ export class FbPublicReadConnector implements ReadConnector {
       }
       const newest = posts.reduce((max, p) => Math.max(max, p.postedAt?.getTime() ?? 0), typeof watermark?.newest === 'number' ? watermark.newest : 0);
       return { posts, nextWatermark: { newest }, incomplete: timelineIncomplete || Date.now() >= deadline ? ['PAGINATION_INCOMPLETE'] : [],
-        ...(source.history && { history: { complete: false,
-          detail: maxPosts !== undefined && result.length >= maxPosts
+        ...(source.history && { history: { complete: archive && complete,
+          detail: archive && complete ? undefined : maxPosts !== undefined && result.length >= maxPosts
             ? `Đã dừng ở ${result.length} bài theo giới hạn mỗi lượt quét của nguồn. Tăng giới hạn trong Quản trị luồng nếu muốn lấy thêm lịch sử.`
             : 'Đã lấy các bài trình duyệt đọc được. Facebook không xác nhận đã hiển thị hết lịch sử profile.' } }),
       };
@@ -484,7 +487,7 @@ export class FbPublicReadConnector implements ReadConnector {
   }
 
   private async readTimeline(page: Page, profile: URL, accountIdentity: string | null, accountCode: string | undefined,
-    aliases: Set<string>, limit: number, deadline: number, history: boolean) {
+    aliases: Set<string>, limit: number, deadline: number, history: boolean, archive: boolean) {
     const response = await page.goto(new URL(profile.pathname + profile.search, this.base).href, {
       waitUntil: 'domcontentloaded', timeout: Math.min(this.opts.stepTimeoutMs * 2, 25_000),
     });
@@ -513,7 +516,7 @@ export class FbPublicReadConnector implements ReadConnector {
     if (accountIdentity && aliases.has(accountIdentity)) {
       throw new ConnectorError('SOURCE_UNREADABLE', 'Nguồn trùng với tài khoản đích. Chọn một trang nguồn khác để tránh đăng lặp.');
     }
-    return this.collect(page, aliases, limit, deadline, history);
+    return this.collect(page, aliases, limit, deadline, history, archive);
   }
 
   private async verifyReadAccount(page: Page, account: NonNullable<SourceRef['readAccount']>) {
@@ -598,6 +601,16 @@ export class FbPublicReadConnector implements ReadConnector {
   }
 
   async readProfileArtwork(source: SourceRef) {
+    const { avatar, cover } = await this.captureProfileArtwork(source, true);
+    if (!avatar || !cover) throw new ConnectorError('SOURCE_UNREADABLE', 'Không xác nhận được đúng ảnh đại diện và ảnh bìa từ đầu trang nguồn.');
+    return { avatar, cover };
+  }
+
+  readArchiveProfileArtwork(source: SourceRef) {
+    return this.captureProfileArtwork(source, false);
+  }
+
+  private async captureProfileArtwork(source: SourceRef, requireBoth: boolean) {
     const profile = facebookSourceUrl(source.externalRef);
     const account = this.key === 'fb-session' ? source.readAccount : undefined;
     if (!profile || (this.key === 'fb-session' && !account)) {
@@ -607,10 +620,12 @@ export class FbPublicReadConnector implements ReadConnector {
     const locale = { locale: 'vi-VN', timezoneId: 'Asia/Ho_Chi_Minh' };
     const browser = account ? undefined : await chromium.launch(launch);
     let context: BrowserContext | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       context = account
         ? await chromium.launchPersistentContext(fbTargetProfilePath(this.opts.profilesRoot, account), { ...launch, ...locale })
         : await browser!.newContext(locale);
+      timer = setTimeout(() => void (browser?.close() ?? context?.close())?.catch(() => undefined), 50_000);
       const page = await context.newPage();
       const expected = profileIdentity(profile);
       const accountIdentity = account ? await this.verifyReadAccount(page, account) : null;
@@ -620,13 +635,16 @@ export class FbPublicReadConnector implements ReadConnector {
       const response = await page.goto(new URL(profile.pathname + profile.search, this.base).href,
         { waitUntil: 'domcontentloaded', timeout: 20_000 });
       if (account) await this.assertReadSession(page, account.code);
-      if (!response?.ok() || !this.profileAt(page.url())) throw new ConnectorError('SOURCE_UNREADABLE', 'Không mở được trang nguồn.');
+      const observed = this.profileAt(page.url());
+      if (!response?.ok() || !observed) throw new ConnectorError('SOURCE_UNREADABLE', 'Không mở được trang nguồn.');
       await page.locator('h1').first().waitFor({ timeout: 5000 }).catch(() => undefined);
-      const header = await readArtworkHeader(page, expected);
-      if (!header?.avatar || !header.cover || accountIdentity === header.owner) {
-        throw new ConnectorError('SOURCE_UNREADABLE', 'Không xác nhận được đúng ảnh đại diện và ảnh bìa từ đầu trang nguồn.');
+      const header = await readArtworkHeader(page, expected, requireBoth);
+      const observedId = profileIdentity(observed);
+      if (!header || (observedId !== expected && observedId !== header.owner) || accountIdentity === header.owner) {
+        throw new ConnectorError('SOURCE_UNREADABLE', 'Không xác nhận được đúng ảnh từ đầu trang nguồn.');
       }
-      const read = async (id: string) => {
+      const read = async (id: string | null) => {
+        if (!id) return;
         const photo = await context!.newPage();
         try {
           const url = new URL('/photo/', this.base);
@@ -644,15 +662,29 @@ export class FbPublicReadConnector implements ReadConnector {
           await photo.close().catch(() => undefined);
         }
       };
-      const [avatar, cover] = await Promise.all([read(header.avatar), read(header.cover)]);
-      return { avatar, cover };
+      if (requireBoth) {
+        const [avatar, cover] = await Promise.all([read(header.avatar), read(header.cover)]);
+        return { avatar, cover };
+      }
+      const readAvatar = async () => {
+        const original = await read(header.avatar).catch(() => undefined);
+        if (original || !header.displayedAvatar) return original;
+        const { url, width, height } = header.displayedAvatar;
+        const photoId = 'profile-avatar:' + header.owner;
+        const media = await this.fetchMedia({ ref: 'fb-public:' + photoId + ':image:profile', sourceUrl: url });
+        return { ...media, photoId, width, height };
+      };
+      const [avatar, cover] = await Promise.allSettled([readAvatar(), read(header.cover)]);
+      return { avatar: avatar.status === 'fulfilled' ? avatar.value : undefined,
+        cover: cover.status === 'fulfilled' ? cover.value : undefined };
     } finally {
+      clearTimeout(timer);
       if (browser) await browser.close().catch(() => undefined);
       else await context?.close().catch(() => undefined);
     }
   }
 
-  async readComments(source: SourceRef, post: { externalId: string; permalink?: string; aliases?: string[] },
+  async readComments(source: SourceRef, post: Parameters<NonNullable<ReadConnector['readComments']>>[1],
     onProgress: (readCount: number, expectedCount?: number) => Promise<void>): Promise<ReadCommentsResult> {
     const link = post.permalink && postLink(post.permalink, this.base);
     if (!link || (link.id !== post.externalId && !post.aliases?.includes(link.id))) {
@@ -679,7 +711,10 @@ export class FbPublicReadConnector implements ReadConnector {
       if (!response?.ok() || postLink(page.url(), this.base)?.id !== link.id || (!account && await sel.loginForm(page).isVisible())) {
         throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook chưa mở được đúng bài và phần bình luận với phiên này.');
       }
-      return await collectVisibleComments(page, link.id, Date.now() + 85_000, onProgress, [post.externalId, ...(post.aliases ?? [])]);
+      const mediaPost = post.contentType === 'VIDEO' || post.contentType === 'REEL'
+        || /\/(?:reel|videos)\/[^/]+\/?$|\/watch\/?$/.test(url.pathname);
+      return await collectVisibleComments(page, link.id, Date.now() + FB_COMMENT_READ_MS, onProgress,
+        [post.externalId, ...(post.aliases ?? [])], { mediaPost, knownCommentIds: post.knownCommentIds, identity: post.identity });
     } finally {
       if (browser) await browser.close();
       else await context?.close();
@@ -770,15 +805,17 @@ export class FbPublicReadConnector implements ReadConnector {
     if (await close.isVisible()) await close.click({ timeout: 900 }).catch(() => undefined);
   }
 
-  private async collect(page: Page, aliases: Set<string>, max: number, deadline: number, history = false) {
+  private async collect(page: Page, aliases: Set<string>, max: number, deadline: number, history: boolean, archive: boolean) {
     const posts = new Map<string, { post: ReadPost; data: CardContent }>();
     const settled = new Set<string>();
     const failedReads = new Map<string, number>();
     let idle = 0;
     let scroll = '';
     let blockedMidScan = false;
-    const scanUntil = Math.min(deadline, Date.now() + (history ? 48_000 : 38_000));
-    for (let step = 0; step < (history ? 64 : 34) && idle < 4 && posts.size < max && Date.now() < scanUntil; step++) {
+    let endReached = false;
+    const idleLimit = archive ? 8 : 4;
+    const scanUntil = Math.min(deadline, Date.now() + (archive ? 95_000 : history ? 48_000 : 38_000));
+    for (let step = 0; step < (archive ? Infinity : history ? 64 : 34) && idle < idleLimit && posts.size < max && Date.now() < scanUntil; step++) {
       await this.dismissOptionalLogin(page);
       const blocked = page.getByRole('dialog').filter({ hasText: LOGIN_WALL }).first();
       if (!this.profileAt(page.url()) || await blocked.isVisible()) {
@@ -795,7 +832,7 @@ export class FbPublicReadConnector implements ReadConnector {
           if (posts.size) { blockedMidScan = true; break; }
           throw new ConnectorError('SOURCE_UNREADABLE', 'Facebook yêu cầu đăng nhập hoặc trang nguồn không khả dụng cho khách.');
         }
-        if (!posts.size && NO_POSTS.test(body)) return { posts: [], partial: false };
+        if (!posts.size && NO_POSTS.test(body)) return { posts: [], partial: false, complete: true };
       }
       const before = settled.size;
       const anchor = await page.evaluate(() => document.scrollingElement?.scrollTop ?? 0);
@@ -821,18 +858,23 @@ export class FbPublicReadConnector implements ReadConnector {
       }, anchor);
       idle = position.atEnd && settled.size === before && position.key === scroll ? idle + 1 : 0;
       scroll = position.key;
-      if (posts.size < max && idle < 4) {
+      if (archive && position.atEnd && await page.getByText(END_OF_POSTS).filter({ visible: true }).count()) {
+        endReached = true;
+        break;
+      }
+      if (posts.size < max && idle < idleLimit) {
         await page.evaluate(() => {
           const el = document.scrollingElement;
           if (el) el.scrollTop += Math.max(440, el.clientHeight - 140);
         });
-        await page.waitForTimeout(550);
+        await page.waitForTimeout(archive && position.atEnd ? 900 : 550);
       }
     }
     if (!posts.size) throw new ConnectorError('SOURCE_UNREADABLE', this.key === 'fb-session'
       ? 'Facebook chưa hiển thị bài nào của nguồn cho phiên tài khoản đích.'
       : 'Facebook chưa hiển thị bài có thể đọc của nguồn ở chế độ khách.');
-    return { posts: [...posts.values()], partial: blockedMidScan || idle < 4 };
+    const complete = endReached && [...failedReads.keys()].every(id => settled.has(id)) && Date.now() < scanUntil;
+    return { posts: [...posts.values()], partial: archive ? !complete : blockedMidScan || idle < idleLimit, complete };
   }
 
   private async readCard(page: Page, id: string, exact?: { id: string; url: string }, aliases?: Set<string>): Promise<{ post: ReadPost; data: CardContent } | null> {

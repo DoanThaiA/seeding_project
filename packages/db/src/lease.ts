@@ -1,9 +1,13 @@
 import type { Prisma } from '@prisma/client';
+import { SOURCE_PROFILE_SCAN_STEP_MS } from '@seedingsys/contracts';
 
 type Q = Prisma.TransactionClient;
 
 export const accountResource = (targetId: string) => `account:${targetId}`;
 export const sourceResource = (sourceId: string) => `source:${sourceId}`;
+export const sourceProfileStepResource = (targetId: string) => `profile-scan-step:${targetId}`;
+export const sourceProfileAccountHolder = (scanId: string) => `profile-scan:${scanId}`;
+export const SOURCE_PROFILE_ACCOUNT_PURPOSE = 'source-profile-archive';
 
 export interface Lease {
   resource: string;
@@ -72,8 +76,42 @@ export async function assertLeaseHeld(t: Q, lease: Pick<Lease, 'resource' | 'tok
 }
 
 export async function activeLease(q: Q, resource: string, now: Date) {
-  const rows = await q.$queryRaw<Array<{ holder: string; fencing_token: bigint; expires_at: Date }>>`
-    SELECT holder, fencing_token, expires_at FROM account_leases
+  const rows = await q.$queryRaw<Array<{ holder: string; fencing_token: bigint; expires_at: Date; purpose: string | null }>>`
+    SELECT holder, fencing_token, expires_at, purpose FROM account_leases
     WHERE resource = ${resource} AND released_at IS NULL AND expires_at > ${now}`;
   return rows[0] ?? null;
+}
+
+export async function profileScanBlocksPoll(q: Q, sourceId: string, now: Date) {
+  const fresh = new Date(+now - SOURCE_PROFILE_SCAN_STEP_MS);
+  const [row] = await q.$queryRaw<Array<{ busy: boolean }>>`
+    SELECT EXISTS (
+      SELECT 1 FROM source_profile_scans r JOIN sources s ON s.id=r.source_id
+      WHERE s.id=${sourceId}::uuid AND r.connector='fb-session' AND r.connector=s.connector
+        AND r.source_ref=s.external_ref AND r.reset_generation=s.reset_generation
+        AND r.phase IN ('PROFILE','POSTS') AND r.updated_at>${fresh}
+    ) OR EXISTS (
+      SELECT 1 FROM source_target_mappings m JOIN sources s ON s.id=m.source_id
+      JOIN target_accounts b ON b.id=m.target_id AND b.enabled AND b.connector='fb-web'
+      JOIN account_leases l ON l.resource='account:'||b.id
+      WHERE m.source_id=${sourceId}::uuid AND m.enabled AND s.connector='fb-session'
+        AND l.purpose=${SOURCE_PROFILE_ACCOUNT_PURPOSE} AND l.released_at IS NULL AND l.expires_at>${now}
+    ) AS busy`;
+  return row?.busy ?? false;
+}
+
+/** Release the account between workflows only after its last browser step has closed. */
+export async function releaseFinishedProfileScanAccount(q: Q, scanId: string, now: Date) {
+  await q.$executeRaw`
+    UPDATE account_leases l SET released_at=${now}
+    FROM source_profile_scans r
+    WHERE r.id=${scanId}::uuid AND l.holder=${sourceProfileAccountHolder(scanId)}
+      AND l.purpose=${SOURCE_PROFILE_ACCOUNT_PURPOSE} AND l.released_at IS NULL
+      AND (r.phase='FAILED' OR (r.phase='COLLECTING' AND NOT EXISTS (
+        SELECT 1 FROM comment_scans c WHERE c.source_profile_scan_id=r.id AND c.status IN ('QUEUED','RUNNING')
+      )))
+      AND NOT EXISTS (
+        SELECT 1 FROM account_leases step WHERE step.resource='profile-scan-step:'||substr(l.resource, 9)
+          AND step.released_at IS NULL AND step.expires_at>${now}
+      )`;
 }

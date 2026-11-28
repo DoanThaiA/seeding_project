@@ -11,6 +11,7 @@ import { ProfileDetailsPanel, type ProfileDetailsState } from '../profile-sync/P
 import type { PersonaDetail, PersonaSummaryRow } from '../personas/types';
 import { PostWorkspace } from './PostWorkspace';
 import { ProfilePicker } from './ProfilePicker';
+import { SourceProfileScan, type SourceProfileScanState } from './SourceProfileScan';
 import type { Listing, PostDetail, Profiles } from './types';
 import styles from './library.module.css';
 
@@ -80,7 +81,8 @@ export default async function LibraryPage({ searchParams }: { searchParams: Prom
   const source = profiles.sources.find(item => item.id === profile.id);
   const target = profiles.targets.find(item => item.id === profile.id);
   const query = new URLSearchParams({ page: String(page), q, ...(trash && { trash }) });
-  const [listing, candidate, persona, mappings, health, summaries] = await Promise.all([
+  const canScanProfile = !!source && READABLE.includes(source.connector);
+  const [listing, candidate, persona, mappings, health, summaries, sourceScan] = await Promise.all([
     apiGet<Listing>(`/library/profiles/${encodeURIComponent(profile.code)}?` + query, session.token),
     postId && UUID.test(postId) ? apiGet<PostDetail>('/library/posts/' + postId, session.token).catch(error => {
       if (!(error instanceof ApiError) || error.status !== 404) throw error;
@@ -93,6 +95,8 @@ export default async function LibraryPage({ searchParams }: { searchParams: Prom
     kind === 'B' && admin ? apiGet<TargetHealth[]>('/targets/health', session.token).catch(() => null) : null,
     kind === 'B' && can.operate(session.role)
       ? apiGet<PersonaSummaryRow[]>('/personas/summaries', session.token).catch(() => null) : null,
+    source && canScanProfile && can.operate(session.role)
+      ? apiGet<{ scan: SourceProfileScanState | null }>(`/sources/${source.id}/profile-scan`, session.token).then(result => result.scan) : null,
   ]);
   const belongsToProfile = candidate && (source
     ? candidate.source.id === profile.id && !!candidate.post.archivedAt === !!trash
@@ -137,7 +141,7 @@ export default async function LibraryPage({ searchParams }: { searchParams: Prom
 
   return (
     <div className={styles.workspace}>
-      {readingProfile && <AutoRefresh seconds={5} />}
+      {(readingProfile || sourceScan?.active) && <AutoRefresh seconds={5} />}
       <header className={styles.heading}>
         <h1>{title}</h1>
         <ProfilePicker profiles={profiles} selected={profile.code} kind={kind} />
@@ -149,12 +153,17 @@ export default async function LibraryPage({ searchParams }: { searchParams: Prom
           <span className="muted">{source ? `${source._count.posts} bài đã lưu` : `${target?._count.publications ?? 0} bài đã đăng`}</span>
         </div>
         <div className="actions">
-          {source?.enabled && admin && <ActionButton path={`sources/${source.id}/poll`}>Quét bài của {source.code}</ActionButton>}
+          {source && admin && (canScanProfile
+            ? <ActionButton className="primary" path={`sources/${source.id}/profile-scan`} disabled={sourceScan?.active}>
+                {sourceScan?.active ? 'Đang quét hồ sơ' : `Quét hồ sơ ${source.code}`}
+              </ActionButton>
+            : source.enabled && source.connector !== 'manual' && <ActionButton path={`sources/${source.id}/poll`}>Quét bài của {source.code}</ActionButton>)}
           {persona?.profileUrl && <a className="btn" href={persona.profileUrl} target="_blank" rel="noreferrer">Mở hồ sơ Facebook</a>}
           {persona?.canComment && canOperate && <Link className="btn" href={{ pathname: '/comment-scripts', query: { new: '1', profile: profile.code } }}>Gán vào kịch bản</Link>}
           <Link className="btn" href={{ pathname: '/profile-sync', query: source ? { source: profile.code } : { target: profile.code } }}>Đồng bộ hồ sơ</Link>
         </div>
       </section>
+      {source && sourceScan && <SourceProfileScan scan={sourceScan} code={source.code} />}
       {health && <section className="card workflow-stack" aria-labelledby="health">
         {checking && <AutoRefresh seconds={6} />}
         <div className="workflow-toolbar">

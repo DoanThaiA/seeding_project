@@ -19,8 +19,12 @@ export interface ProfilePost {
   sharedReel?: 'attached' | 'shorts';
   comments?: boolean;
   structuredComments?: boolean;
+  commentPagination?: 'complete' | 'blocked';
+  archivedCommentThread?: boolean;
   commentDelayMs?: number;
   commentPermalinkId?: string;
+  nestedReply?: boolean;
+  lazyCommentPage?: boolean;
   emptyComments?: boolean;
   detailCaption?: string;
   messageRoleOnly?: boolean;
@@ -80,6 +84,8 @@ export class MockProfile {
   guestMode = false;
   latePostsStart?: number;
   profileArtwork?: { avatar: string; cover: string; avatarOwner?: string };
+  archiveFixture = false;
+  directoryAbout = false;
   profileNameOutsideHeading = false;
   profileHeaderDelay = 0;
   signedInAs?: string;
@@ -114,10 +120,22 @@ export class MockProfile {
         res.writeHead(302, { location: `/profile.php?id=${this.signedInAs ?? this.userId}` });
         return res.end();
       }
+      if (this.directoryAbout && url.pathname === '/profile.php' &&
+        ['about', 'directory_personal_details'].includes(url.searchParams.get('sk') ?? '')) {
+        return html(`<main><article>
+          <h2>Giới thiệu</h2>
+          <div><a role="tab" aria-selected="${url.searchParams.get('sk') === 'directory_personal_details'}" href="/profile.php?id=${this.userId}&amp;sk=directory_personal_details">Thông tin cá nhân</a></div>
+          <div><section><h2>Giới tính</h2><p>Giá trị hiển thị</p><span>Giới tính</span>
+            <button onclick="document.getElementById('about-extra').hidden=false;this.hidden=true">Xem thêm</button>
+            <p id="about-extra" hidden>Chi tiết mở rộng</p></section>
+            <section><h2>Nơi từng sống</h2><p>Không có địa điểm nào để hiển thị</p></section></div>
+          </article><section><h2>Hồ sơ gợi ý</h2><p>Dữ liệu hồ sơ khác</p></section></main>`);
+      }
       if (this.profileArtwork && url.pathname === '/profile.php') {
         const header = { id: this.userId, profilePhoto: { id: this.profileArtwork.avatar },
           cover_photo: { photo: { id: this.profileArtwork.cover } } };
-        return html(`<h1>${esc(this.owner)}</h1><script type="application/json">${JSON.stringify(header)}</script>`);
+        const data = `<script type="application/json">${JSON.stringify(header)}</script>`;
+        return html(this.archiveFixture ? this.page(data) : `<h1>${esc(this.owner)}</h1>${data}`);
       }
       if (this.profileArtwork && url.pathname === '/photo/') {
         const id = url.searchParams.get('fbid');
@@ -127,14 +145,51 @@ export class MockProfile {
           return html(`<script type="application/json">${JSON.stringify({ id, owner: { id: owner }, image })}</script>`);
         }
       }
-      if (this.guestMode && url.pathname === '/video.mp4') {
+      if (this.guestMode && ['/video.mp4', '/reel-fixture.mp4'].includes(url.pathname)) {
         res.writeHead(200, { 'content-type': 'video/mp4' });
-        return res.end(Buffer.from('test video media'));
+        return res.end(Buffer.from('test video media ' + url.pathname));
       }
       if (this.guestMode && url.pathname.startsWith('/reel/')) {
         const id = url.pathname.split('/').filter(Boolean).at(-1);
         const p = this.posts.find(post => post.playbackVideoId === id);
         if (p) {
+          if (p.comments) {
+            const comment = (story: string, id: string) => encodeURIComponent(Buffer.from(`comment:${story}_${id}`).toString('base64'));
+            const link = '/profile.php?comment_id=' + comment('8900', '105');
+            if (p.archivedCommentThread) {
+              const card = (id: string, parent?: string) => `<article><a href="/profile.php?comment_id=${comment('8900', parent ?? id)}${parent
+                ? '&amp;reply_comment_id=' + comment('8900', id) : ''}">Vừa xong</a><div data-comment-text>Bình luận ${id}</div></article>`;
+              const video = { id, creation_story: { message: { text: p.text } } };
+              return html(`<main>
+                <section style="height:850px"><video style="display:block;width:480px;height:270px"></video>
+                  <button aria-label="Bình luận, 4 bình luận" onclick="document.querySelector('#comment-rail').hidden=false">Bình luận</button></section>
+                <section><video style="display:block;width:480px;height:270px"></video>
+                  <button aria-label="Bình luận, 3,8K bình luận" onclick="document.querySelector('#suggestion').hidden=false">Bình luận</button></section>
+              </main>
+              <aside id="comment-rail" hidden style="position:fixed;right:0;top:0">
+                <section>${card('105')}<button id="reply" onclick="advanceReply(this)">Xem 1 phản hồi</button></section>
+                <button id="more" onclick="advancePage(this)">Xem thêm bình luận</button>
+              </aside>
+              <aside id="suggestion" hidden><article><a href="/profile.php?comment_id=${comment('9990','999')}">Khác bài</a></article></aside>
+              <script>
+                function advanceReply(button){button.insertAdjacentHTML('beforebegin',${JSON.stringify(card('106', '105'))});button.hidden=true}
+                let next=0;
+                function advancePage(button){button.insertAdjacentHTML('beforebegin',${JSON.stringify([card('107'),card('108')])}[next++]);if(next===2)button.hidden=true}
+              </script>
+              <script type="application/json">${JSON.stringify({ result: { data: { video } } })}</script>`);
+            }
+            return html(`<main data-comment-count="2">
+              <button id="open-thread" hidden aria-label="Bình luận, 2 bình luận" onclick="document.querySelector('#thread').hidden=false">Bình luận</button>
+              <article data-commentid="999"><a href="/profile.php?comment_id=${comment('9990', '999')}">Khác bài</a></article>
+              </main>
+              <section id="thread" hidden><button>Tất cả bình luận</button>
+                <article data-commentid="105"><a href="${link}">1 giờ</a><div data-comment-text>Bình luận Reel</div>
+                  <article data-commentid="106"><a href="${link}&amp;reply_comment_id=${comment('8900', '106')}">Vừa xong</a><div data-comment-text>Phản hồi Reel</div></article>
+                </article>
+              </section>
+              <script>setTimeout(()=>document.querySelector('#open-thread').hidden=false, 900)</script>
+              <meta property="og:video" content="${this.baseUrl}/reel-fixture.mp4">`);
+          }
           const creation_story = { message: { text: p.text }, short_form_video_context: { playback_video: {
             id, videoDeliveryLegacyFields: { browser_native_hd_url: this.baseUrl + '/expired.mp4', browser_native_sd_url: this.baseUrl + '/video.mp4' },
           } } };
@@ -162,6 +217,61 @@ export class MockProfile {
       }
       if (this.guestMode && url.pathname.includes('/posts/')) {
         const p = this.posts.find(post => url.pathname.endsWith('/' + post.id));
+        if (p?.commentPagination) {
+          const archived = p.archivedCommentThread;
+          const encoded = (id: string) => encodeURIComponent(Buffer.from('comment:123456_' + id).toString('base64'));
+          const rotatedPath = '/profile/posts/pfbidARCHIVEDROTATED';
+          const card = (id: string, parent?: string, children = '') => {
+            const link = (archived ? rotatedPath : url.pathname) + '?comment_id=' + (parent
+              ? (archived ? encoded(parent) : '201') + '&amp;reply_comment_id=' + (archived ? encoded(id) : id)
+              : archived ? encoded(id) : id);
+            return `<article id="comment-${id}" ${parent ? `data-parent-comment-id="${parent}"` : ''}>
+              <a href="${link}">Vừa xong</a><div data-comment-text>Bình luận ${id}</div>${children}</article>`;
+          };
+          const nested = '<button id="nested-more" onclick="nextNested(this)">Xem 1 phản hồi mới hơn</button>';
+          const branches = '<section id="replies"><button id="reply-more" onclick="nextReply(this)">Xem thêm 2 lượt trả lời khác</button></section>';
+          const blocked = p.commentPagination === 'blocked'
+            ? '<button onclick="return false">Xem thêm bình luận khác</button>' : '';
+          const node = (id: string, path: string, photo: string) => ({ result: { data: { node_v2: {
+            id: Buffer.from(`S:_I10099:${id}:${id}`).toString('base64'), permalink_url: this.baseUrl + path, comet_sections: {
+              content: { story: { message: { text: p.text }, attachments: [{ media: { __typename: 'Photo', id: photo } }] } },
+            },
+          } } } });
+          const hydration = archived ? `<script type="application/json">${JSON.stringify([
+            node('123456', rotatedPath, '234567'), node('999999', '/user/posts/other', '345678'),
+          ])}</script>` : '';
+          return html(`<main data-comment-count="1">
+            <article ${archived ? 'role="dialog"' : ''}>${archived ? '' : `
+              <button id="sort" onclick="document.getElementById('all').hidden=false">Phù hợp nhất</button>
+              <button role="menuitemradio" id="all" hidden onclick="this.hidden=true;document.getElementById('sort').textContent='Tất cả bình luận'">Tất cả bình luận</button>`}
+              <section id="roots">${card('201', undefined, branches)}</section>
+              ${blocked}
+              <a href="#" id="root-more" onclick="nextRoot(this);return false">${archived ? 'Xem các bình luận trước' : 'Xem thêm bình luận trước đó'}</a>
+              <p role="status" id="end" hidden>Không còn bình luận</p>
+            </article>
+            <article><a href="/user/posts/other?comment_id=999">Bài khác</a><button onclick="document.getElementById('end').textContent='Không hợp lệ'">Xem thêm bình luận</button></article>
+            ${hydration}
+            <script>
+              const insert=(control, content, onDone)=>{const section=control.parentElement;section.setAttribute('aria-busy','true');
+                setTimeout(()=>{control.insertAdjacentHTML('beforebegin',content);section.removeAttribute('aria-busy');onDone?.();},1250);};
+              let rootPage=0;
+              function nextRoot(control){
+                const pages=${JSON.stringify([card('202'), card('203'), card('207')])};
+                insert(control, pages[rootPage++],()=>{
+                  if(rootPage===pages.length){
+                    control.hidden=true;document.querySelector('main').dataset.commentCount='${archived ? 4 : 7}';
+                    document.getElementById('end').hidden=false;document.getElementById('end').textContent='Không còn bình luận';
+                  }
+                });
+              }
+              let replyPage=0;
+              function nextReply(control){
+                const pages=${JSON.stringify([card('204', '201', nested), card('205', '201')])};
+                insert(control, pages[replyPage++],()=>{if(replyPage===pages.length)control.hidden=true;});
+              }
+              function nextNested(control){insert(control,${JSON.stringify(card('206','204'))},()=>control.hidden=true);}
+            </script></main>`);
+        }
         if (p?.detailPhotoIds?.length) {
           const ids = p.detailPhotoIds;
           const set = 'pcb.112233';
@@ -180,7 +290,8 @@ export class MockProfile {
             comment_list_renderer: { feedback: { comment_rendering_instance_for_feed_location: thread } },
           } } };
           const node = { id: p.id, comet_sections: { content: { story: { actors: [{ name: this.owner }] } }, feedback: { story } } };
-          return html(`<main><button aria-label="Bình luận về bài viết của ${esc(this.owner)}">Bình luận</button>
+          return html(`${p.playable ? `<meta property="og:video" content="${this.baseUrl}/video.mp4">` : ''}
+            <main><button aria-label="Bình luận về bài viết của ${esc(this.owner)}">Bình luận</button>
             <div aria-hidden="true"><button aria-label="Bình luận về bài viết khác, 3 bình luận">Bình luận</button></div>
             <script type="application/json">${JSON.stringify({ result: { data: { node_v2: node } } })}</script></main>`);
         }
@@ -190,13 +301,16 @@ export class MockProfile {
             const parent = { __typename: 'Comment', id: 'parent', legacy_fbid: '101', body: { text: 'Bình luận chính' }, author: { name: 'Khách A' } };
             const encoded = (id: string) => encodeURIComponent(Buffer.from('comment:123_' + id).toString('base64'));
             const thread = { comments: { count: 1, edges: [{ node: parent }] } };
-            const story = { feedback_context: { feedback_target_with_context: { total_comment_count: 2,
+            const expected = p.lazyCommentPage ? undefined : p.nestedReply ? 3 : 2;
+            const story = { feedback_context: { feedback_target_with_context: { total_comment_count: expected,
               comment_list_renderer: { feedback: { comment_rendering_instance_for_feed_location: thread } } } } };
             const node = { id: p.id, permalink_url: this.baseUrl + oldPath, comet_sections: {
               content: { story: { actors: [{ name: this.owner }] } }, feedback: { story: { story_ufi_container: { story } } },
             } };
             const data = { recommendation: { __typename: 'Comment', legacy_fbid: '999', body: { text: 'Khác bài' } }, __bbox: { result: { data: { node_v2: node } } } };
-            const content = `<main data-comment-count="2"><button>Tất cả bình luận</button>
+            const lateComment = `<article data-commentid="104"><a href="${url.pathname}?comment_id=104">Vừa xong</a><div data-comment-text>Bình luận tải thêm</div></article>`;
+            const content = `<main ${expected === undefined ? '' : `data-comment-count="${expected}"`}><button>Tất cả bình luận</button>
+              ${p.lazyCommentPage ? '<section id="thread-scroll" style="height:450px;overflow-y:auto">' : ''}
               <article aria-label="Bình luận dưới bài"><a href="/profile?comment_id=${encoded('101')}">Khách A</a>
                 <a href="${oldPath}?comment_id=101">1 giờ</a><div data-comment-text>Bình luận chính</div>
                 <button onclick="document.getElementById('reply').hidden=false;this.hidden=true">Xem 1 câu trả lời</button>
@@ -204,9 +318,21 @@ export class MockProfile {
                   <a href="/profile?comment_id=${encoded('102')}">Khách B</a>
                   <a href="/profile/posts/pfbidROTATEDAGAIN?comment_id=101&amp;reply_comment_id=102">30 phút</a>
                   <div data-comment-text>Phản hồi https://s.shopee.vn/an_redir?affiliate_id=1</div>
+                  ${p.nestedReply ? `<button onclick="document.getElementById('nested').hidden=false;this.hidden=true">View 1 more reply</button>
+                    <article hidden id="nested" aria-label="Phản hồi bình luận" data-parent-comment-id="102">
+                      <a href="${url.pathname}?comment_id=101&amp;reply_comment_id=103">Vừa xong</a>
+                      <div data-comment-text>Phản hồi cấp hai</div>
+                    </article>` : ''}
                 </article>
               </article>
               <article aria-label="Bình luận dưới bài"><a href="/user/posts/other?comment_id=999">1 giờ</a><div data-comment-text>Khác bài</div></article>
+              ${p.lazyCommentPage ? `<div id="spacer" style="height:900px"></div></section>
+                <script>const box=document.querySelector('#thread-scroll');box.onscroll=()=>{
+                  if (!document.querySelector('[data-commentid="104"]') && box.scrollTop>100) {
+                    document.querySelector('#spacer').insertAdjacentHTML('beforebegin',${JSON.stringify(lateComment)});
+                    document.querySelector('main').dataset.commentCount='4';
+                  }
+                }</script>` : ''}
               <script type="application/json">${JSON.stringify(data)}</script></main>`;
             return html(p.commentDelayMs
               ? `<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(content).replace(/</g, '\\u003c')}), ${p.commentDelayMs})</script>`
@@ -275,12 +401,13 @@ export class MockProfile {
     </div>`;
   }
 
-  private page(): string {
+  private page(extra = ''): string {
     const cards = this.posts.map((p, i) => this.post(p, i + 1));
     const posts = cards.slice(0, this.latePostsStart ?? cards.length).join('') || (this.guestMode ? '<p>Chưa có bài viết nào</p>' : '');
-    const late = this.latePostsStart === undefined ? '' : cards.slice(this.latePostsStart).join('');
+    const late = (this.latePostsStart === undefined ? '' : cards.slice(this.latePostsStart).join(''))
+      + (this.archiveFixture ? '<p>Không còn bài viết</p>' : '');
     const profile = { __isProfile: 'User', __isRenderedProfile: 'User', id: this.userId, url: this.baseUrl + '/profile.php?id=' + this.userId, name: this.owner };
-    return `<!doctype html><html lang="vi"><body>
+    return `<!doctype html><html lang="vi"><body>${extra}
       ${this.profileNameOutsideHeading ? `<svg hidden aria-label="${esc(this.owner)}" width="24" height="24"><rect width="24" height="24" /></svg>
         <script>setTimeout(() => document.querySelector('svg').removeAttribute('hidden'), ${this.profileHeaderDelay})</script>
         <script type="application/json">${JSON.stringify(profile).replace(/</g, '\\u003c')}</script>` : `<h1>${esc(this.owner)}</h1>`}

@@ -41,13 +41,13 @@ const OPEN_VARIANT: Array<'FETCHING_MEDIA' | 'REWRITING' | 'VALIDATING' | 'READY
 ];
 
 /** Prepare scanned comments and assign available Facebook profiles before sending. */
-export async function prepareCommentDrafts(t: Q, sourcePostId: string, targetIds: string[], now: Date) {
+export async function prepareCommentDrafts(t: Q, sourcePostId: string, targetIds: string[], now: Date, opts: { automatic?: boolean } = {}) {
   if (!targetIds.length) return 0;
   const inserted = await t.$executeRaw`
     INSERT INTO publication_comments (id, destination_id, source_comment_id, text, status, updated_at)
     SELECT gen_random_uuid(), d.target_id, c.id, c.text, 'DRAFT', ${now}
     FROM source_comments c CROSS JOIN unnest(${targetIds}::uuid[]) AS d(target_id)
-    WHERE c.source_post_id=${sourcePostId}::uuid AND length(trim(c.text))>0
+    WHERE c.source_post_id=${sourcePostId}::uuid AND length(trim(c.text))>0 AND (${!opts.automatic} OR NOT c.archive_only)
     ON CONFLICT (destination_id, source_comment_id) DO NOTHING`;
   const accounts = await t.targetAccount.findMany({
     where: { enabled: true, connector: 'fb-web', profile: { is: { workerNodeId: { not: null } } } },
@@ -67,7 +67,7 @@ export async function prepareCommentDrafts(t: Q, sourcePostId: string, targetIds
     if (!pool.length) continue;
     const eligible = new Set(pool.map(account => account.id));
     const drafts = await t.publicationComment.findMany({
-      where: { destinationId: target.id, source: { sourcePostId }, status: { in: ['DRAFT', 'FAILED'] } },
+      where: { destinationId: target.id, source: { sourcePostId, ...(opts.automatic && { archiveOnly: false }) }, status: { in: ['DRAFT', 'FAILED'] } },
       select: { id: true, status: true, authorTargetId: true, autoAuthor: true },
       orderBy: [{ source: { position: 'asc' } }, { sourceCommentId: 'asc' }],
     });
@@ -105,6 +105,7 @@ export async function ingestPost(
   t: Q,
   args: { sourceId: string; connector: string; post: IngestPost; baseline: boolean; now: Date; actor: string;
     archiveOnly?: boolean;
+    retryFailedMedia?: boolean;
     draftCaption?: { targetId: string; value: string } },
 ): Promise<IngestOutcome> {
   const { now } = args;
@@ -192,7 +193,7 @@ export async function ingestPost(
     && JSON.stringify(latest.incomplete) === JSON.stringify(post.incomplete) ? latest : null;
   const stored = existingRev ?? equivalent;
   if (trackIncompleteMedia && stored) {
-    if (post.media.length) await refreshAssetUrls(t, stored.id, post.media);
+    if (post.media.length) await refreshAssetUrls(t, stored.id, post.media, args.retryFailedMedia);
     const raw = stored.raw as Record<string, unknown> | null;
     const expected = post.raw?.expectedPhotoCount;
     const details: Record<string, unknown> = {};
@@ -321,13 +322,13 @@ export async function ingestPost(
   return isNewPost ? 'NEW_POST' : 'NEW_REVISION';
 }
 
-async function refreshAssetUrls(t: Q, revisionId: string, media: IngestPost['media']) {
+async function refreshAssetUrls(t: Q, revisionId: string, media: IngestPost['media'], retryFailedMedia = false) {
   await t.$queryRaw`SELECT id FROM source_post_revisions WHERE id = ${revisionId}::uuid FOR UPDATE`;
   const assets = await t.postAsset.findMany({ where: { revisionId, asset: { status: { in: ['PENDING', 'FAILED'] } } }, include: { asset: true } });
   const urls = new Map(media.map(m => [m.ref, m.sourceUrl]));
   for (const { asset } of assets) {
     const url = asset.sourceRef && urls.get(asset.sourceRef);
-    if (!url || url === asset.sourceUrl) continue;
+    if (!url || (url === asset.sourceUrl && !(retryFailedMedia && asset.status === 'FAILED'))) continue;
     const restart = asset.status === 'FAILED';
     const changed = await t.asset.updateMany({
       where: { id: asset.id, status: asset.status, sourceUrl: asset.sourceUrl },

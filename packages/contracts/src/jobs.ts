@@ -7,6 +7,7 @@ import { z } from 'zod';
 export const Q = {
   TargetBrowser: 'target.browser',
   SourcePoll: 'source.poll',
+  SourceProfileScan: 'source.profile.scan',
   ProfileSync: 'profile.sync',
   ProfileSyncPublish: 'profile.sync.publish',
   ProfileArtwork: 'profile.artwork',
@@ -33,17 +34,21 @@ export const Q = {
 export type QueueName = (typeof Q)[keyof typeof Q];
 
 const id = z.string().uuid();
+export const SOURCE_POLL_BUSY_RETRIES = 16;
 
 export const JobSchemas = {
   [Q.TargetBrowser]: z.object({ runId: id }),
-  [Q.SourcePoll]: z.object({ sourceId: id, collectComments: z.boolean().optional(), scheduled: z.boolean().optional() }),
+  [Q.SourcePoll]: z.object({
+    sourceId: id, collectComments: z.boolean().optional(), scheduled: z.boolean().optional(), requestedAt: z.string().datetime().optional(),
+  }),
+  [Q.SourceProfileScan]: z.object({ scanId: id, phase: z.enum(['PROFILE', 'POSTS']), readTargetId: id.optional() }),
   [Q.ProfileSync]: z.object({ syncId: id, step: z.number().int().min(0) }),
   [Q.ProfileSyncPublish]: z.object({ syncId: id }),
   [Q.ProfileArtwork]: z.object({ mappingId: id, requestId: id }),
   [Q.ApplyProfileArtwork]: z.object({ mappingId: id, requestId: id, applyId: id }),
   [Q.ProfileDetails]: z.object({ mappingId: id, requestId: id }),
   [Q.ApplyProfileBio]: z.object({ mappingId: id, requestId: id, bioJobId: id }),
-  [Q.CommentScan]: z.object({ scanId: id, readTargetId: id.optional(), manual: z.boolean().optional() }),
+  [Q.CommentScan]: z.object({ scanId: id, readTargetId: id.optional(), manual: z.boolean().optional(), archiveOnly: z.boolean().optional() }),
   [Q.CommentPublish]: z.object({ replayId: id, sendVersion: z.number().int().min(1), automatic: z.boolean().optional() }),
   [Q.CommentScriptStep]: z.object({ stepId: id, sendVersion: z.number().int().min(1) }),
   [Q.CommentScriptGenerate]: z.object({ generationId: id }),
